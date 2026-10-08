@@ -1,0 +1,26 @@
+# voaice.rs reference pin — the whisper.cpp whose compiled output voaice.rs must reproduce bit for bit.
+# Tab-separated key/value lines; testing/oracle/build.sh reads them and refuses any other checkout.
+#
+# Why a commit and not a tag: mindX production runs whisper.cpp built against ggml 0.16.0. No whisper.cpp release tag
+# bundles ggml 0.16.0 (checked 2026-10-07, ggml/CMakeLists.txt GGML_VERSION_* at every tag):
+#   v1.9.0 / v1.9.1 -> ggml 0.15.1     v1.9.2 -> 0.18.1     v1.9.3 -> 0.20.2     v1.9.4 -> 0.23.0     v1.9.5 -> 0.26.0
+# ggml 0.16.0 lived on master from 4fc2a2d9 ("ggml : bump version to 0.16.0", 2026-07-10) until 2ca53bb4 ("sync : ggml",
+# 2026-07-31, -> 0.18). Production was built 2026-07-21 from a shallow clone of master (mindX memory
+# whisper_cpp_stt_verified.md: "/opt/whisper.cpp ... v1.9.1"), and master's head on that day was 080bbbe8 (2026-07-11;
+# the next master commit is 2026-07-28). `git describe` names it v1.9.1-154-g080bbbe8; WHISPER_VERSION reads 1.9.1.
+# The only commit between the 0.16.0 sync (7695a533) and this one changes examples/ text output, not libwhisper.
+# NOT YET VERIFIED against the production binary itself (that would need reading the VPS, out of scope for 0.0.1);
+# the check is `strings /opt/whisper.cpp/build/bin/libggml-base.so* | grep 0.16.0` and the build's git sha if kept.
+url	https://github.com/ggml-org/whisper.cpp
+commit	080bbbe85230f624f0b52127f1ae1218247989f9
+describe	v1.9.1-154-g080bbbe8
+whisper_version	1.9.1
+ggml	0.16.0
+nearest_tag	v1.9.1 (154 commits after it; the tag itself bundles ggml 0.15.1)
+build	cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=ON, CPU only (no CUDA/Vulkan/Metal/BLAS), OpenMP
+compiler	gcc 11.4.0 (Ubuntu 22.04), glibc 2.35, x86-64 AVX2+FMA host (no AVX-512)
+#
+# The models (kept out of git, under models/; sizes are the production files' sizes):
+model	ggml-tiny.en.bin	77704715	921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f	https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin
+# base.en is production's default STT model; its sha256 is not pinned yet (not downloaded on this disk-tight machine).
+model_unpinned	ggml-base.en.bin	147964211

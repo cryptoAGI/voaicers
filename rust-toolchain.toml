@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Pinned like bankml's, not the machine default; rustup installs it on first use.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy"]

@@ -1,0 +1,26 @@
+[package]
+name = "voaice"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.99"
+authors = ["Professor Codephreak", "Gregory L. Magnusson"]
+readme = "README.md"
+description = "voaice.rs: speech-to-text in zero-dependency Rust, bit-exact against whisper.cpp (ggml 0.16.0) before it is fast"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "voaice"
+path = "src/main.rs"
+
+# Zero dependencies: sha256, the ggml model parse, the WAV reader and the mel front end are in-crate.
+# Each crate added later carries a comment saying why.
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
