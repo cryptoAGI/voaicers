@@ -124,13 +124,41 @@ whisper.cpp (upstream/PIN) in the same run; only then is its speed measured.
       ported); an AVX-512 build (cvar's 16-lane branch pairs differently); production's library; `base.en` (n = 512).
 - [ ] Efficiency left: at 1500 × 384 the op is memory-bound on this laptop (input + output ≈ 4.5 MB > the 4 MB L3);
       the real saving is to fuse the norm into 0.0.9's `from_float` (the MUL_MAT's f32 → f16 row conversion), so the
-      norm's f32 output is never written.
+      norm's f32 output is never written — done in 0.0.9 (`Block::qkv_into`, `Block::mlp_into`).
 
-## Next: 0.0.9 — the matrix products on activations (see docs/ROADMAP.md)
-- [ ] Q, K, V, the out projection and the MLP's two products: `mul_mat`'s f32 activation rows converted to f16 by
-      `from_float` (`ggml_cpu_fp32_to_fp16`, 0.0.3; the threads split each row's conversion by element ranges), then
-      0.0.6's `ggml_vec_dot_f16`; + biases. Oracle: every MUL_MAT node of block 0 through `sched_encode`'s callback
-      (0.0.8's callback already observes them all), fed the recorded activations.
+## Done: 0.0.9 — the matrix products on activations (CHANGELOG.md, testing/matmul/NOTES.md)
+- [x] Read from the pin and the binary: per block Q (+ bias), K (**no bias**), V (+ bias) on attn_ln's output; K and V
+      CPY'd f32 → f16 into flash attention's cache by the **scalar** bit trick; the out projection + bias + the block's
+      input; mlp_ln, fc1 + bias, GELU (0.0.3's), fc2 + bias + that residual. `ggml_compute_forward_mul_mat`: `from_float`
+      = `ggml_cpu_fp32_to_fp16` with **each thread converting its element range `[ith·K/nth, (ith+1)·K/nth)` of every
+      row**, then 0.0.6's `ggml_vec_dot_f16(K, weight row, converted row)` per output (nrows 1, chunks of 16 × 16,
+      nothing accumulated across chunks); LLAMAFILE off, repack has no f16, no MUL_MAT + ADD fusion.
+- [x] Oracle through `sched_encode`'s eval callback, nodes identified by what they read, recorded compactly (a 64-bit
+      digest per row, each product's input digested before it ran, the attention's output whole: 80 MB for 8 inputs):
+      every product-side node of all 4 blocks 0 rows differ (model, 1 and 4 threads; 2,304,000 node rows) and the
+      residuals 0 values differ against 0.0.8's record; block 0 from voaice's own mel 0 differ at 1, 2, 4 threads;
+      NaN-bearing rows at 1..8 threads 0 differ — **the reference's own NaN output depends on its thread count** (at 5
+      and 7 threads the split puts a NaN in the bit trick's tail); six discriminators caught on every input, the two
+      converter readings caught on the NaN rows.
+- [x] Faster, bits unchanged: attn_ln / mlp_ln fused into the conversion (their f32 output never written), one conversion
+      for Q, K and V, a 4 × 3 register block over a permuted panel of 64 frames, every epilogue in the panel, the MLP a
+      panel at a time (its 1536-wide hidden layer never leaves it), caller-owned outputs, threads by frames.
+- [ ] Not covered: production's own libggml-cpu (Zen 3) was not run; an AVX-512 host (`ggml_cpu_fp32_to_fp16` converts
+      16 at a time first, which moves the scalar tail); `base.en` (n_state 512, hidden 2,048); the attention's output
+      was the reference's (v0.1.0 computes it); NaN only on constructed rows of one product (query), not through a
+      whole block.
+- [ ] Efficiency left: at 4 threads on this 2-core laptop voaice gains nothing over 2 (the FMA pipes are shared by SMT
+      siblings); the weights are held widened to f32 (7.1 MB per block, 2× the f16 bytes) because the f16-in-kernel
+      variant measured ~30 % slower here — revisit on a core with more FMA than conversion throughput (Zen 3).
+
+## Next: v0.1.0 — the whole encoder (see docs/ROADMAP.md)
+- [ ] Flash attention (`ggml_compute_forward_flash_attn_ext_f16`, ops.cpp ~8440): per (frame, head) Q converted by
+      the K type's `from_float` (Q f32 → f16, the row converter), `kq_vec_dot` = `ggml_vec_dot_f16(64)` per key, `s · scale`
+      (1/√64), the online softmax with `expf` and V accumulated **in f16** (`ggml_vec_scale_f16`, `ggml_vec_mad_f16`)
+      when V is f16; read which path (tiled or one-row) this build takes for 1,500 queries. Check what the 36 padding
+      rows of `kv_pad` (n_ctx_pad = 1536, no mask) hold: they are attended to.
+- [ ] Then the four blocks chained (0.0.8's norms, 0.0.9's products, attention), `ln_post`, and `embd_enc` bit-exact
+      against `whisper_encode_with_state` at a stated thread count.
 
 ## Then, in order
 
@@ -153,9 +181,9 @@ Graph (`whisper_build_graph_conv` + `whisper_build_graph_encoder`, src/whisper.c
 | + bias, GELU | `ggml_add`, `ggml_gelu` | GELU is a **lookup table** (`GGML_GELU_FP16`): x→f16, `ggml_table_gelu_f16[bits]`; x ≤ −10 → 0, x ≥ 10 → x |
 | conv2 | same, stride 2 → [384, 1500] | as conv1 |
 | + positional | `ggml_add(e_pe view, cont(transpose(cur)))` | exact (one add) — done in 0.0.7 |
-| ×4 blocks | `ggml_norm` (eps 1e-5) → `*w + b` → Q,K,V `mul_mat` (f16 weights) + biases | norm: done in 0.0.8 (double sum in order, cvar's 8-lane f32 pairing, `1/sqrtf`, MUL and ADD unfused); the products: 0.0.9 |
+| ×4 blocks | `ggml_norm` (eps 1e-5) → `*w + b` → Q,K,V `mul_mat` (f16 weights) + biases | norm: done in 0.0.8 (double sum in order, cvar's 8-lane f32 pairing, `1/sqrtf`, MUL and ADD unfused); the products: done in 0.0.9 (`from_float` split by thread, then the f16 dot; K has no bias) |
 | attention | **flash_attn = true** (whisper-cli default): K,V copied to the f16 `kv_pad` cache, `ggml_flash_attn_ext(Q, K, V, scale 1/√64)` | online softmax order, Q→f16 conversion, `expf` vs ggml's own exp, V accumulation in f16 or f32 — read `ggml_compute_forward_flash_attn_ext_f16` |
-| out proj, residual, MLP | `mul_mat` + bias, add, norm, `mul_mat` (384→1536), GELU, `mul_mat`, add | as above |
+| out proj, residual, MLP | `mul_mat` + bias, add, norm, `mul_mat` (384→1536), GELU, `mul_mat`, add | done in 0.0.9 (fed the recorded attention output) |
 | ln_post | norm, `*w + b` | done in 0.0.8 (fed the recorded input) |
 
 The matrix products are where the float order lives. For an f16 weight and f32 activation, ggml-cpu converts the

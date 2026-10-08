@@ -5,7 +5,7 @@ has one job, a public surface small enough to read, and an oracle that compares 
 library. A new stage is added beside the old ones, never inside them, and it ships only when its own oracle passes
 in the release gate.
 
-## The modules (0.0.8)
+## The modules (0.0.9)
 
 | module | job | public surface | proven by |
 |---|---|---|---|
@@ -18,9 +18,10 @@ in the release gate.
 | `src/conv.rs` | (0.0.6) `ggml_vec_dot_f16` in the AVX build's float order (4 × 8 lanes, exact products, pairwise reduce, the f32 widened to double and the tail added in double) and encoder conv1 (`ggml_conv_1d_ph`: im2col to f16 + that dot), its bias and GELU; fast path: tiles of 8 frames built from the mel and rounded through F16C (no im2col held), eight dots per weight load, the reduce and the double tail across eight frames, threads by frames | `Conv1` (`new`, `from_parts`, `run`, `run_bias`, `run_gelu`, `run_into`), `vec_dot_f16()`, `dot_f16_model()`, `im2col_f16()`, `wrong::*` (discriminators) | `oracle_vec_dot_f16_kernel`, `oracle_vec_dot_f16_discriminators`, `oracle_conv1_im2col_bit_exact`, `oracle_conv1_bit_exact`, `oracle_conv1_discriminators` (tests/conv1.rs) |
 | `src/conv.rs` (0.0.7) | encoder conv2 (`ggml_conv_1d_ph(w2, ·, 2, 1)`: stride-2 im2col to f16 + 1,152-long f16 dots), its bias and GELU (`embd_conv`), and the positional embedding the encoder graph adds first (`e_pe + cont(transpose(·))`); fast path: per thread, blocks of 32 frames built from conv1's output (no im2col held), a 4-frame × 3-channel AVX2 register block over rows whose columns are permuted so each accumulator's blocks are contiguous (no product or chain changes), the transpose and the add written by the epilogue; `ConvStage` joins conv1 and conv2 through an f16 buffer (conv2 reads only conv1's f16 conversion) | `Conv2` (`new`, `from_parts`, `frames_out`, `run`, `run_into`, `run_into_f16`), `Epilogue` (`Raw`, `BiasGelu`, `Positions`), `ConvStage` (`new`, `run`, `run_into`), `Conv1::run_into_f16`, `im2col_strided_f16()` | `oracle_conv2_im2col_bit_exact`, `oracle_conv2_bit_exact`, `oracle_positions_bit_exact`, `oracle_conv2_discriminators` (tests/conv2.rs) |
 | `src/norm.rs` (0.0.8) | the encoder's layer norms, `ggml_add(ggml_mul(ggml_norm(x, 1e-5), w), b)`, nine in tiny.en (each block's attn_ln and mlp_ln, ln_post): `ggml_compute_forward_norm_f32`'s in-order double sum rounded to f32, `mean = sum / n` in f32, `ggml_vec_cvar_f32`'s 8-blocks (f32 `x − mean`, `d·d`, the `(h0 + h2) + (h1 + h3)` pairing, a double sum), `1.0f / sqrtf(var + eps)`, then `· w` and `+ b` as two roundings (two nodes, no FMA); fast path: the three nodes in one pass per row, the double sums in vector lanes **only on rows that prove every order exact** (else in order), no intermediate tensors, threads by rows | `LayerNorm` (`new`, `from_parts`, `encoder`, `run`, `run_into`, `run_into_split`, `run_model`, `row_model`), `MIN_ROWS_PER_THREAD`, `Node` (`Norm`, `Mul`, `Add`), `Variant` (the reference = default; each flag a discriminator), `row_stats()`, `cvar_model()`, `norm_row()`, `sum_lanes()`, `sum_is_order_free()` | `oracle_norm_nodes_bit_exact`, `oracle_attn_ln_0_from_mel`, `oracle_norm_discriminators` (tests/norm.rs) |
+| `src/matmul.rs` (0.0.9) | the encoder's matrix products on activations as `ggml_compute_forward_mul_mat` runs them for an f16 weight: the f32 activations converted by `from_float` (`ggml_cpu_fp32_to_fp16`, each of the reference's threads converting its element range of every row — which decides how a NaN converts), then 0.0.6's `ggml_vec_dot_f16` per output; Q, K (no bias), V and their f16 CPYs (the scalar bit trick), the out projection + bias + residual, fc1 + bias, GELU, fc2 + bias + residual; fast path: attn_ln / mlp_ln computed row by row into the conversion (never written), one conversion shared by Q, K and V, panels of 64 frames in a permuted layout rounded through F16C, a 4-frame × 3-row AVX2 register block, every epilogue in the panel, the MLP a panel at a time from the out projection to fc2, threads by frames | `Linear` (`new`, `from_parts`, `model`, `convert_model`, `run_into`, `with_split`), `Epilogue` (`None`, `Bias`, `BiasGelu`), `Block` (`new`, `set_split`, `qkv_into`, `mlp_into`), `QkvTaps`, `MlpTaps`, `Variant` (the reference = default; each flag a discriminator), `split_ranges()`, `from_float_row()`, `perm()`, `residual_model()`, `gelu_model()`, `cpy_f16_model()`, `PANEL` | `oracle_matmul_nodes_bit_exact`, `oracle_block0_from_mel`, `oracle_mm_nan_split`, `oracle_matmul_discriminators` (tests/matmul.rs) |
 | `src/measure.rs` | CPU seconds, RSS and its peak from `/proc` (no libc binding), and the `bench` loop the gate uses | `cpu_seconds()`, `rss_kb()`, `peak_rss_kb()`, `reset_peak_rss()`, `bench()` | unit test; its numbers are only read after the oracles pass |
 | `src/lib.rs` | the crate root, and `ulp_distance()` every oracle reports in | `ulp_distance()` | — |
-| `src/main.rs` | the CLI: `voaice info · mel · bench-mel · bench-f16 · conv1 · bench-conv1 · conv · bench-conv · norm · bench-norm · version` (and the opus, resample and vclone commands); a counting allocator for `bench-mel`'s heap peak | — | the gate runs it |
+| `src/main.rs` | the CLI: `voaice info · mel · bench-mel · bench-f16 · conv1 · bench-conv1 · conv · bench-conv · norm · bench-norm · qkv · bench-mm · version` (and the opus, resample and vclone commands); a counting allocator for `bench-mel`'s heap peak | — | the gate runs it |
 
 The pattern each module follows is the one bankml uses: **a pure function of its inputs, the same float operations
 in the same order as the reference, and no hidden state.** That is what makes a module testable alone, and what
@@ -36,7 +37,9 @@ goes in the same way:
 2. **Give the oracle a way to see it.** If whisper.cpp's public API exposes the value, use it; if not, extend the
    layout probe (`testing/oracle/layout_probe.cpp`) or hook ggml's scheduler
    (`ggml_backend_sched_set_eval_callback`) — and make the oracle *self-check* every probed location against a
-   public getter before it trusts it.
+   public getter before it trusts it. Identify nodes by what they read (a weight's name, the node they add to), not
+   by their index; and when the tensors are large, record a digest per row (0.0.9: 80 MB instead of 1.8 GB) and take
+   the full inputs from an earlier record, checking each against the digest of what the node read.
 3. **Write the module** as a new file (`src/encoder.rs`, `src/decoder.rs`, …) with a pure public function.
 4. **Add its oracle** to `tests/oracle.rs` (bit patterns, ULP distance, a count of matches over all inputs) **and a
    discriminator**: a deliberately wrong variant (fused, reordered, wider accumulator) that the oracle must reject.
@@ -55,6 +58,10 @@ goes in the same way:
      multiple of 2^q (q from the smallest non-zero term's exponent) and n · max|term| < 2^(53 + q), no partial sum
      can round in any order, so a lane sum equals the in-order one; a row that cannot prove it takes the in-order
      loop. The proof is checked per row at run time, never assumed for a model or an input set.
+   - (0.0.9) a different layout and a different split of the *same* chains: the dot's four accumulators may live in
+     any registers and its operands in any permuted layout, as long as each accumulator chains the same products in
+     the same order and the reduction pairs as the reference's does; a conversion the reference makes three times
+     (Q, K and V each convert attn_ln's output) may be made once, because it is the same function of the same row.
    And one trap: a C++ `std::max(x, c)` is `x < c ? c : x`, which keeps a NaN `x`; Rust's `f64::max` drops it.
 
 ## Where voaice uses speech-to-text today — the integration points

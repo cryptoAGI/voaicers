@@ -258,6 +258,20 @@ impl LayerNorm {
         });
     }
 
+    /// One row of the ADD node (the norm's output) by the fast path, for a consumer that reads it row by row and never
+    /// needs it whole (0.0.9: fused into the matrix products' f32 → f16 conversion). Same bits as [`LayerNorm::run_into`].
+    #[inline]
+    pub fn row_into(&self, x: &[f32], y: &mut [f32]) {
+        assert!(x.len() == self.n && y.len() == self.n, "layer norm: one row of n");
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: the CPU has AVX2 (checked above); x and y are one row of n each
+            unsafe { x86::row(x, &self.w, &self.b, self.eps, Node::Add, y) };
+            return;
+        }
+        self.row_model(x, Variant::default(), Node::Add, y);
+    }
+
     fn rows(&self, x: &[f32], node: Node, y: &mut [f32]) {
         #[cfg(target_arch = "x86_64")]
         if std::is_x86_feature_detected!("avx2") {

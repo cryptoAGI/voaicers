@@ -1,5 +1,110 @@
 # Changelog
 
+## 0.0.9 — 2026-10-08 — the matrix products on activations, bit-exact: every block's Q, K, V, out projection and MLP
+
+**`mul_mat`'s f32 → f16 conversion of the activations (`from_float`, split by thread) and 0.0.6's f16 dot, with every
+bias, GELU, residual and the f16 copies flash attention reads — all 16 product-side nodes of all four blocks, bit for
+bit as the shipped ggml-cpu computes them inside whisper's encoder scheduler, on 8 inputs at 1 and 4 threads, and block
+0 from voaice's own mel; then 4.6–5.2× the reference at one thread (3.1–5.2× at two, 3.8–4.7× at four), the block in
+a seventh of its memory.**
+Record: `testing/results/0.0.9.txt`; how it was read and found: `testing/matmul/NOTES.md`.
+
+### The ops, read from the pin and the binary
+- Per block: Q = mul_mat(attn.query.weight, attn_ln) + query.bias; **K = mul_mat(attn.key.weight, attn_ln) with no
+  bias** (the source says so; the record confirms no ADD reads K's product); V = mul_mat(attn.value.weight, attn_ln) +
+  value.bias; K and V copied into flash attention's f16 cache by CPY nodes; after attention, mul_mat(attn.out.weight,
+  ·) + out.bias + the block's input; mlp_ln; fc1 = mul_mat(mlp.0.weight, ·) + mlp.0.bias; GELU (0.0.3's table op);
+  fc2 = mul_mat(mlp.2.weight, ·) + mlp.2.bias + that residual. Every bias, GELU and residual is its own node (the CPU
+  backend fuses only RMS_NORM + MUL).
+- `ggml_compute_forward_mul_mat` (ggml-cpu.c:1254) for an f16 weight: `vec_dot_type` F16, so the f32 activations are
+  converted first by `from_float` = `ggml_cpu_fp32_to_fp16` (the type traits; `vcvtps2ph` on blocks of 8, then 4, the
+  portable bit trick on the last `len % 4`) — **every thread converting its element range `[ith·K/nth, (ith+1)·K/nth)`
+  of every row**; a barrier; then chunks of 16 × 16 outputs, each output one `ggml_vec_dot_f16(K, weight row,
+  converted row)` whole in one thread. `LLAMAFILE` off; `GGML_CPU_REPACK` on but with no f16 traits (`nm -D`); the
+  weights sit in a plain CPU buffer (the record checks the buffer's name). K = 384 and 1,536 are multiples of 32: no
+  double tail.
+- **The CPY nodes convert with the scalar bit trick** (`ggml_compute_forward_dup_flt<float, ggml_fp16_t>`, element by
+  element through `GGML_CPU_FP32_TO_FP16`), not the row converter. The two agree on every finite value (0.0.3).
+
+### The oracle
+- `whisper_oracle --matmul`: an eval callback on `sched_encode` observing every node; nodes identified by what they read
+  (a MUL_MAT by its weight's name, an ADD by the node it adds to and its bias's name, a CPY by K's product or V's ADD,
+  GELU by fc1's ADD). **Recorded compactly**: one 64-bit FNV-1a digest per row of each node (a single changed value
+  always changes its row's digest), each MUL_MAT's input digested when the scheduler asks about it, and the attention's
+  output whole — 80 MB for 8 inputs, where the tensors would be ~1.8 GB. The full tensors around the products come from
+  0.0.8's norm record, each checked against the digest of what the MUL_MAT read before voaice is fed it. Self-checks,
+  yes on 8 / 8: 17 nodes in every block; f16 weights in a plain CPU buffer; `src1` contiguous f32; K unbiased; the
+  named biases; 1 vs 4 threads identical; `embd_enc` observed = unobserved; the standalone graphs = the nodes.
+- `oracle_matmul_nodes_bit_exact`: all 16 nodes (k_mm, k_cpy, v_mm, v_add, v_cpy, q_mm, q_add, o_mm, o_add, o_res,
+  fc1_mm, fc1_add, gelu, fc2_mm, fc2_add, mlp_res) of all 4 blocks, by the portable model and the fast path at 1 and 4
+  threads — **0 rows differ** of 2,304,000 digested rows (1,382,400,000 values); the residuals also **0 values differ**
+  against the norm record.
+- `oracle_block0_from_mel`: voaice's mel → conv stage → attn_ln fused into Q, K, V and the CPYs; the out projection →
+  the MLP from the recorded attention output: **0 differ** at 1, 2 and 4 threads on 8 inputs.
+- `whisper_oracle --mm-nan` / `oracle_mm_nan_split`: twelve rows, ten with one NaN placed in an 8-block, a 4-block or
+  the bit trick's tail of some thread's range, through mul_mat(query.weight) + bias at 1..8 threads. voaice's model (at
+  the same split) and fast path (told the split) **0 differ** at every count. **Found: the reference's own output
+  depends on its thread count when an activation is NaN** — at 5 threads it differs from its 1-thread output in 1,920
+  values (5 rows), at 7 in 1,152 (3 rows), at 1, 2, 3, 4, 6 and 8 not at all: the split decides whether `vcvtps2ph`
+  (payload kept) or the bit trick (`sign | 0x7E00`) converts the NaN.
+- Discriminators, each caught on every input (`oracle_matmul_discriminators`, summed over the 4 blocks): activations
+  not rounded to f16, one f32 accumulator, the accumulators reduced in sequence, the bias in the first accumulator —
+  **6,000 / 6,000** q_add rows each; GELU from x without the f16 table **6,000 / 6,000** rows; the residual before the
+  bias **281–307 k** of 2,304,000 o_res values. The scalar bit trick for `from_float` and the split ignored change
+  nothing on the 8 inputs (no NaN) and are caught on the NaN rows: 3,456 values at most thread counts and 1,920 at 5
+  threads (1,152 at 7) respectively.
+- **What this holds for:** this laptop's native libggml-cpu (Zen+, AVX2 + FMA + F16C, no AVX-512). Production's Zen 3
+  library was not run; an AVX-512 build converts 16 at a time first (another tail) — not compared; `base.en` not
+  compared; the attention's output and blocks 1–3's inputs are the reference's (v0.1.0 computes attention); the NaN
+  behaviour is checked on one product with constructed rows, not through a whole block.
+
+### Faster, bits unchanged
+- attn_ln and mlp_ln are computed row by row **into the conversion**: their f32 output is never written (0.0.8's TODO).
+- Q, K and V share **one** conversion of attn_ln's output (the reference converts it three times).
+- A panel of 64 frames is converted into a permuted layout (each accumulator's blocks contiguous), rounded through F16C
+  and widened back (exact); a **4-frame × 3-row** AVX2 register block (conv2's) chains each dot's four accumulators in
+  `ggml_vec_dot_f16`'s order and reduces with its pairing; bias, GELU, residual and the f16 CPYs (bit-trick semantics:
+  F16C unless a block holds a NaN) are the panel's epilogue.
+- The MLP runs a panel at a time from the out projection to fc2: the residual, mlp_ln's output and the 1,536-wide hidden
+  layer never leave the panel. Caller-owned outputs; threads split frames.
+- The weights are held widened to f32 in the kernel's layout (2× the f16 bytes: 7.1 MB per block, outside the measured
+  call). Keeping them f16 and widening in the kernel measured ~30 % slower on this core.
+
+### Measured (gate step 11, only after 4g passed; Ryzen 3 3200U, 2 cores / 4 threads, load 1.6–2.9)
+Block 0 on jfk; inputs computed beforehand by each side from the WAV; the reference = the same ops as a standalone ggml
+graph (equal to the scheduler's nodes), its work buffer allocated once; wall = best of 10 (gate run · one rerun):
+
+| | reference 1t | voaice 1t | 1 thread | 2 threads | 4 threads |
+|---|---|---|---|---|---|
+| q: Q + bias | 54.9 ms | 10.6 ms | 5.19× · 5.07× | 3.06× · 3.91× | 4.74× · 4.16× |
+| fc1 + bias + GELU | 233.1 | 49.6 | 4.70× · 4.80× | 4.68× · 4.68× | 4.27× · 3.81× |
+| fc2 + bias | 210.9 | 41.0 | 5.15× · 4.98× | 5.17× · 4.79× | 4.28× · 4.17× |
+| qkv: attn_ln → Q, K, V, the f16 CPYs | 168.8 | 32.6 | 5.18× · 5.15× | 4.79× · 4.34× | 4.10× · 4.10× |
+| mlp: out proj → residual → mlp_ln → fc1 → GELU → fc2 → residual | 506.5 | 106.0 | 4.78× · 4.75× | 4.58× · 4.82× | 3.89× · 3.93× |
+| block: qkv + mlp (V standing in for attention) | 666.8 | 146.6 | 4.55× · 4.77× | 4.36× · 4.37× | 4.14× · 3.80× |
+
+- Q at 10.6 ms is 21 G multiply-adds per second, about three quarters of this core's eight FMA lanes per cycle at boost.
+- **At 4 threads voaice is no faster than at 2** (block 93.6 → 95.0 ms; the FMA pipes are shared by SMT siblings); the
+  reference gains little either (408 → 393 ms).
+- **CPU:** the block at one thread 162 against 684 CPU-ms; at 4 threads 384 against 1,608.
+- **Memory:** the block **10,351 KiB** (its outputs: Q, K16, V16, the V stand-in, the result, and the panels) against the
+  graph's **69,751** (every node + the work buffer); q 2,444 against 5,626; fc1 9,482 against 28,126.
+
+### Added
+- `src/matmul.rs`: `Linear` (`new`, `from_parts`, `model`, `convert_model`, `run_into`, `with_split`), `Epilogue`,
+  `Block` (`new`, `set_split`, `qkv_into`, `mlp_into`), `QkvTaps`, `MlpTaps`, `Variant` (the reference = default; eight
+  discriminator flags), `split_ranges`, `from_float_row`, `perm`, `residual_model`, `gelu_model`, `cpy_f16_model`,
+  `PANEL`; unit tests (the layout is a permutation; the fast path = the model on k = 32…1536, n = 3…12, 1…70 frames, 1
+  and 3 threads, with GELU and a fused norm; a NaN follows the split; the CPY is the scalar trick).
+  `LayerNorm::row_into` (one row of the norm's output, for the fusion).
+- `voaice qkv`, `voaice bench-mm q|fc1|fc2|qkv|mlp|block`; `tests/matmul.rs` (4 oracle tests).
+- `whisper_oracle --matmul`, `--mm-nan`, `--bench-mm`; gate steps 4g and 11; step 3 prints `ggml_cpu_fp32_to_fp16`'s
+  vcvtps2ph count, `ggml_compute_forward_mul_mat`'s (no FMA: the dot is called through the traits) and the absence of
+  f16 repack traits. Every earlier check kept (13 oracle, 4 opus, 3 streamair, 3 resample, 5 conv1, 4 conv2, 3 norm).
+  The gate's disassembly reads now let `sed` read to the end (`sed -n '1,/ret/p'`): a first run of this version
+  stopped with SIGPIPE (exit 141) when `sed '/ret/q'` quit before objdump finished writing. Step 4b was run with
+  `VOAICE_OPUS_HOST=unreachable.invalid` (SKIPPED: compared against the recorded answers, as 0.0.6 and 0.0.7 did).
+
 ## 0.0.8 — 2026-10-08 — the encoder's layer norms, bit-exact: all nine `norm → · w → + b` chains
 
 **`ggml_norm` and the MUL and ADD whisper puts after it — each block's `attn_ln` and `mlp_ln`, and `ln_post` — bit for

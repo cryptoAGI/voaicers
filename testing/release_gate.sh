@@ -47,6 +47,17 @@
 #   10. (0.0.8) its efficiency, only after 4f passed: the NORM node, and norm -> * w -> + b, on jfk's encoder input,
 #      each side in a fresh process (`voaice bench-norm`, `whisper_oracle --bench-norm`: the same ops as a ggml graph,
 #      which the record shows equal to the scheduler's nodes), at 1, 2 and nproc threads
+#   4g. (0.0.9) the matrix products on activations: every block's Q, K, V, K's and V's f16 copies, the out projection, its
+#      bias and residual, fc1, its bias, GELU, fc2, its bias and residual, read through the encoder scheduler's eval
+#      callback (`whisper_oracle --matmul`: one digest per row of every node, each product's input digested before it
+#      ran, the attention's output whole) and from_float on NaN-bearing rows at 1..8 threads (`--mm-nan`); voaice fed
+#      the recorded inputs (with the norm record of 4f) and block 0 from its own mel, compared bit for bit
+#      (tests/matmul.rs); discriminators (no f16 rounding, one accumulator, the accumulators in sequence, the bias in the
+#      accumulator, the residual before the bias, GELU without its table, the scalar converter, the split ignored)
+#   11. (0.0.9) its efficiency, only after 4g passed: block 0's products on jfk — q, fc1 (+ GELU), fc2, and the block's
+#      two halves and whole (qkv = attn_ln -> Q, K, V; mlp = out proj -> MLP with V standing in for the attention) — each
+#      side in a fresh process (`voaice bench-mm`, `whisper_oracle --bench-mm`: the same ops as a ggml graph, which the
+#      record shows equal to the scheduler's nodes), at 1, 2 and nproc threads
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
@@ -97,7 +108,7 @@ testing/oracle/bin/whisper_oracle --conv1 "$model" .oracle/conv1 .audio/*.wav 2>
 log "(the conv1 record took $(( $(date +%s) - t0 )) s: each input encoded three times, observed at 1 and 4 threads and not observed)"
 lib=upstream/whisper.cpp/build/bin/libggml-cpu.so
 a=$(nm -D --defined-only "$lib" | awk '$3=="ggml_vec_dot_f16"{print "0x"$1}')
-dis=$(objdump -d --no-show-raw-insn "$lib" --start-address="$a" --stop-address=$(printf '0x%x' $((a + 0x100))) | sed '/ret/q')
+dis=$(objdump -d --no-show-raw-insn "$lib" --start-address="$a" --stop-address=$(printf '0x%x' $((a + 0x100))) | sed -n '1,/ret/p')   # sed reads to the end: quitting early can SIGPIPE objdump
 log "libggml-cpu's ggml_vec_dot_f16 ($a): $(echo "$dis" | grep -c vcvtph2ps) vcvtph2ps, $(echo "$dis" | grep -c 'vfmadd231ps.*ymm') ymm vfmadd231ps, $(echo "$dis" | grep -c vhaddps) vhaddps, $(echo "$dis" | grep -c vaddsd) vaddsd (the double tail); GGML_LLAMAFILE $(awk -F= '/^GGML_LLAMAFILE:/{print $2}' upstream/whisper.cpp/build/CMakeCache.txt) in the build"
 rm -rf .oracle/conv2
 t0=$(date +%s)
@@ -107,9 +118,16 @@ rm -rf .oracle/norm
 t0=$(date +%s)
 testing/oracle/bin/whisper_oracle --norm "$model" .oracle/norm .audio/*.wav 2>&1 | tee -a "$out"
 log "(the norm record took $(( $(date +%s) - t0 )) s: each input encoded three times, every encoder node observed at 1 and 4 threads, and not observed)"
-nfn() { local a; a=$(nm -D --defined-only "$lib" | awk -v f="$1" '$3==f{print "0x"$1}'); objdump -d --no-show-raw-insn "$lib" --start-address="$a" --stop-address=$(printf '0x%x' $((a + $2))) | sed '/ret *$/q'; }
+nfn() { local a; a=$(nm -D --defined-only "$lib" | awk -v f="$1" '$3==f{print "0x"$1}'); objdump -d --no-show-raw-insn "$lib" --start-address="$a" --stop-address=$(printf '0x%x' $((a + $2))) | sed -n '1,/ret *$/p'; }   # to the end: no SIGPIPE under pipefail
 cv=$(nfn ggml_vec_cvar_f32 0x400); fn=$(objdump -d --no-show-raw-insn "$lib" | sed -n '/<ggml_compute_forward_norm>:/,/^$/p')
 log "libggml-cpu's ggml_vec_cvar_f32: $(echo "$cv" | grep -c 'vmulps') vmulps, $(echo "$cv" | grep -c 'vaddsd') vaddsd, $(echo "$cv" | grep -cE 'vfn?m(add|sub)') FMA; ggml_compute_forward_norm: $(echo "$fn" | grep -c vsqrtss) vsqrtss, $(echo "$fn" | grep -c vcvtsd2ss) vcvtsd2ss, $(echo "$fn" | grep -cE 'vfn?m(add|sub)') FMA, $(echo "$fn" | grep -c 'vaddsd') vaddsd (the in-order double sum)"
+rm -rf .oracle/matmul
+t0=$(date +%s)
+testing/oracle/bin/whisper_oracle --matmul "$model" .oracle/matmul .audio/*.wav 2>&1 | tee -a "$out"
+testing/oracle/bin/whisper_oracle --mm-nan "$model" .oracle/matmul 2>&1 | tee -a "$out"
+log "(the matmul record took $(( $(date +%s) - t0 )) s: each input encoded three times, every encoder node observed at 1 and 4 threads, and not observed; $(du -sh .oracle/matmul | cut -f1) of digests and attention outputs)"
+ff=$(nfn ggml_cpu_fp32_to_fp16 0x200); mm=$(objdump -d --no-show-raw-insn "$lib" | sed -n '/<ggml_compute_forward_mul_mat>:/,/^$/p')
+log "libggml-cpu's ggml_cpu_fp32_to_fp16 (mul_mat's from_float): $(echo "$ff" | grep -c vcvtps2ph) vcvtps2ph; ggml_compute_forward_mul_mat: $(echo "$mm" | grep -c 'call') calls, $(echo "$mm" | grep -cE 'vfn?m(add|sub)') FMA (the dot is ggml_vec_dot_f16 through the traits); GGML_CPU_REPACK $(awk -F= '/^GGML_CPU_REPACK:/{print $2}' upstream/whisper.cpp/build/CMakeCache.txt) (no f16 repack: $(nm -D --defined-only "$lib" | grep -c 'repack.*ggml_type1EE') f16 traits)"
 log "this CPU: $(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -xE 'avx|avx2|fma|f16c|avx512f' | paste -sd' ') (production: Zen 3, the same extensions; its library is not the one checked here)"
 
 log "## 4. voaice.rs"
@@ -169,6 +187,13 @@ cargo test --release --test norm -- --ignored --nocapture --test-threads=1 2>&1 
   | grep -vE "^\s*(Compiling|Finished|Running)|^$|^running" > "$step" || true
 tee -a "$out" < "$step"
 grep -q "test result: ok. 3 passed" "$step" || { log "FAIL: the layer norm oracle comparisons did not all pass"; exit 1; }
+
+log "## 4g. the matrix products on activations (0.0.9): every block's products, biases, GELU, residuals and f16 copies"
+step=.oracle/matmul_step.log
+cargo test --release --test matmul -- --ignored --nocapture --test-threads=1 2>&1 \
+  | grep -vE "^\s*(Compiling|Finished|Running)|^$|^running" > "$step" || true
+tee -a "$out" < "$step"
+grep -q "test result: ok. 4 passed" "$step" || { log "FAIL: the matmul oracle comparisons did not all pass"; exit 1; }
 
 nt=$(nproc)
 log "## 5. efficiency (only now): log-mel; wall = best of 10 calls, cpu = CPU ms per call (utime+stime, all threads,"
@@ -305,6 +330,25 @@ for what in norm chain; do
     v=$(target/release/voaice bench-norm "$model" .audio/jfk.wav "$what" --threads "$th")
     rw=$(echo "$r" | field wall_best_ms); vw=$(echo "$v" | field wall_best_ms)
     log "$(printf '%-6s %3s | %8.4f %8.4f %5.2fx | %8s %8s | %7s %7s | %6s %6s' "$what" "$th" \
+      "$rw" "$vw" "$(awk -v a="$rw" -v b="$vw" 'BEGIN{print a/b}')" \
+      "$(echo "$r" | field cpu_ms_per_call)" "$(echo "$v" | field cpu_ms_per_call)" \
+      "$(echo "$r" | field op_mem_kb)" "$(echo "$v" | field heap_peak_kb)" \
+      "$(echo "$r" | field rss_peak_delta_kb)" "$(echo "$v" | field rss_peak_delta_kb)")"
+  done
+done
+log "## 11. efficiency (only now): block 0's products (0.0.9) on jfk (inputs computed beforehand from the WAV by each"
+log "##    side: X = the encoder's input; q = Q + b and fc1 = fc1 + b + GELU on attn_ln_0(X); fc2 = fc2 + b on that GELU;"
+log "##    qkv = attn_ln -> Q + b, K, V + b, K and V to f16; mlp = out proj + b + X -> mlp_ln -> fc1 + b -> GELU -> fc2 + b"
+log "##    + residual, V's output standing in for the attention; block = qkv then mlp). wall = best of 10, cpu = CPU ms per"
+log "##    call over >= 1 s; heap: voaice = bytes live at the first call's peak (outputs, then reused; the widened weights"
+log "##    are held with the model, outside the call); the reference = the graph's non-view nodes + its work buffer"
+log "$(printf '%-6s %3s | %9s %9s %6s | %9s %9s | %7s %7s | %6s %6s' op thr ref_ms vo_ms x cpu_ref cpu_vo mem_ref heap_vo rss_r rss_v)"
+for what in q fc1 fc2 qkv mlp block; do
+  for th in 1 2 "$nt"; do
+    r=$(testing/oracle/bin/whisper_oracle --bench-mm "$model" .audio/jfk.wav "$th" "$what")
+    v=$(target/release/voaice bench-mm "$model" .audio/jfk.wav "$what" --threads "$th")
+    rw=$(echo "$r" | field wall_best_ms); vw=$(echo "$v" | field wall_best_ms)
+    log "$(printf '%-6s %3s | %9.3f %9.3f %5.2fx | %9s %9s | %7s %7s | %6s %6s' "$what" "$th" \
       "$rw" "$vw" "$(awk -v a="$rw" -v b="$vw" 'BEGIN{print a/b}')" \
       "$(echo "$r" | field cpu_ms_per_call)" "$(echo "$v" | field cpu_ms_per_call)" \
       "$(echo "$r" | field op_mem_kb)" "$(echo "$v" | field heap_peak_kb)" \

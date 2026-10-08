@@ -14,6 +14,9 @@
 //   whisper_oracle --bench-conv2 <model.bin> <wav> <threads> conv2|stage   (0.0.7) their time, see bench_conv2
 //   whisper_oracle --norm <model.bin> <outdir> <wav ...>    (0.0.8) the encoder's nine norm -> mul -> add chains, see record_norm
 //   whisper_oracle --bench-norm <model.bin> <wav> <threads> norm|chain   (0.0.8) their time, see bench_norm
+//   whisper_oracle --matmul <model.bin> <outdir> <wav ...>  (0.0.9) every block's products, biases, GELU, residuals, see record_matmul
+//   whisper_oracle --mm-nan <model.bin> <outdir>            (0.0.9) from_float on NaN-bearing rows at 1..8 threads, see record_mm_nan
+//   whisper_oracle --bench-mm <model.bin> <wav> <threads> q|fc1|fc2|qkv|mlp|block   (0.0.9) their time, see bench_mm
 //
 // --bench-mel measures the reference's whisper_pcm_to_mel_with_state the way `voaice bench-mel` measures voaice's,
 // in a fresh process each: the heap bytes live at the first call's peak (operator new counted, below), peak RSS of
@@ -1218,7 +1221,436 @@ static int bench_norm(const char * model_path, const char * wav, int threads, co
     return 0;
 }
 
+// ---- 0.0.9: the matrix products on activations, observed in the shipped library --------------------------------------
+// --matmul <model.bin> <outdir> <wav ...> writes, per wav, <outdir>/<stem>/ (compact: per-row digests, not tensors):
+//   nodes.tsv          every node of the encoder graph (the eval callback on sched_encode observes them all)
+//   b<il>.<key>.d64    for each block il and each node below, one 64-bit FNV-1a digest per row (digest32 / digest16 of
+//                      the row's bits: 384 or 1536 f32, or 384 f16), u64 little-endian, 1500 rows:
+//                        k_mm (MUL_MAT key.weight; K has no bias), k_cpy (CPY of k_mm into kv_pad.k, f16),
+//                        v_mm, v_add (+ value.bias), v_cpy (CPY of v_add into kv_pad.v, f16), q_mm, q_add (+ query.bias),
+//                        o_mm (MUL_MAT attn.out.weight on the attention's output), o_add (+ out.bias), o_res (+ the
+//                        block's input), fc1_mm (mlp.0), fc1_add, gelu, fc2_mm (mlp.2), fc2_add, mlp_res (+ o_res)
+//   b<il>.<key>.in.d64 each MUL_MAT's src1 (its f32 activations), digested per row when the scheduler asks about the
+//                      MUL_MAT (every earlier node computed): q, k, v (attn_ln's ADD), o (the attention), fc1 (mlp_ln's
+//                      ADD), fc2 (the GELU)
+//   b<il>.fa.f32       the FLASH_ATTN_EXT node (f32 [64, 6, 1500] = [384, 1500] frame-major): o_mm's input, kept whole
+//                      because voaice.rs does not compute attention yet
+//   matmul.tsv         the self-checks: every block shows the 17 nodes; the MUL_MATs read the named f16 weights from a
+//                      plain CPU buffer (not a repack buffer); src1 contiguous f32; no ADD reads K's MUL_MAT; the ADDs
+//                      read the named biases; 1 vs 4 threads bit-identical (every digest and the attention output);
+//                      embd_enc observed == unobserved; the standalone graphs (what --bench-mm times) == the nodes
+static const char * MM_KEYS[17] = {"k_mm", "k_cpy", "v_mm", "v_add", "v_cpy", "q_mm", "q_add", "o_mm", "o_add", "o_res",
+                                   "fc1_mm", "fc1_add", "gelu", "fc2_mm", "fc2_add", "mlp_res", "fa"};
+static std::vector<uint64_t> row_digests(const ggml_tensor * t, int64_t row) {
+    // a scheduler's tensor lives in a backend buffer; a standalone graph's in its context
+    std::vector<uint8_t> b = t->buffer ? tensor_bytes(t) : std::vector<uint8_t>((const uint8_t *)t->data, (const uint8_t *)t->data + ggml_nbytes(t));
+    const size_t es = ggml_type_size(t->type), rb = (size_t)row * es, n = b.size() / rb;
+    check(b.size() % rb == 0, "row digests: not whole rows");
+    std::vector<uint64_t> d(n);
+    for (size_t r = 0; r < n; r++)
+        d[r] = es == 4 ? digest32((const float *)(b.data() + r * rb), row) : digest16((const uint16_t *)(b.data() + r * rb), row);
+    return d;
+}
+struct mm_capture {
+    std::vector<std::string> lines;
+    std::map<const ggml_tensor *, std::string> names;   // the model's tensors, by pointer
+    std::map<const ggml_tensor *, std::string> key;     // node -> "<il>.<key>"
+    std::map<std::string, std::vector<uint64_t>> d;     // "b<il>.<key>" -> row digests (and "...in")
+    std::map<std::string, std::vector<uint8_t>> keep;   // "b<il>.fa", "b<il>.inp" (the block's input), kept whole
+    int n_layer = 0, n_state = 0, fa_seen = 0;
+    bool weights_named = true, plain_buffers = true, src1_f32 = true, biases_named = true, k_unbiased = true;
+};
+static std::string mm_weight_key(const std::string & w, int & il) {   // encoder.blocks.2.attn.query.weight -> q_mm, il 2
+    const std::string p = "encoder.blocks.";
+    if (w.compare(0, p.size(), p) != 0) return "";
+    il = std::atoi(w.c_str() + p.size());
+    const std::string rest = w.substr(w.find('.', p.size()) + 1);
+    if (rest == "attn.query.weight") return "q_mm";
+    if (rest == "attn.key.weight") return "k_mm";
+    if (rest == "attn.value.weight") return "v_mm";
+    if (rest == "attn.out.weight") return "o_mm";
+    if (rest == "mlp.0.weight") return "fc1_mm";
+    if (rest == "mlp.2.weight") return "fc2_mm";
+    return "";
+}
+static bool mm_cb(ggml_tensor * t, bool ask, void * ud) {
+    auto & c = *static_cast<mm_capture *>(ud);
+    auto src_key = [&](int i) -> std::string {
+        auto it = t->src[i] ? c.key.find(t->src[i]) : c.key.end();
+        return it == c.key.end() ? "" : it->second;
+    };
+    auto put = [&](const std::string & k) { c.key[t] = k; };
+    if (ask) {   // inputs, before the node runs
+        if (t->op == GGML_OP_MUL_MAT) {
+            auto it = c.names.find(t->src[0]);
+            int il = -1;
+            const std::string k = it == c.names.end() ? "" : mm_weight_key(it->second, il);
+            if (!k.empty()) {
+                c.d["b" + std::to_string(il) + "." + k.substr(0, k.size() - 3) + ".in"] = row_digests(t->src[1], t->src[1]->ne[0]);
+                c.src1_f32 = c.src1_f32 && t->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(t->src[1]);
+            }
+        } else if (t->op == GGML_OP_ADD) {
+            const std::string s = src_key(0);
+            if (s.size() > 6 && s.compare(s.size() - 6, 6, ".o_add") == 0)   // the residual: src[1] is the block's input
+                c.keep["b" + s.substr(0, s.find('.')) + ".inp"] = tensor_bytes(t->src[1]);
+        }
+        return true;
+    }
+    cap_line(c.lines, "encode", t);
+    std::string k;   // "<il>.<key>" of this node, if it is one of ours
+    if (t->op == GGML_OP_MUL_MAT) {
+        auto it = c.names.find(t->src[0]);
+        int il = -1;
+        const std::string w = it == c.names.end() ? "" : mm_weight_key(it->second, il);
+        if (!w.empty()) {
+            k = std::to_string(il) + "." + w;
+            c.plain_buffers = c.plain_buffers && t->src[0]->buffer && std::strcmp(ggml_backend_buffer_name(t->src[0]->buffer), "CPU") == 0;
+            c.weights_named = c.weights_named && t->src[0]->type == GGML_TYPE_F16;
+        }
+    } else if (t->op == GGML_OP_ADD) {
+        const std::string s = src_key(0);
+        const std::string il = s.substr(0, s.find('.')), sk = s.empty() ? "" : s.substr(s.find('.') + 1);
+        auto bias = [&](const char * name) {
+            auto it = c.names.find(t->src[1]);
+            c.biases_named = c.biases_named && it != c.names.end() && it->second == "encoder.blocks." + il + "." + name;
+        };
+        if (sk == "k_mm") c.k_unbiased = false;
+        else if (sk == "q_mm") { k = il + ".q_add"; bias("attn.query.bias"); }
+        else if (sk == "v_mm") { k = il + ".v_add"; bias("attn.value.bias"); }
+        else if (sk == "o_mm") { k = il + ".o_add"; bias("attn.out.bias"); }
+        else if (sk == "o_add") k = il + ".o_res";
+        else if (sk == "fc1_mm") { k = il + ".fc1_add"; bias("mlp.0.bias"); }
+        else if (sk == "fc2_mm") { k = il + ".fc2_add"; bias("mlp.2.bias"); }
+        else if (sk == "fc2_add") { k = il + ".mlp_res"; check(src_key(1) == il + ".o_res", "the MLP's residual does not read o_res"); }
+    } else if (t->op == GGML_OP_CPY) {
+        const std::string s = src_key(0), il = s.substr(0, s.find('.'));
+        if (!s.empty() && s.substr(s.find('.') + 1) == "k_mm") k = il + ".k_cpy";
+        if (!s.empty() && s.substr(s.find('.') + 1) == "v_add") k = il + ".v_cpy";
+    } else if (is_gelu(t)) {
+        const std::string s = src_key(0);
+        if (!s.empty() && s.substr(s.find('.') + 1) == "fc1_add") k = s.substr(0, s.find('.')) + ".gelu";
+    } else if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+        k = std::to_string(c.fa_seen++) + ".fa";
+        c.keep["b" + k] = tensor_bytes(t);
+    }
+    if (k.empty()) return true;
+    put(k);
+    const std::string file = "b" + k;
+    if (t->op != GGML_OP_FLASH_ATTN_EXT) c.d[file] = row_digests(t, t->op == GGML_OP_CPY ? c.n_state : t->ne[0]);
+    else c.d[file] = row_digests(t, c.n_state);
+    return true;
+}
+
+// the block's products as a standalone ggml graph on the shipped CPU backend (what --bench-mm times), the same ops in
+// the same order as whisper_build_graph_encoder builds them (attention left out):
+//   q    in = attn_ln's output [384, n]     -> q_mm, q_add
+//   fc1  in = mlp_ln's output              -> fc1_mm, fc1_add, gelu
+//   fc2  in = the GELU [1536, n]           -> fc2_mm, fc2_add
+//   qkv  in = the block's input            -> norm * w + b, then k_mm, k_cpy, v_mm, v_add, v_cpy, q_mm, q_add
+//   mlp  in = the block's input, att = the attention's output -> o_mm, o_add, o_res, norm * w + b, fc1.., fc2.., mlp_res
+//   block = qkv then mlp with att = v_add (V standing in for the attention, which is v0.1.0's)
+struct mm_graph {
+    ggml_context * ctx; ggml_tensor * in = nullptr; ggml_tensor * att = nullptr; ggml_cgraph * gf;
+    std::map<std::string, ggml_tensor *> node;
+    mm_graph(std::map<std::string, ggml_tensor *> & m, int il, const std::string & what, int n_state, int n_ctx) {
+        ggml_init_params p = { (size_t)160 << 20, nullptr, false };
+        ctx = ggml_init(p);
+        check(ctx != nullptr, "ggml_init failed");
+        const std::string pre = "encoder.blocks." + std::to_string(il) + ".";
+        auto W = [&](const char * n) { return conv2_graph::copy(ctx, m.at(pre + n)); };
+        gf = ggml_new_graph(ctx);
+        auto ln = [&](ggml_tensor * x, const char * w) {
+            return ggml_add(ctx, ggml_mul(ctx, ggml_norm(ctx, x, 1e-5f), W((std::string(w) + ".weight").c_str())), W((std::string(w) + ".bias").c_str()));
+        };
+        auto qkv = [&](ggml_tensor * cur) {
+            node["k_mm"] = ggml_mul_mat(ctx, W("attn.key.weight"), cur);
+            node["k_cpy"] = ggml_cpy(ctx, node["k_mm"], ggml_new_tensor_1d(ctx, GGML_TYPE_F16, (int64_t)n_state * n_ctx));
+            ggml_build_forward_expand(gf, node["k_cpy"]);
+            node["v_mm"] = ggml_mul_mat(ctx, W("attn.value.weight"), cur);
+            node["v_add"] = ggml_add(ctx, node["v_mm"], W("attn.value.bias"));
+            node["v_cpy"] = ggml_cpy(ctx, node["v_add"], ggml_new_tensor_1d(ctx, GGML_TYPE_F16, (int64_t)n_state * n_ctx));
+            ggml_build_forward_expand(gf, node["v_cpy"]);
+            node["q_mm"] = ggml_mul_mat(ctx, W("attn.query.weight"), cur);
+            node["q_add"] = ggml_add(ctx, node["q_mm"], W("attn.query.bias"));
+            ggml_build_forward_expand(gf, node["q_add"]);
+        };
+        auto fc1 = [&](ggml_tensor * cur) {
+            node["fc1_mm"] = ggml_mul_mat(ctx, W("mlp.0.weight"), cur);
+            node["fc1_add"] = ggml_add(ctx, node["fc1_mm"], W("mlp.0.bias"));
+            node["gelu"] = ggml_gelu(ctx, node["fc1_add"]);
+            return node["gelu"];
+        };
+        auto fc2 = [&](ggml_tensor * cur) {
+            node["fc2_mm"] = ggml_mul_mat(ctx, W("mlp.2.weight"), cur);
+            node["fc2_add"] = ggml_add(ctx, node["fc2_mm"], W("mlp.2.bias"));
+            return node["fc2_add"];
+        };
+        auto mlp = [&](ggml_tensor * a, ggml_tensor * inp) {
+            node["o_mm"] = ggml_mul_mat(ctx, W("attn.out.weight"), a);
+            node["o_add"] = ggml_add(ctx, node["o_mm"], W("attn.out.bias"));
+            node["o_res"] = ggml_add(ctx, node["o_add"], inp);
+            node["mlp_res"] = ggml_add(ctx, fc2(fc1(ln(node["o_res"], "mlp_ln"))), node["o_res"]);
+            ggml_build_forward_expand(gf, node["mlp_res"]);
+        };
+        if (what == "q") {
+            in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state, n_ctx);
+            node["q_mm"] = ggml_mul_mat(ctx, W("attn.query.weight"), in);
+            node["q_add"] = ggml_add(ctx, node["q_mm"], W("attn.query.bias"));
+            ggml_build_forward_expand(gf, node["q_add"]);
+        } else if (what == "fc1") {
+            in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state, n_ctx);
+            ggml_build_forward_expand(gf, fc1(in));
+        } else if (what == "fc2") {
+            in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4 * n_state, n_ctx);
+            ggml_build_forward_expand(gf, fc2(in));
+        } else if (what == "qkv") {
+            in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state, n_ctx);
+            qkv(ln(in, "attn_ln"));
+        } else if (what == "mlp") {
+            in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state, n_ctx);
+            att = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state, n_ctx);
+            mlp(att, in);
+        } else if (what == "block") {
+            in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state, n_ctx);
+            qkv(ln(in, "attn_ln"));
+            mlp(node["v_add"], in);
+        } else {
+            die("--bench-mm ... q|fc1|fc2|qkv|mlp|block");
+        }
+    }
+    static void set(ggml_tensor * t, const std::vector<uint8_t> & x) { check(x.size() == ggml_nbytes(t), "mm graph input size"); std::memcpy(t->data, x.data(), x.size()); }
+    // ggml_graph_compute_with_ctx would take a new work buffer from ctx on every call: the same plan and compute, the
+    // work buffer (the converted activations) allocated once and reused
+    std::vector<uint8_t> work;
+    void run(int threads) {
+        ggml_cplan cp = ggml_graph_plan(gf, threads, nullptr);
+        if (work.size() < cp.work_size) work.resize(cp.work_size);
+        cp.work_data = work.data();
+        check(ggml_graph_compute(gf, &cp) == GGML_STATUS_SUCCESS, "graph compute failed");
+    }
+    size_t op_bytes() const {   // the graph's own non-view nodes and the work buffer
+        size_t b = work.size();
+        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+            ggml_tensor * t = ggml_graph_node(gf, i);
+            if (t->view_src == nullptr) b += ggml_nbytes(t);
+        }
+        return b;
+    }
+    ~mm_graph() { ggml_free(ctx); }
+};
+
+static int record_matmul(const char * model_path, const std::string & outdir, int nwav, char ** wavs) {
+    if (mkdir(outdir.c_str(), 0755) != 0 && errno != EEXIST) die("cannot create outdir (its parent must exist)");
+    whisper_context * ctx = load_quiet(model_path);
+    auto & tensors = model_tensors(ctx);
+    const int n_ctx = whisper_model_n_audio_ctx(ctx), n_state = whisper_model_n_audio_state(ctx), n_layer = whisper_model_n_audio_layer(ctx);
+    for (int a = 0; a < nwav; a++) {
+        std::string path = wavs[a];
+        std::string stem = path.substr(path.find_last_of('/') + 1);
+        stem = stem.substr(0, stem.find_last_of('.'));
+        const std::string dir = outdir + "/" + stem;
+        mkdir(dir.c_str(), 0755);
+        std::vector<float> pcm = read_wav(path.c_str());
+        mm_capture caps[2];
+        std::vector<uint8_t> obs_enc, unobs_enc;
+        const int threads[2] = {1, 4};
+        for (int k = 0; k < 3; k++) {              // k = 0, 1: observed at 1 and 4 threads; k = 2: not observed, 1 thread
+            whisper_state * st = whisper_init_state(ctx);
+            check(st != nullptr, "whisper_init_state failed");
+            check(whisper_pcm_to_mel_with_state(ctx, st, pcm.data(), (int)pcm.size(), 1) == 0, "pcm_to_mel failed");
+            state_sched(st, VOAICE_OFF_STATE_SCHED_CONV);
+            ggml_backend_sched_t se = state_sched(st, VOAICE_OFF_STATE_SCHED_ENCODE);
+            if (k < 2) {
+                for (auto & kv : tensors) caps[k].names[kv.second] = kv.first;
+                caps[k].n_layer = n_layer;
+                caps[k].n_state = n_state;
+                ggml_backend_sched_set_eval_callback(se, mm_cb, &caps[k]);
+            }
+            check(whisper_encode_with_state(ctx, st, 0, k < 2 ? threads[k] : 1) == 0, "whisper_encode failed");
+            ggml_tensor * ee = *reinterpret_cast<ggml_tensor **>((char *)st + VOAICE_OFF_STATE_EMBD_ENC);
+            check(ee != nullptr && ee->type == GGML_TYPE_F32 && ee->ne[0] == n_state, "layout check failed: embd_enc");
+            if (k != 1) (k == 0 ? obs_enc : unobs_enc) = tensor_bytes(ee);
+            whisper_free_state(st);
+        }
+        mm_capture & c = caps[0];
+        const mm_capture & d = caps[1];
+        bool all17 = c.fa_seen == n_layer, thr = c.d == d.d && c.keep == d.keep;
+        for (int il = 0; il < n_layer; il++)
+            for (const char * key : MM_KEYS) all17 = all17 && c.d.count("b" + std::to_string(il) + "." + key) == 1;
+        for (const char * in : {"q", "k", "v", "o", "fc1", "fc2"})
+            for (int il = 0; il < n_layer; il++) all17 = all17 && c.d.count("b" + std::to_string(il) + "." + in + ".in") == 1;
+        check(all17, "the encoder graph did not show every block's 17 nodes and 6 products");
+        for (auto & kv : c.d) {
+            check(kv.second.size() == (size_t)n_ctx, "unexpected row count");
+            write_bin(dir + "/" + kv.first + ".d64", kv.second.data(), kv.second.size());
+        }
+        for (int il = 0; il < n_layer; il++) {
+            const std::vector<uint8_t> & fa = c.keep.at("b" + std::to_string(il) + ".fa");
+            write_bin(dir + "/b" + std::to_string(il) + ".fa.f32", (const float *)fa.data(), fa.size() / 4);
+        }
+        FILE * nf = std::fopen((dir + "/nodes.tsv").c_str(), "w");
+        for (auto & l : c.lines) std::fprintf(nf, "%s\n", l.c_str());
+        std::fclose(nf);
+        const bool enc_eq = obs_enc == unobs_enc;
+        // the standalone graphs --bench-mm times, against the scheduler's nodes: qkv from the block's input, mlp from the
+        // block's input and the recorded attention output, at 1 and 4 threads, every node's row digests
+        bool alone = true;
+        for (int il = 0; il < n_layer; il++) {
+            const std::string b = "b" + std::to_string(il) + ".";
+            for (const char * what : {"qkv", "mlp"}) {
+                mm_graph g(tensors, il, what, n_state, n_ctx);
+                mm_graph::set(g.in, c.keep.at(b + "inp"));
+                if (g.att) mm_graph::set(g.att, c.keep.at(b + "fa"));
+                for (int th : {1, 4}) {
+                    g.run(th);
+                    for (auto & kv : g.node)
+                        alone = alone && row_digests(kv.second, kv.second->op == GGML_OP_CPY ? n_state : kv.second->ne[0]) == c.d.at(b + kv.first);
+                }
+            }
+        }
+        FILE * m = std::fopen((dir + "/matmul.tsv").c_str(), "w");
+        std::fprintf(m, "n_ctx\t%d\nn_state\t%d\nn_layer\t%d\nnodes\t%zu\nevery_block_17_nodes\tyes\nweights_f16_named\t%s\n"
+                        "weights_in_plain_cpu_buffers\t%s\nsrc1_contiguous_f32\t%s\nbiases_named\t%s\nk_has_no_bias\t%s\n"
+                        "threads_1_vs_4_bit_identical\t%s\nembd_enc_observed_eq_unobserved\t%s\nstandalone_eq_sched\t%s\n",
+                     n_ctx, n_state, n_layer, c.lines.size(), c.weights_named ? "yes" : "NO", c.plain_buffers ? "yes" : "NO",
+                     c.src1_f32 ? "yes" : "NO", c.biases_named ? "yes" : "NO", c.k_unbiased ? "yes" : "NO", thr ? "yes" : "NO",
+                     enc_eq ? "yes" : "NO", alone ? "yes" : "NO");
+        std::fclose(m);
+        std::fprintf(stderr, "whisper_oracle: %s: %zu encoder nodes observed; %d blocks x 17 nodes digested; f16 weights, plain CPU "
+                             "buffers: %s; K unbiased: %s; biases named: %s; 1 vs 4 threads identical: %s; embd_enc observed = "
+                             "unobserved: %s; standalone = scheduler: %s\n", stem.c_str(), c.lines.size(), n_layer,
+                     c.weights_named && c.plain_buffers ? "yes" : "NO", c.k_unbiased ? "yes" : "NO", c.biases_named ? "yes" : "NO",
+                     thr ? "yes" : "NO", enc_eq ? "yes" : "NO", alone ? "yes" : "NO");
+    }
+    whisper_free(ctx);
+    return 0;
+}
+
+// --mm-nan <model.bin> <outdir>: from_float on NaN-bearing activation rows. The real inputs carry no NaN, and on every
+// other f32 the row converter (vcvtps2ph) and the portable bit trick agree (0.0.3), so this is the only place the
+// converter can be told apart. Rows of encoder.positional_embedding (finite), each with one NaN at a position chosen so
+// that some thread counts convert it in an 8-block, a 4-block or the scalar tail of their element range; through the
+// standalone graph mul_mat(block 0's query.weight, x) + query.bias at 1..8 threads. Writes nan.in.f32 ([384, R]),
+// nan.mm.t<n>.f32 and nan.add.t<n>.f32 ([384, R] each), nan.tsv (the positions and payloads).
+static int record_mm_nan(const char * model_path, const std::string & outdir) {
+    if (mkdir(outdir.c_str(), 0755) != 0 && errno != EEXIST) die("cannot create outdir (its parent must exist)");
+    whisper_context * ctx = load_quiet(model_path);
+    auto & tensors = model_tensors(ctx);
+    const int n_state = whisper_model_n_audio_state(ctx);
+    struct nanrow { int pos; uint32_t bits; };
+    // 152, 229, 306, 383: the scalar tail of thread 1..4's range at 5 threads; 148..151: a 4-block there; 52, 53: the
+    // scalar tail of thread 0 at 7 threads; 8: an 8-block at every count. Payloads: high bits (vcvtps2ph keeps them, the
+    // trick does not), negative, signalling with a high payload, signalling with only low bits (both give 0x7E00).
+    const nanrow rows[] = {{152, 0x7FC12345u}, {152, 0xFFD0F000u}, {229, 0x7FBFFFFFu}, {306, 0x7FC7E000u}, {383, 0xFFFFE000u},
+                           {150, 0x7FC12345u}, {53, 0x7FD5A000u}, {52, 0xFFC40000u}, {8, 0x7FC12345u}, {8, 0x7F801234u},
+                           {-1, 0}, {-1, 0}};
+    const int R = (int)(sizeof rows / sizeof rows[0]);
+    std::vector<float> x((size_t)n_state * R);
+    ggml_tensor * pe = tensors.at("encoder.positional_embedding");
+    std::vector<uint8_t> peb = tensor_bytes(pe);
+    for (int r = 0; r < R; r++) {
+        std::memcpy(&x[(size_t)r * n_state], peb.data() + (size_t)(17 * r + 3) * n_state * 4, (size_t)n_state * 4);
+        if (rows[r].pos >= 0) std::memcpy(&x[(size_t)r * n_state + rows[r].pos], &rows[r].bits, 4);
+    }
+    write_bin(outdir + "/nan.in.f32", x.data(), x.size());
+    ggml_init_params p = { (size_t)16 << 20, nullptr, false };
+    ggml_context * gc = ggml_init(p);
+    ggml_tensor * in = ggml_new_tensor_2d(gc, GGML_TYPE_F32, n_state, R);
+    std::memcpy(in->data, x.data(), x.size() * 4);
+    ggml_tensor * mm = ggml_mul_mat(gc, conv2_graph::copy(gc, tensors.at("encoder.blocks.0.attn.query.weight")), in);
+    ggml_tensor * add = ggml_add(gc, mm, conv2_graph::copy(gc, tensors.at("encoder.blocks.0.attn.query.bias")));
+    ggml_cgraph * gf = ggml_new_graph(gc);
+    ggml_build_forward_expand(gf, add);
+    FILE * m = std::fopen((outdir + "/nan.tsv").c_str(), "w");
+    std::vector<uint8_t> work;
+    std::fprintf(m, "rows\t%d\nn_state\t%d\n", R, n_state);
+    for (int r = 0; r < R; r++) std::fprintf(m, "row\t%d\t%d\t%08x\n", r, rows[r].pos, rows[r].bits);
+    for (int th = 1; th <= 8; th++) {
+        ggml_cplan cp = ggml_graph_plan(gf, th, nullptr);
+        if (work.size() < cp.work_size) work.resize(cp.work_size);
+        cp.work_data = work.data();
+        check(ggml_graph_compute(gf, &cp) == GGML_STATUS_SUCCESS, "graph compute failed");
+        check(cp.n_threads == th, "the plan did not take the thread count");
+        write_bin(outdir + "/nan.mm.t" + std::to_string(th) + ".f32", (const float *)mm->data, (size_t)n_state * R);
+        write_bin(outdir + "/nan.add.t" + std::to_string(th) + ".f32", (const float *)add->data, (size_t)n_state * R);
+        std::fprintf(m, "threads\t%d\n", th);
+    }
+    std::fclose(m);
+    std::fprintf(stderr, "whisper_oracle: mm-nan: %d rows (%d with a NaN), query.weight x rows + bias at 1..8 threads recorded\n",
+                 R, R - 2);
+    ggml_free(gc);
+    whisper_free(ctx);
+    return 0;
+}
+
+// --bench-mm <model.bin> <wav> <threads> <what>: block 0's products through the standalone graph above, in a fresh
+// process (what = q | fc1 | fc2 | qkv | mlp | block). The inputs are computed beforehand from <wav> by the standalone
+// graphs of 0.0.7 / 0.0.8 (X = the encoder's input): q, fc1 read attn_ln_0(X) (fc1's stand-in for mlp_ln's output, the
+// same shape); fc2 reads gelu(fc1(attn_ln_0(X))); qkv reads X; mlp reads X and V's output (v_add, standing in for
+// the attention, which voaice.rs does not compute yet); block reads X. wall = best of 10, cpu = CPU ms per compute over
+// >= 1 s, mem = the bytes of the graph's own non-view nodes, rss = VmHWM delta of the first compute.
+static int bench_mm(const char * model_path, const char * wav, int threads, const char * what) {
+    whisper_context * ctx = load_quiet(model_path);
+    auto & tensors = model_tensors(ctx);
+    whisper_state * st = whisper_init_state(ctx);
+    std::vector<float> pcm = read_wav(wav);
+    check(whisper_pcm_to_mel_with_state(ctx, st, pcm.data(), (int)pcm.size(), 1) == 0, "pcm_to_mel failed");
+    auto & mel = *reinterpret_cast<mel_mirror *>((char *)st + VOAICE_OFF_STATE_MEL);
+    const int n_ctx = whisper_model_n_audio_ctx(ctx), n_state = whisper_model_n_audio_state(ctx);
+    const std::string w = what;
+    std::vector<uint8_t> X, LN, V, G;
+    {
+        conv2_graph s(tensors, 2 * n_ctx, whisper_model_n_mels(ctx), true);
+        s.set(mel.data, mel.n_len);
+        s.run(threads);
+        X.assign((const uint8_t *)s.out->data, (const uint8_t *)s.out->data + ggml_nbytes(s.out));
+    }
+    {
+        norm_graph g(tensors.at("encoder.blocks.0.attn_ln.weight"), tensors.at("encoder.blocks.0.attn_ln.bias"), n_state, n_ctx, 1e-5f, true);
+        g.set(X);
+        g.run(threads);
+        LN.assign((const uint8_t *)g.out->data, (const uint8_t *)g.out->data + ggml_nbytes(g.out));
+    }
+    if (w == "fc2") {
+        mm_graph g(tensors, 0, "fc1", n_state, n_ctx);
+        mm_graph::set(g.in, LN);
+        g.run(threads);
+        ggml_tensor * t = g.node.at("gelu");
+        G.assign((const uint8_t *)t->data, (const uint8_t *)t->data + ggml_nbytes(t));
+    }
+    if (w == "mlp") {
+        mm_graph g(tensors, 0, "qkv", n_state, n_ctx);
+        mm_graph::set(g.in, X);
+        g.run(threads);
+        ggml_tensor * t = g.node.at("v_add");
+        V.assign((const uint8_t *)t->data, (const uint8_t *)t->data + ggml_nbytes(t));
+    }
+    mm_graph g(tensors, 0, w, n_state, n_ctx);
+    mm_graph::set(g.in, w == "q" || w == "fc1" ? LN : w == "fc2" ? G : X);
+    if (g.att) mm_graph::set(g.att, V);
+    g.run(threads);                                // the work buffer sized before the measurement (as voaice's first call)
+    const size_t op_bytes = g.op_bytes();
+    const long before = status_kb("VmRSS:");
+    const bool reset = reset_peak_rss();
+    g.run(threads);
+    const long peak = reset ? status_kb("VmHWM:") : -1;
+    double best = 1e30;
+    for (int r = 0; r < 10; r++) { const double t = now_ms(); g.run(threads); best = std::min(best, now_ms() - t); }
+    const double c0 = cpu_seconds(), w0 = now_ms();
+    int reps = 0;
+    while (reps < 10 || now_ms() - w0 < 1000.0) { g.run(threads); reps++; }
+    const double c1 = cpu_seconds();
+    std::printf("bench-mm-reference what %s threads %d wall_best_ms %.4f cpu_ms_per_call %.4f cpu_reps %d op_mem_kb %zu rss_peak_delta_kb %ld\n",
+                what, threads, best, (c1 - c0) * 1000.0 / reps, reps, (op_bytes + 1023) / 1024, peak >= 0 ? peak - before : -1);
+    whisper_free_state(st);
+    whisper_free(ctx);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    if (argc >= 4 && std::strcmp(argv[1], "--matmul") == 0) return record_matmul(argv[2], argv[3], argc - 4, argv + 4);
+    if (argc == 4 && std::strcmp(argv[1], "--mm-nan") == 0) return record_mm_nan(argv[2], argv[3]);
+    if (argc == 6 && std::strcmp(argv[1], "--bench-mm") == 0) return bench_mm(argv[2], argv[3], std::atoi(argv[4]), argv[5]);
     if (argc >= 4 && std::strcmp(argv[1], "--norm") == 0) return record_norm(argv[2], argv[3], argc - 4, argv + 4);
     if (argc == 6 && std::strcmp(argv[1], "--bench-norm") == 0) return bench_norm(argv[2], argv[3], std::atoi(argv[4]), argv[5]);
     if (argc >= 4 && std::strcmp(argv[1], "--conv2") == 0) return record_conv2(argv[2], argv[3], argc - 4, argv + 4);

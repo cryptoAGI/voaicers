@@ -163,6 +163,43 @@ What this holds for: this laptop's native libggml-cpu (Zen+, AVX2 + FMA; the AVX
 which the gate's disassembly shows has no FMA); production's own library was not run. An AVX-512 build takes cvar's
 16-lane branch (`_mm512_reduce_add_ps`), another pairing — not compared. `base.en` (n = 512) not compared.
 
+### The matrix products on activations (0.0.9) — `tests/matmul.rs` against every product-side node of every block
+
+Per block, whisper's encoder computes Q = mul_mat(query.weight, attn_ln) + query.bias, **K = mul_mat(key.weight,
+attn_ln) with no bias**, V = mul_mat(value.weight, attn_ln) + value.bias; K and V are copied (CPY, f32 → f16) into
+flash attention's cache; after attention, mul_mat(out.weight, ·) + out.bias + the block's input (the residual), then
+mlp_ln, fc1 = mul_mat(mlp.0.weight, ·) + mlp.0.bias, GELU, fc2 = mul_mat(mlp.2.weight, ·) + mlp.2.bias + that
+residual. `ggml_compute_forward_mul_mat` converts the f32 activations to f16 first (`from_float` =
+`ggml_cpu_fp32_to_fp16`, **each thread converting its element range of every row**), then every output is one
+`ggml_vec_dot_f16` (testing/matmul/NOTES.md). `whisper_oracle --matmul` observes every encoder node through the eval
+callback on `sched_encode` and identifies each by what it reads (a MUL_MAT by its weight's name, an ADD by the node it
+adds to and the bias's name, a CPY by K's MUL_MAT or V's ADD, GELU by fc1's ADD). The record is **compact**: one 64-bit
+FNV-1a digest per row (frame) of each node's bits — a single changed value always changes its row's digest — plus each
+MUL_MAT's input digested before it ran, and the attention's output whole (voaice does not compute attention yet): 80 MB
+for 8 inputs, where the tensors would be about 1.8 GB. The full tensors around the products (attn_ln's and mlp_ln's
+outputs, the residual stream) come from 0.0.8's norm record, each checked against the digest of what the MUL_MAT read
+before voaice is fed it. Self-checks, all yes on all 8 inputs: every block shows its 17 nodes; the MUL_MATs read f16
+weights from a plain CPU buffer (no repack buffer); every `src1` is contiguous f32; no ADD reads K's product; every
+bias is the named tensor; 1 vs 4 threads bit-identical (every digest, the attention output); `embd_enc` the same
+observed and not; the standalone graphs `--bench-mm` times equal the nodes at 1 and 4 threads.
+
+`whisper_oracle --mm-nan` covers the one place the converter shows: NaN. Twelve rows (ten with one NaN, at positions
+chosen to land in an 8-block, a 4-block or the scalar tail of some thread's range; payloads with high bits, negative,
+signalling) through mul_mat(query.weight) + bias as a standalone graph at 1 to 8 threads.
+
+| oracle | compares | result (0.0.9) |
+|---|---|---|
+| `oracle_matmul_nodes_bit_exact` | per block the 16 nodes k_mm, k_cpy, v_mm, v_add, v_cpy, q_mm, q_add, o_mm, o_add, o_res, fc1_mm, fc1_add, gelu, fc2_mm, fc2_add, mlp_res — each fed the recorded input to that node — by the portable model and by the fast path at 1 and 4 threads; the residuals also value by value against the norm record | **0 rows differ** of 2,304,000 node rows on 8 inputs; o_res and mlp_res **0 values differ** |
+| `oracle_block0_from_mel` | block 0 from the WAV: voaice's mel → conv stage → attn_ln fused into Q, K, V and the two CPYs; the out projection → MLP from the recorded attention output and voaice's own block input, at 1, 2 and 4 threads | the block's input **0 values differ**, every node **0 differ**, 8 inputs |
+| `oracle_mm_nan_split` | the NaN rows at 1..8 threads: the model at the same split, and the fast path told that split, against the reference's MUL_MAT and ADD | **0 differ** at every thread count; the reference's own output at 5 threads differs from its 1-thread output in **1,920** values (5 rows), at 7 threads in **1,152** (3 rows), at 1, 2, 3, 4, 6, 8 not at all |
+| `oracle_mm_nan_split` (discriminators) | the scalar bit trick for every activation; the row converter over the whole row, ignoring the split | the scalar trick: **3,456** values (1,536 at 5 threads, 2,304 at 7); the split ignored: **1,920** at 5 threads, **1,152** at 7 (it *is* the reference at 1, 2, 3, 4, 6, 8) — both rejected |
+| `oracle_matmul_discriminators` | the model with one reading changed, on all 4 blocks of every input | of 6,000 rows per input: activations not rounded to f16, one f32 accumulator, the accumulators reduced in sequence, the bias in the first accumulator — **6,000** q_add rows each; GELU from x without the f16 table — **6,000** gelu rows; the residual before the bias — **281–307 k** of 2,304,000 o_res values; each rejected on every input. The two from_float readings change nothing on these inputs (no NaN): `oracle_mm_nan_split` is what rejects them |
+
+What this holds for: this laptop's native libggml-cpu (Zen+, AVX2 + FMA + F16C, no AVX-512: the 8- and 4-blocks of
+`ggml_cpu_fp32_to_fp16`; an AVX-512 build converts 16 at a time first, which moves where the scalar tail falls — not
+compared); production's own library was not run; `base.en` (n_state 512, 2,048 hidden) not compared; the attention's
+output came from the reference (v0.1.0 computes it).
+
 ## Efficiency — measured only after the oracles pass
 
 (0.0.4) Step 6 of the gate measures the Ogg/Opus reader after 4b passed: Ogg's CRC on 16 MiB sliced-by-8 against the
@@ -217,6 +254,17 @@ input ([1500, 384], computed beforehand by each side's own conv stage): the refe
 `LayerNorm::run_into` with its output kept between calls (`voaice bench-norm`), at 1, 2 and nproc threads. The
 reference's memory is its graph's non-view nodes (the norm, mul and add outputs), from ggml_nbytes.
 
+Step 11 (0.0.9) times block 0's products on jfk, each side in a fresh process on inputs it computed beforehand from the
+WAV (X = the encoder's input): q (Q + bias on attn_ln_0(X)), fc1 (+ bias + GELU, on the same: a stand-in for mlp_ln's
+output, the same shape), fc2 (+ bias, on that GELU), qkv (attn_ln → Q, K, V with K and V to f16), mlp (out projection
++ bias + X → mlp_ln → fc1 → GELU → fc2 + residual, with V's output standing in for the attention) and block (both). The
+reference as ggml graphs of the same ops (`whisper_oracle --bench-mm`; the record shows the qkv and mlp graphs equal
+the scheduler's nodes), computed with its work buffer allocated once; voaice through `Linear::run_into`,
+`Block::qkv_into` and `Block::mlp_into` with outputs kept between calls (`voaice bench-mm`), at 1, 2 and nproc
+threads. The reference's memory is its graph's non-view nodes plus the work buffer (the converted activations);
+voaice's the heap live at the first call's peak. voaice holds its weights widened to f32 (2× the f16 bytes) with the
+model, outside the measured call.
+
 ## The test inputs
 
 Eight WAVs, generated by `testing/make_audio.py` and pinned by sha256 in `testing/pins/audio.sha256`: JFK (11 s,
@@ -240,7 +288,10 @@ result (`embd_conv` is bit-identical with and without the callback, on all 8 inp
 - conv1's four nodes (im2col, the product, + bias, GELU) are bit-identical at 1 and 4 threads: mul_mat splits rows,
   never a dot (each output is one `ggml_vec_dot_f16` call in one thread). So are conv2's four, the CONT and the
   positional ADD (0.0.7), and all nine norm → mul → add chains of the encoder (0.0.8: each row of a NORM is whole in one
-  thread; MUL and ADD are elementwise).
+  thread; MUL and ADD are elementwise), and every product-side node of every block (0.0.9: each dot whole in one
+  thread) — **for finite activations**. A NaN in an activation row converts by `vcvtps2ph` or by the bit trick
+  depending on where the thread split puts it, so the products' NaN payloads differ between thread counts whose
+  split points are not multiples of 4 (at 5 and 7 threads against 1, on the constructed rows of `--mm-nan`).
 - `whisper_full` at 1 thread is identical run to run.
 - At 4 threads against 1, token ids and text are the same, but every token's probability differs in its bits, and
   on JFK the token timestamps move. The transcript oracle is therefore pinned at **1 thread**; a bit-exact transcript
