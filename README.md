@@ -1,7 +1,9 @@
 <h1 align="center">voaice.rs</h1>
 
 <p align="center">
-  <a href="https://github.com/Professor-Codephreak">Professor Codephreak</a> &middot; <a href="https://huggingface.co/Gregory-L">Gregory L. Magnusson</a> &middot; <a href="https://github.com/cryptoAGI">cryptoAGI</a>
+  <a href="https://github.com/Professor-Codephreak">Professor Codephreak</a><br>
+  <a href="https://huggingface.co/Gregory-L">Gregory L. Magnusson</a><br>
+  <a href="https://github.com/cryptoAGI">cryptoAGI</a>
 </p>
 
 **Speech to text in zero-dependency Rust: bit-exact against whisper.cpp first, then faster.**
@@ -229,5 +231,7 @@ stage written here can be swapped in where the older one runs today.
 ---
 
 <p align="center">
-  <a href="https://github.com/Professor-Codephreak">Professor Codephreak</a> &middot; <a href="https://huggingface.co/Gregory-L">Gregory L. Magnusson</a> &middot; <a href="https://github.com/cryptoAGI">cryptoAGI</a>
+  <a href="https://github.com/Professor-Codephreak">Professor Codephreak</a><br>
+  <a href="https://huggingface.co/Gregory-L">Gregory L. Magnusson</a><br>
+  <a href="https://github.com/cryptoAGI">cryptoAGI</a>
 </p>
