@@ -3,7 +3,7 @@
 <p align="center">
   <b>Speech to text in zero-dependency Rust: bit-exact against whisper.cpp first, then faster.</b><br>
   Built the way <a href="https://github.com/cryptoAGI/bankml">bankml</a> was built against llama.cpp.<br><br>
-  <a href="https://github.com/Professor-Codephreak">Professor Codephreak</a> &middot; Gregory L. Magnusson &middot; <a href="https://github.com/cryptoAGI">cryptoAGI</a>
+  <a href="https://github.com/Professor-Codephreak">Professor Codephreak</a> &middot; <a href="https://huggingface.co/Gregory-L">Gregory L. Magnusson</a> &middot; <a href="https://github.com/cryptoAGI">cryptoAGI</a>
 </p>
 
 <p align="center">
@@ -169,3 +169,9 @@ stage written here can be swapped in where the older one runs today.
 [ggml-org/whisper.cpp](https://github.com/ggml-org/whisper.cpp) (MIT), pinned in [`upstream/PIN`](upstream/PIN) at the
 commit mindX production runs. voaice.rs reproduces its compiled output. Credit for the model and its design belongs
 to OpenAI Whisper and to whisper.cpp's authors.
+
+---
+
+<p align="center">
+  <a href="https://github.com/Professor-Codephreak">Professor Codephreak</a> &middot; <a href="https://huggingface.co/Gregory-L">Gregory L. Magnusson</a> &middot; <a href="https://github.com/cryptoAGI">cryptoAGI</a>
+</p>
