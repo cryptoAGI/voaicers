@@ -60,9 +60,9 @@ node testing/fclone/make_oracle.mjs <faicey>/src/face_clone 1000 > tests/fixture
       WAVs, three frame budgets each), the hash and every measure.
 - [ ] **The forensic DSP**: voice-activity detection, the analyser's FFT, pitch, flatness and HNR, which produce
       those features. V8 takes `Math.log` and `Math.exp` from fdlibm, so they get the treatment `atan2` got.
-- [ ] **`framesUsed` from the server.** `/voicey/measure` returns the features and the hash but not `framesUsed`,
-      so a print it hands out cannot be recomputed from its own response. One field on voaice's server (mindX
-      `voaice/server.js` `_measure`) closes it.
+- [x] **`framesUsed` from the server.** Since 2026-10-08 `/voicey/measure` returns `framesUsed`, `framesTotal`, the
+      measures, `kind` and `v` with the hash, so a print the route hands out can be recomputed from its own response.
+      Checked live: on JFK, framesUsed 400, and the recomputed print equals the returned hash.
 - [ ] **Read identities from any `.opus`.** The test reads the tags from streamair's own single-page OpusTags. The
       general reader is voaice.rs 0.0.4's streaming Ogg reader; wire `Identity::from_comments` to it when it lands,
       and add `streamair identity <file.opus>`.

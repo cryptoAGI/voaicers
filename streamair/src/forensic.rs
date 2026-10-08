@@ -12,8 +12,8 @@
 //! DSP that produces the features (voice-activity detection, the analyser's FFT, pitch, flatness) is not ported yet:
 //! V8 takes `Math.log`/`Math.exp` from fdlibm, so it needs the same treatment `atan2` got (docs/FCLONE.md).
 //!
-//! A gap on the server side, recorded here because it decides what can be checked: `/voicey/measure` returns the
-//! features and the hash but not `framesUsed`, so a print it hands out cannot be recomputed from its own response.
+//! `/voicey/measure` returns `framesUsed` and the measures with the hash (since 2026-10-08), so a print it hands out
+//! can be recomputed from its own response with [`forensic_print`].
 
 use crate::fclone::to_fixed18;
 use voaice::json::Value;
