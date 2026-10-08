@@ -1,0 +1,24 @@
+[package]
+name = "streamair"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.99"
+authors = ["Professor Codephreak", "Gregory L. Magnusson"]
+description = "streamair: CPU → .opus in zero-dependency Rust — the Ogg/Opus container first (RFC 3533 / RFC 7845), then the encoder, each stage checked against libopus 1.4"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "streamair"
+path = "src/main.rs"
+
+# Zero dependencies: the CRC, the pager and the headers are in-crate.
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"

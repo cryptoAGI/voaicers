@@ -1,0 +1,6 @@
+# streamair 0.0.1 container oracle — 2026-10-07, against mindX production (libopus0 1.4-1build1, opus-tools 0.2)
+PASS 0.001 s: 48 samples
+PASS 1 s: 48000 samples
+PASS 2.5 s: 120000 samples
+PASS 7.3333 s: 351998 samples
+PASS 60 s: 2880000 samples
