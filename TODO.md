@@ -83,3 +83,9 @@ with AVX2/F16C in the reference's lane order; fused conv+GELU; a KV layout witho
       bankml carries its own f16), with an oracle over every f32 input the mel can produce for `sincosf`/`cosf`
       (400 + 400 arguments) and a sampled-plus-boundary oracle for `log10` on f64.
 - [ ] Threading of the mel (frame i to worker i % n), checked bit-identical to one thread.
+
+## Production parity (checked 2026-10-07)
+- The pin is production's commit (see upstream/PIN). libwhisper there has no FMA, so stages 1–2 are exact on production too.
+- libggml-cpu on production is a native Zen 3 build (652 vfmadd, AVX2). Before the encoder oracle claims production
+  parity, record production's GGML_* build flags (or rebuild there) and compare kernel outputs against that library,
+  not only the laptop's native build.

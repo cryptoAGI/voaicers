@@ -24,3 +24,9 @@ compiler	gcc 11.4.0 (Ubuntu 22.04), glibc 2.35, x86-64 AVX2+FMA host (no AVX-512
 model	ggml-tiny.en.bin	77704715	921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f	https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin
 # base.en is production's default STT model; its sha256 is not pinned yet (not downloaded on this disk-tight machine).
 model_unpinned	ggml-base.en.bin	147964211
+
+# CONFIRMED 2026-10-07 (read-only, production VPS): /opt/whisper.cpp/build/bin/libwhisper.so.1.9.1 + libggml-*.so.0.16.0,
+# built 2026-07-22 00:13 UTC. With full history, the next master commit after 080bbbe8 (2026-07-11) is 97c56f1d
+# (2026-07-28), so master HEAD at the production build was this pin. Production CPU: AMD EPYC 7543P (Zen 3).
+# Production libwhisper has 0 FMA instructions (objdump vfmadd), like this build — the mel oracle holds there.
+# Production libggml-cpu has 652 vfmadd and AVX2 ymm code: the encoder oracle must match THAT build's kernels.
