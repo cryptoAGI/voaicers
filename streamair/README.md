@@ -23,10 +23,23 @@ payload) of exact length. That exercises every container rule without an encoder
 anything is put in it.
 
 ```bash
-cargo test                                   # 6 unit tests: CRC check value, TOC, lacing, continuation, granules
+cargo test                                   # the container's unit tests, and fclone against its oracles
 cargo run --release -- silence 2.5 out.opus  # 466 bytes, 120,000 samples
 testing/oracle.sh user@host                  # against that host's libopus 1.4 tools (local if no host)
 ```
+
+## The identities a stream carries: vCLONE and fCLONE
+
+streamair also carries the voice and the face a stream is made from. Both are prints of a **measurement**, never
+biometrics, and both are byte-identical to the JavaScript that ollywoo runs:
+
+- **`streamair::vclone`** (the voice, re-exported from voaice.rs): the `dvscope/1` vprint and the hash-chained
+  forge log.
+- **`streamair::fclone`** (the face): the twelve-ratio `faceprint/1` of `faice/1` files, checked against faicey on
+  1,000 recorded landmark sets, and MediaPipe's triangulation, read and checked (852 triangles, χ = −2).
+
+`streamair fclone check <file.faice>` and `streamair vclone check <file.voaice>` recompute and compare every
+stored field. The detail and the TODO are in [docs/FCLONE.md](docs/FCLONE.md).
 
 ## Where it is going
 

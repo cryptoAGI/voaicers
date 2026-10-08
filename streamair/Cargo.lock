@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "streamair"
 version = "0.0.1"
+dependencies = [
+ "voaice",
+]
+
+[[package]]
+name = "voaice"
+version = "0.0.3"

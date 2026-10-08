@@ -19,6 +19,7 @@ here with its licence.
 |---|---|---|
 | [OpenAI Whisper](https://github.com/openai/whisper), by Alec Radford, Jong Wook Kim, Tao Xu, Greg Brockman, Christine McLeavey and Ilya Sutskever ([paper](https://arxiv.org/abs/2212.04356)) | MIT (code and weights) | the model and its design. voaice.rs implements the architecture |
 | [`ggml-tiny.en.bin`](https://huggingface.co/ggerganov/whisper.cpp) (also `base.en`), Whisper's weights in ggml format, from the whisper.cpp Hugging Face repository | MIT | the model the oracles run on, pinned by sha256. It is downloaded into `models/`, which is gitignored |
+| [MediaPipe](https://github.com/google-ai-edge/mediapipe) Face Landmarker, by Google | Apache-2.0 | its face-mesh tessellation (the canonical face model's connections) is a test fixture for streamair's fclone (`streamair/tests/fixtures/mediapipe_tessellation.json`): the triangles fCLONE reads and checks. The landmarker itself runs in the browser (ollywoo), not here |
 | [Piper](https://github.com/rhasspy/piper) and its [voices](https://huggingface.co/rhasspy/piper-voices), by Michael Hansen and contributors | MIT (code). Each voice has its own licence | the 70 open-licensed voices in [PYTHAI/voaice](https://huggingface.co/PYTHAI/voaice), each published with Piper's attribution and its own licence and model card |
 
 ## Standards implemented

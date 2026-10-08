@@ -1,0 +1,35 @@
+{
+ "format": "faice/1",
+ "id": "sAGI",
+ "label": "SAVANTE",
+ "engine": "faicey",
+ "landmarker": null,
+ "measured": null,
+ "fprint": null,
+ "provenance": {
+  "source": "",
+  "measuredAt": "",
+  "tool": "faice/1 — nothing measured",
+  "reason": "This office has never been cloned. There is no photograph, no landmark set, and therefore no faceprint. The founder template draiml.persona carries a real faceprint and fourteen clone proportions; this bundle carries none, and says so.",
+  "deciding_experiment": "Run faicey /clone-face against a real image (or perspectives, or video) and record the twelve ordered ratios, their toFixed18 encoding, the precisionScore and the resulting hash with its params. Only that fills these fields."
+ },
+ "render": null,
+ "synthesis": null,
+ "_why": [
+  "faice/1 is voaice/1's sibling, and it inherits the same rule: nulls mean nothing was",
+  "measured. A faceprint is a hash of twelve ratios drawn from a real measurement, so a",
+  "fabricated one is indistinguishable from a real one until somebody tries to reproduce",
+  "it — which is exactly why an unearned value here is a defect and not a placeholder.",
+  "",
+  "The persona's embodiment.face is pointer 14 of the doctrine root. Filling faceprint or",
+  "cloneProportions with a plausible number is named, in the office's own binding document,",
+  "as an edit that voids the office. The bundle would rather carry a hole with a reason.",
+  "",
+  "persona_print stays null BY CONSTRUCTION, not by choice: personaPrint() throws when both",
+  "modalities are absent, so no bundle can carry a persona print it did not earn.",
+  "",
+  "Encoding note for whoever fills this in: faice uses toFixed18 (nine real decimals, then",
+  "padded), while voaice uses floor(v * 1e18) with a float 1e18. They disagree in the low",
+  "digits on purpose. Do not write a shared helper."
+ ]
+}

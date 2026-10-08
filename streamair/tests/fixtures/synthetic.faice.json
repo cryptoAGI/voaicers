@@ -1,0 +1,82 @@
+{
+ "format": "faice/1",
+ "id": "synthetic-face",
+ "label": "synthetic-face",
+ "engine": "faicey",
+ "landmarker": "mediapipe/face_landmarker",
+ "measured": {
+  "source": "ollywoo fCLONE: camera frames, landmarks only (no image kept)",
+  "frames": 12,
+  "meanFrontality": 1,
+  "proportions": {
+   "faceAspect": 0.5966603123126327,
+   "jawRatio": 1.3396185140650518,
+   "cheekRatio": 0.94831422869345,
+   "interocularRatio": 0.38707179042010276,
+   "eyeWidthRatio": 1.0558194096583167,
+   "noseLengthRatio": 1.0714089694329014,
+   "noseWidthRatio": 1.3174818022875305,
+   "mouthWidthRatio": 0.9747572830311738,
+   "lipHeightRatio": 1.8027898947707937,
+   "philtrumRatio": 1.163377780086077,
+   "browEyeRatio": 0.6794320514481693,
+   "chinRatio": 0.8389275859669398
+  },
+  "quality": {
+   "confidence": 0.6,
+   "symmetry": 0.1833296659112159,
+   "frontality": 1
+  }
+ },
+ "fprint": {
+  "hash": "0x2e7f102a6de440c9f63eeebeeb986c4a77300f022345978142ff218c7e060e6c",
+  "version": "faceprint/1",
+  "measureNames": [
+   "faceAspect",
+   "jawRatio",
+   "cheekRatio",
+   "interocularRatio",
+   "eyeWidthRatio",
+   "noseLengthRatio",
+   "noseWidthRatio",
+   "mouthWidthRatio",
+   "lipHeightRatio",
+   "philtrumRatio",
+   "browEyeRatio",
+   "chinRatio"
+  ],
+  "measures": [
+   "596660312000000000",
+   "1339618514000000000",
+   "948314229000000000",
+   "387071790000000000",
+   "1055819410000000000",
+   "1071408969000000000",
+   "1317481802000000000",
+   "974757283000000000",
+   "1802789895000000000",
+   "1163377780000000000",
+   "679432051000000000",
+   "838927586000000000"
+  ],
+  "precisionScore": "554998900000000000",
+  "canonical": "{\"v\":1,\"kind\":\"faceprint\",\"measureNames\":[\"faceAspect\",\"jawRatio\",\"cheekRatio\",\"interocularRatio\",\"eyeWidthRatio\",\"noseLengthRatio\",\"noseWidthRatio\",\"mouthWidthRatio\",\"lipHeightRatio\",\"philtrumRatio\",\"browEyeRatio\",\"chinRatio\"],\"measures\":[\"596660312000000000\",\"1339618514000000000\",\"948314229000000000\",\"387071790000000000\",\"1055819410000000000\",\"1071408969000000000\",\"1317481802000000000\",\"974757283000000000\",\"1802789895000000000\",\"1163377780000000000\",\"679432051000000000\",\"838927586000000000\"],\"precisionScore\":\"554998900000000000\"}",
+  "params": {
+   "encoding": "toFixed18",
+   "realDecimals": 9,
+   "scale": "1e18"
+  }
+ },
+ "mesh": {
+  "format": "fclone-mesh/1",
+  "vertices": 468,
+  "triangles": 852,
+  "sha256": "3a87a3305b4d5c32ee64ae6380d5470bdc7bc7a22574eeb8bf41259473c43480"
+ },
+ "provenance": {
+  "measuredAt": "2026-10-08T04:05:39.398Z",
+  "tool": "ollywoo fclone.js + faicey face_clone (faceprint/1)"
+ },
+ "render": null,
+ "synthesis": null
+}

@@ -4,7 +4,7 @@ version = "0.0.1"
 edition = "2021"
 rust-version = "1.99"
 authors = ["Professor Codephreak", "Gregory L. Magnusson"]
-description = "streamair: CPU → .opus in zero-dependency Rust — the Ogg/Opus container first (RFC 3533 / RFC 7845), then the encoder, each stage checked against libopus 1.4"
+description = "streamair: CPU → .opus in Rust with no third-party crates — the Ogg/Opus container (RFC 3533 / RFC 7845), the encoder next, each stage checked against libopus 1.4; and the identities a stream carries, vCLONE and fCLONE"
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -15,8 +15,10 @@ path = "src/lib.rs"
 name = "streamair"
 path = "src/main.rs"
 
-# Zero dependencies: the CRC, the pager and the headers are in-crate.
+# No third-party crates. One in-repo crate: voaice (this repository's root), for vclone (the voice identity and
+# the forge log) and its JSON and SHA-256, so the voice and the face clones share one implementation of each.
 [dependencies]
+voaice = { path = ".." }
 
 [profile.release]
 lto = true
