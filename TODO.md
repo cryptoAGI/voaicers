@@ -32,9 +32,8 @@ whisper.cpp (upstream/PIN) in the same run; only then is its speed measured.
       patterns four ways; all 2³² f32 patterns three ways (the 1,429,656-value boundary set compared value by value, the
       rest by per-chunk digest); the GELU table; the op on 1,495,192 values and on all 2³². Discriminators:
       round-half-away (rejected) and the unfused GELU (rejected: 1 table entry, `0xBFFF`).
-- [ ] Not observed yet: the inlined scalar copies inside im2col and flash attention themselves (the same macro; the
-      oracle sees the row tail's copy, the table-init's copy and the GELU op's copy). They are checked when their
-      nodes are, through the scheduler callback (0.0.6 onward).
+- [x] im2col's inlined scalar copy: observed through conv1's IM2COL node in 0.0.6 (5,760,000 / 5,760,000).
+- [ ] Not observed yet: flash attention's inlined copy (checked when its node is, through the scheduler callback).
 
 ## Done in 0.0.4 — the streaming Ogg/Opus reader (`src/ogg.rs`)
 - [x] Pages from any `std::io::Read`, one page buffer (65,307 bytes) allocated once and reused; a packet inside a page
@@ -74,9 +73,26 @@ whisper.cpp (upstream/PIN) in the same run; only then is its speed measured.
       coefficients and float order are fixed by the oracle. What remains to win is around it: `.opus` decoded straight
       into this converter (v0.4.0), and the mel fed from it without the whole vector.
 
-## Next: 0.0.6 — encoder conv1 (see docs/ROADMAP.md)
-- [ ] `im2col` to f16 (0.0.3's portable f32→f16), then `mul_mat` against the f16 weights; oracle: the conv1 node's
-      output through ggml's scheduler callback.
+## Done: 0.0.6 — `ggml_vec_dot_f16` (brought forward from 0.0.9) and encoder conv1 (CHANGELOG.md, testing/conv1/NOTES.md)
+- [x] The order decided from the source and the binary before any code: conv1's mul_mat has the f16 weights as its
+      *second* operand (already the F16 `vec_dot_type`, nothing converted), every output one
+      `ggml_vec_dot_f16(240)` whole in one thread; the AVX path (4 × 8 lanes, FMA, pairwise reduce, double tail of 16)
+      read in `objdump`; LLAMAFILE off, repack has no f16. The kernel was the roadmap's 0.0.9 — moved here, rows renumbered.
+- [x] Oracle through ggml's scheduler eval callback on `whisper_state::sched_conv` (layout probe): IM2COL, MUL_MAT,
+      ADD, GELU nodes bit-exact on 8 inputs at 1 and 4 threads; the kernel on 1,436 real/random dots; four
+      discriminators caught; `embd_conv` unchanged by observing; the standalone graph the bench times = the node.
+- [x] Faster, bits unchanged: no im2col, tiles of 8 frames rounded through F16C, 8 dots per weight load, the reduce and
+      double tail vectorized across frames, threads by frames, the output kept by the caller (`Conv1::run_into`).
+- [ ] Not covered: production's own libggml-cpu (Zen 3) was not run; an AVX-512 host's 16-lane path; offsets other
+      than 0 against the reference (voaice's windowing at other offsets is checked against its own im2col + model
+      dot in unit tests, not against whisper); `base.en` (n_state 512).
+- [ ] Efficiency left on the table: the kernel issues 9 loads per 8 FMAs (one weight block, eight frame rows); a
+      4-frame × 2-channel tile would issue 6, at the cost of a second epilogue shape. At 4 threads on this 2-core /
+      4-thread laptop voaice gains nothing over 2 (the FMA pipes are shared by SMT siblings).
+
+## Next: 0.0.7 — conv2 (see docs/ROADMAP.md)
+- [ ] conv2 (stride 2, 1500 frames; n = 1,152 = 36 × 32: no tail) on conv1's GELU output, its bias and GELU nodes,
+      then the positional embedding add; oracle: the conv graph's remaining nodes and `embd_conv`.
 
 ## Then, in order
 
@@ -107,8 +123,10 @@ Graph (`whisper_build_graph_conv` + `whisper_build_graph_encoder`, src/whisper.c
 The matrix products are where the float order lives. For an f16 weight and f32 activation, ggml-cpu converts the
 activation row to f16 (`vec_dot_type` of F16 is F16) and calls `ggml_vec_dot_f16`: on AVX2 that is 4 accumulators ×
 8 lanes with FMA, then `GGML_F32x8_REDUCE`'s pairwise order, then a scalar tail. Threads split rows (each dot whole
-in one thread), so the count should not change bits — to be checked, as the mel's was. `GGML_LLAMAFILE` is OFF in
-this build (whisper.cpp's CMake does not set the default), so tinyBLAS is not in the path; the oracle must confirm it.
+in one thread), so the count should not change bits — checked for conv1 in 0.0.6 (1 vs 4 threads identical).
+`GGML_LLAMAFILE` is OFF in this build (CMakeCache.txt; the gate prints it), so tinyBLAS is not in the path, and the
+traits' `vec_dot` for F16 is the exported `ggml_vec_dot_f16` (0.0.6's record checks the pointer). Note conv1 is the
+other way round: there the *weights* are mul_mat's src1 and nothing is converted.
 
 **How the oracle checks each step.** The public API gives the encoder's output: `whisper_encode_with_state()` after
 `whisper_set_mel_with_state()` (or `pcm_to_mel`), then `state->embd_enc` — a `ggml_tensor *` at an offset the layout
@@ -120,7 +138,7 @@ still does all the arithmetic, the oracle only observes. Kernel-level oracles, a
 `ggml_table_gelu_f16` is an **exported symbol** of `libggml-cpu.so` (dump all 65,536 entries and compare to the port's
 table), `ggml_cpu_fp32_to_fp16` / `ggml_vec_dot_f16` are reachable through `ggml_get_type_traits_cpu`.
 
-Order of work: GELU table → f32↔f16 conversions (both done in 0.0.3) → `vec_dot_f16` on sampled real rows → conv1 → conv2 → one block
+Order of work: GELU table → f32↔f16 conversions (both done in 0.0.3) → `vec_dot_f16` on sampled real rows → conv1 (both done in 0.0.6) → conv2 → one block
 (norm, attention, MLP) → all four → `embd_enc` bit-exact on the 8 test inputs.
 
 ### Stage 4 — decoder (plan)

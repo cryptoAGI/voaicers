@@ -72,6 +72,30 @@ whisper-cli does without `--diarize`, writing the vector it returns. The corpus 
 | `oracle_resample_streaming_equals_whole` | the data chunk pushed through `Converter` in pseudo-random 1–9,000-byte pieces (frames split across pushes) | **55 / 55** files equal the reference |
 | `oracle_resample_discriminates` | wrong readings of miniaudio: a low-pass of order 2 or 6; the stereo mixdown as `L + R` (the diarize path's) or the left channel alone; the output length as the samples the resampler makes | order 2: **45 / 50** resampled files differ, order 6: **45 / 50** (the 5 not caught are 1–2-frame inputs whose only output is the leading 0); `L + R`: **8 / 8**, `L` alone: **8 / 8** stereo s16 files; the length: **3 / 55** (exactly the files with a zero tail) |
 
+### Encoder conv1 and `ggml_vec_dot_f16` (0.0.6) — `tests/conv1.rs` against the conv graph's own nodes
+
+`whisper_oracle --conv1` loads the model, computes each input's mel, and runs `whisper_encode_with_state` at offset 0
+three times: twice with `ggml_backend_sched_set_eval_callback` set on the state's **conv scheduler**
+(`whisper_state::sched_conv`, at an offset from the layout probe; self-checked: non-null, only the `CPU` backend, and
+the graph must show IM2COL, MUL_MAT, ADD, GELU in that order) at 1 and at 4 threads, and once without it. The
+callback copies every node's output as the scheduler finishes it; the shipped library does all the arithmetic. It
+also calls `ggml_get_type_traits_cpu(GGML_TYPE_F16)->vec_dot` — which it checks is the exported `ggml_vec_dot_f16` —
+on real rows. How the order was decided, and the disassembly it agrees with: `testing/conv1/NOTES.md`.
+
+| oracle | compares | result (0.0.6) |
+|---|---|---|
+| `oracle_vec_dot_f16_kernel` | 1,436 dots by the shipped kernel: 16 random row pairs of every one of the model's 70 f16 tensors (as mul_mat reads them: n = 240, 384, 1,152, 1,536), every length 1–300 on two real conv2 rows (every tail 0–31, and n < 32 where there is no vector loop), 64 vectors of random finite f16 patterns (every exponent, both signs, subnormals) | **1,436 / 1,436** identical, 303 distinct lengths |
+| `oracle_vec_dot_f16_discriminators` | one f32 accumulator in index order; the right lanes with the tail added in f32 instead of double; the four accumulators reduced in sequence instead of pairwise | **1,265**, **211** and **680** of 1,436 dots differ — each rejected |
+| `oracle_conv1_im2col_bit_exact` | conv1's IM2COL node (f16 [240, 3000]: the mel window rounded by ggml-cpu's inlined `GGML_CPU_FP32_TO_FP16`) against voaice's, from voaice's own mel of the WAV | **5,760,000 / 5,760,000** f16 values, 8 inputs |
+| `oracle_conv1_bit_exact` | the MUL_MAT node (conv1 without its bias, f32 [3000, 384]), the ADD (+ bias) and the GELU after it, against voaice's fast path at 1 and 4 threads; the record must also say the reference's own 1- and 4-thread nodes are identical, that `embd_conv` is the same observed and not, and that the standalone graph `--bench-conv1` times equals the scheduler's node | **0 values differ** in any of the three nodes on any of the 8 inputs at either thread count (55,296,000 compared); all three record checks yes |
+| `oracle_conv1_discriminators` | conv1 with im2col kept in f32 (no f16 rounding), and with a one-accumulator dot, on JFK | **1,151,932** and **1,068,048** of 1,152,000 values differ — both rejected |
+
+What this holds for: **this laptop's** native libggml-cpu (Zen+: AVX2, FMA, F16C, no AVX-512), which takes the AVX
+path of `ggml_vec_dot_f16`. Production's native build (Zen 3) has the same extensions and so compiles the same path,
+and because every product of two halves is exact in f32, the FMA and a separate multiply and add give the same bits in
+this kernel — but production's own library was not run by this oracle. An AVX-512 host would take a 16-lane path
+with another reduction order; voaice does not model it.
+
 ## Efficiency — measured only after the oracles pass
 
 (0.0.4) Step 6 of the gate measures the Ogg/Opus reader after 4b passed: Ogg's CRC on 16 MiB sliced-by-8 against the
@@ -104,7 +128,15 @@ reference's through a one-op ggml graph; its two tensor copies are measured alon
 symbols `ggml_table_f32_f16` / `ggml_table_gelu_f16` by libggml-cpu (`nm -D`). The scalar `GGML_CPU_FP32_TO_FP16` is
 inlined, not exported: the oracle reaches ggml-cpu's own compiled copy by calling `ggml_cpu_fp32_to_fp16` on three
 values at a time (always its tail loop), and the GELU op's copy through the op. The copies inlined in im2col and
-flash attention are not observed until those nodes are (0.0.6 onward).
+flash attention are not observed until those nodes are: im2col's is, since 0.0.6 (the IM2COL node, through the
+scheduler's eval callback).
+
+Step 8 (0.0.6) times conv1 — and conv1 + bias + GELU — each side in a fresh process: the reference as a ggml graph of
+the same ops on copies of the weights and the mel window, computed by the shipped CPU backend
+(`whisper_oracle --bench-conv1`; the record shows this graph's output equals the scheduler's node, at 1 and 4
+threads), voaice through `Conv1::run_into` with its output kept between calls (`voaice bench-conv1`), at 1, 2 and
+nproc threads. The reference's memory is the bytes of the graph's own tensors (ggml_nbytes: im2col and the product,
+plus the add and GELU outputs), voaice's the heap live at the first call's peak, its output included.
 
 ## The test inputs
 
@@ -118,11 +150,16 @@ whisper.cpp's public C API has no getter for the mel it computes, the tensors it
 `testing/oracle/layout_probe.cpp` compiles the pinned source with the same compiler and prints `offsetof()` for each;
 `testing/oracle/whisper_oracle.cpp` reads the shipped library's own objects at those offsets, **after checking each
 against a public getter** (the tensor map's size against the loader's count, `n_len_org` against
-`whisper_n_len_from_state`, `n_mel` against `whisper_model_n_mels`), and refuses to run on any mismatch.
+`whisper_n_len_from_state`, `n_mel` against `whisper_model_n_mels`), and refuses to run on any mismatch. Since
+0.0.6 it also finds the state's schedulers (`sched_conv`, `sched_encode`) and `embd_conv` that way, and observes
+every node of the conv graph through ggml's own `ggml_backend_sched_set_eval_callback`; observing does not change the
+result (`embd_conv` is bit-identical with and without the callback, on all 8 inputs).
 
 ## Determinism of the reference
 
 - The mel is bit-identical at 1 and 4 threads (each frame is computed whole by one thread).
+- conv1's four nodes (im2col, the product, + bias, GELU) are bit-identical at 1 and 4 threads: mul_mat splits rows,
+  never a dot (each output is one `ggml_vec_dot_f16` call in one thread).
 - `whisper_full` at 1 thread is identical run to run.
 - At 4 threads against 1, token ids and text are the same, but every token's probability differs in its bits, and
   on JFK the token timestamps move. The transcript oracle is therefore pinned at **1 thread**; a bit-exact transcript

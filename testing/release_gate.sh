@@ -24,6 +24,12 @@
 #      streaming equal to the whole; discriminators (another low-pass order, another mixdown, another length rule)
 #   7. (0.0.5) its efficiency, only after 4c passed: each side reads the same file whole, in a fresh process (`voaice
 #      bench-resample`, `resample_oracle --bench`)
+#   4d. (0.0.6) encoder conv1 and ggml_vec_dot_f16: the conv graph's IM2COL, MUL_MAT, ADD and GELU nodes as the shipped
+#      scheduler computed them (read through its eval callback, `whisper_oracle --conv1`), and the kernel on real rows of
+#      every f16 tensor, compared bit for bit (tests/conv1.rs); discriminators (other dot orders, im2col without its f16)
+#   8. (0.0.6) its efficiency, only after 4d passed: conv1, and conv1 + bias + GELU, each side in a fresh process
+#      (`voaice bench-conv1`, `whisper_oracle --bench-conv1`: the same ops as a ggml graph on the shipped CPU backend,
+#      which the record shows equal to the scheduler's nodes), at 1, 2 and nproc threads
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
@@ -68,6 +74,16 @@ testing/oracle/bin/resample_oracle .oracle/resample .audio/resample/*.wav > .ora
 log "resample_oracle (libcommon.a's read_audio_data): $(wc -l < .oracle/resample.log) files recorded, $(awk '{s+=$2} END{print s}' .oracle/resample.log) samples"
 log "libcommon.a's common-whisper.cpp.o (miniaudio inside): $(objdump -d upstream/whisper.cpp/build/examples/CMakeFiles/common.dir/common-whisper.cpp.o | grep -cE 'vfn?m(add|sub)') FMA instructions, $(objdump -d upstream/whisper.cpp/build/examples/CMakeFiles/common.dir/common-whisper.cpp.o | grep -c '%ymm') ymm uses"
 
+rm -rf .oracle/conv1
+t0=$(date +%s)
+testing/oracle/bin/whisper_oracle --conv1 "$model" .oracle/conv1 .audio/*.wav 2>&1 | tee -a "$out"
+log "(the conv1 record took $(( $(date +%s) - t0 )) s: each input encoded three times, observed at 1 and 4 threads and not observed)"
+lib=upstream/whisper.cpp/build/bin/libggml-cpu.so
+a=$(nm -D --defined-only "$lib" | awk '$3=="ggml_vec_dot_f16"{print "0x"$1}')
+dis=$(objdump -d --no-show-raw-insn "$lib" --start-address="$a" --stop-address=$(printf '0x%x' $((a + 0x100))) | sed '/ret/q')
+log "libggml-cpu's ggml_vec_dot_f16 ($a): $(echo "$dis" | grep -c vcvtph2ps) vcvtph2ps, $(echo "$dis" | grep -c 'vfmadd231ps.*ymm') ymm vfmadd231ps, $(echo "$dis" | grep -c vhaddps) vhaddps, $(echo "$dis" | grep -c vaddsd) vaddsd (the double tail); GGML_LLAMAFILE $(awk -F= '/^GGML_LLAMAFILE:/{print $2}' upstream/whisper.cpp/build/CMakeCache.txt) in the build"
+log "this CPU: $(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -xE 'avx|avx2|fma|f16c|avx512f' | paste -sd' ') (production: Zen 3, the same extensions; its library is not the one checked here)"
+
 log "## 4. voaice.rs"
 cargo build --release 2>&1 | tail -1 | tee -a "$out"
 cargo clippy --release --all-targets -q -- -D warnings 2>&1 | tee -a "$out"
@@ -104,6 +120,13 @@ cargo test --release --test resample -- --ignored --nocapture --test-threads=1 2
   | grep -vE "^\s*(Compiling|Finished|Running)|^$|^running" > "$step" || true
 tee -a "$out" < "$step"
 grep -q "test result: ok. 3 passed" "$step" || { log "FAIL: the resampler oracle comparisons did not all pass"; exit 1; }
+
+log "## 4d. encoder conv1 and ggml_vec_dot_f16 (0.0.6): the conv graph's nodes through the scheduler's eval callback"
+step=.oracle/conv1_step.log
+cargo test --release --test conv1 -- --ignored --nocapture --test-threads=1 2>&1 \
+  | grep -vE "^\s*(Compiling|Finished|Running)|^$|^running" > "$step" || true
+tee -a "$out" < "$step"
+grep -q "test result: ok. 5 passed" "$step" || { log "FAIL: the conv1 oracle comparisons did not all pass"; exit 1; }
 
 nt=$(nproc)
 log "## 5. efficiency (only now): log-mel; wall = best of 10 calls, cpu = CPU ms per call (utime+stime, all threads,"
@@ -193,6 +216,24 @@ for f in jfk_48k bench_44k1_s_60s r48000_s_s16 r44100_s_s16 r22050_m_s16 r8000_s
   sum=$(awk -v s="$sum" -v a="$rw" -v b="$vw" 'BEGIN{print s + log(a/b)}'); k=$((k + 1))
 done
 log "$(awk -v s="$sum" -v k="$k" 'BEGIN{printf "geometric mean over %d files: voaice reads %.2fx faster than whisper-cli'"'"'s read_audio_data (cpu_ms/as = voaice CPU ms per second of output audio)", k, exp(s/k)}')"
+log "## 8. efficiency (only now): encoder conv1 (0.0.6), the first 30-s window of jfk (3000 frames, any input costs the"
+log "##    same). wall = best of 10, cpu = CPU ms per call over >= 1 s; heap: voaice = bytes live at the first call's peak"
+log "##    (its output allocated by that call, then reused, as the reference's graph keeps its tensors); the reference ="
+log "##    the bytes of the graph's own tensors (im2col, the product, and for +gelu the add and gelu outputs), from"
+log "##    ggml_nbytes; rss = VmHWM delta of the first call"
+log "$(printf '%-12s %3s | %8s %8s %6s | %8s %8s | %7s %7s | %6s %6s' op thr ref_ms vo_ms x cpu_ref cpu_vo mem_ref heap_vo rss_r rss_v)"
+for what in conv1 gelu; do
+  for th in 1 2 "$nt"; do
+    r=$(testing/oracle/bin/whisper_oracle --bench-conv1 "$model" .audio/jfk.wav "$th" "$what")
+    v=$(target/release/voaice bench-conv1 "$model" .audio/jfk.wav "$what" --threads "$th")
+    rw=$(echo "$r" | field wall_best_ms); vw=$(echo "$v" | field wall_best_ms)
+    log "$(printf '%-12s %3s | %8.3f %8.3f %5.2fx | %8s %8s | %7s %7s | %6s %6s' "$( [ "$what" = gelu ] && echo conv1+b+gelu || echo conv1)" "$th" \
+      "$rw" "$vw" "$(awk -v a="$rw" -v b="$vw" 'BEGIN{print a/b}')" \
+      "$(echo "$r" | field cpu_ms_per_call)" "$(echo "$v" | field cpu_ms_per_call)" \
+      "$(echo "$r" | field op_mem_kb)" "$(echo "$v" | field heap_peak_kb)" \
+      "$(echo "$r" | field rss_peak_delta_kb)" "$(echo "$v" | field rss_peak_delta_kb)")"
+  done
+done
 log "## transcripts recorded (not yet reproduced by voaice.rs: encoder and decoder are later stages)"
 for d in .oracle/tiny.en/*/; do log "$(basename "$d"): $(tr '\n' ' ' < "$d/transcript.txt")"; done
 log "GATE PASSED"

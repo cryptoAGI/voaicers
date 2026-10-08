@@ -23,6 +23,11 @@ int main() {
     std::printf("#define VOAICE_OFF_MODEL_FILTERS  %zu\n", offsetof(whisper_model, filters));
     std::printf("#define VOAICE_OFF_MODEL_TENSORS  %zu\n", offsetof(whisper_model, tensors));
     std::printf("#define VOAICE_OFF_MODEL_N_LOADED %zu\n", offsetof(whisper_model, n_loaded));
+    // (0.0.6) the schedulers, so the oracle can observe each node through ggml's eval callback, and embd_conv
+    std::printf("#define VOAICE_OFF_STATE_SCHED_CONV   %zu\n", offsetof(whisper_state, sched_conv));
+    std::printf("#define VOAICE_OFF_STATE_SCHED_ENCODE %zu\n", offsetof(whisper_state, sched_encode));
+    std::printf("#define VOAICE_OFF_STATE_EMBD_CONV    %zu\n", offsetof(whisper_state, embd_conv));
+    std::printf("#define VOAICE_OFF_WSCHED_SCHED       %zu\n", offsetof(whisper_sched, sched));
     std::printf("#define VOAICE_SIZEOF_MEL         %zu\n", sizeof(whisper_mel));
     std::printf("#define VOAICE_SIZEOF_FILTERS     %zu\n", sizeof(whisper_filters));
     return 0;

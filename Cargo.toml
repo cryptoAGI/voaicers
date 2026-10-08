@@ -1,6 +1,6 @@
 [package]
 name = "voaice"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2021"
 rust-version = "1.99"
 authors = ["Professor Codephreak", "Gregory L. Magnusson"]

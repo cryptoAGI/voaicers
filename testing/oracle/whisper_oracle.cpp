@@ -8,6 +8,8 @@
 //   whisper_oracle --bench-mel <model.bin> <wav> <threads>
 //   whisper_oracle --f16 <outdir>                 (0.0.3) the f32<->f16 conversions and GELU of the shipped libggml*
 //   whisper_oracle --bench-f16 <what>             (0.0.3) one measurement of them, see bench_f16
+//   whisper_oracle --conv1 <model.bin> <outdir> <wav ...>   (0.0.6) the conv graph's nodes and ggml_vec_dot_f16, see record_conv1
+//   whisper_oracle --bench-conv1 <model.bin> <wav> <threads> conv1|gelu   (0.0.6) conv1's time, see bench_conv1
 //
 // --bench-mel measures the reference's whisper_pcm_to_mel_with_state the way `voaice bench-mel` measures voaice's,
 // in a fresh process each: the heap bytes live at the first call's peak (operator new counted, below), peak RSS of
@@ -484,7 +486,276 @@ static int bench_f16(const char * what) {
     return 0;
 }
 
+
+// ---- 0.0.6: encoder conv1 and ggml_vec_dot_f16, observed in the shipped library -----------------------------------
+// --conv1 <model.bin> <outdir> <wav ...> writes, per wav, <outdir>/<stem>/:
+//   nodes.tsv        every node of the conv graph as the scheduler computes it: index, name, op, type, ne0..ne3
+//   im2col.u16       the first IM2COL node (conv1's: f16 [240, 3000], row t = the 240 inputs of output frame t)
+//   conv1.f32        the MUL_MAT after it (conv1 without its bias: f32, ne0 = 3000 frames, ne1 = 384 channels)
+//   conv1_bias.f32   the ADD after it (+ encoder.conv1.bias)
+//   conv1_gelu.f32   the GELU after it (what conv2's im2col reads)
+//   conv1.tsv        threads compared (1 and 4: all four nodes bit-identical?), embd_conv observed vs not, the
+//                    standalone ggml graph (the one --bench-conv1 times) vs the scheduler's node
+// The nodes are read through ggml_backend_sched_set_eval_callback on whisper_state::sched_conv (layout probe); the
+// shipped library does all the arithmetic, the callback only copies each node's output when the node is done.
+// and <outdir>/vecdot.bin (+ vecdot.tsv): ggml_vec_dot_f16 through ggml_get_type_traits_cpu(F16)->vec_dot on real
+// rows of every f16 tensor of the model, every length 1..300 on real conv2 rows, and random finite f16 patterns;
+// records of (u32 n, u16 x[n], u16 y[n], u32 result bits), little-endian.
+extern "C" void ggml_vec_dot_f16(int n, float * s, size_t bs, ggml_fp16_t * x, size_t bx, ggml_fp16_t * y, size_t by, int nrc);
+
+struct node_capture {
+    std::vector<std::string> lines;              // nodes.tsv
+    std::vector<uint8_t> im2col, mm, add, gelu;  // the first IM2COL and the MUL_MAT / ADD / GELU that follow it
+    int stage = 0;                               // 0: want IM2COL, 1: MUL_MAT, 2: ADD, 3: GELU, 4: done
+    std::vector<uint8_t> last;                   // the last node's output (the graph's result, embd_conv)
+};
+static bool conv_cb(ggml_tensor * t, bool ask, void * ud) {
+    if (ask) return true;                        // observe every node
+    auto & c = *static_cast<node_capture *>(ud);
+    char line[256];
+    std::snprintf(line, sizeof line, "%zu\t%s\t%s\t%s\t%lld\t%lld\t%lld\t%lld", c.lines.size(), t->name, ggml_op_desc(t),
+                  ggml_type_name(t->type), (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3]);
+    c.lines.push_back(line);
+    std::vector<uint8_t> b(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, b.data(), 0, b.size());
+    const ggml_op want[4] = {GGML_OP_IM2COL, GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_UNARY};
+    if (c.stage < 4 && t->op == want[c.stage] && (c.stage != 3 || ggml_get_unary_op(t) == GGML_UNARY_OP_GELU)) {
+        std::vector<uint8_t> * dst[4] = {&c.im2col, &c.mm, &c.add, &c.gelu};
+        *dst[c.stage] = b;
+        c.stage++;
+    }
+    c.last.swap(b);
+    return true;
+}
+
+// conv1 alone as a ggml graph, computed by the shipped CPU backend (what --bench-conv1 times): ggml_conv_1d_ph on a
+// copy of encoder.conv1.weight and the first 3000 mel frames, optionally + bias and GELU as whisper's graph does
+struct conv1_graph {
+    ggml_context * ctx; ggml_tensor * w; ggml_tensor * b; ggml_tensor * mel; ggml_tensor * out; ggml_cgraph * gf;
+    conv1_graph(ggml_tensor * w_src, ggml_tensor * b_src, int n_frames, int n_mel, bool bias_gelu) {
+        ggml_init_params p = { (size_t)64 << 20, nullptr, false };
+        ctx = ggml_init(p);
+        check(ctx != nullptr, "ggml_init failed");
+        w = ggml_new_tensor_3d(ctx, w_src->type, w_src->ne[0], w_src->ne[1], w_src->ne[2]);
+        ggml_backend_tensor_get(w_src, w->data, 0, ggml_nbytes(w));
+        b = ggml_new_tensor_2d(ctx, b_src->type, b_src->ne[0], b_src->ne[1]);
+        ggml_backend_tensor_get(b_src, b->data, 0, ggml_nbytes(b));
+        mel = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_frames, n_mel);
+        out = ggml_conv_1d_ph(ctx, w, mel, 1, 1);
+        if (bias_gelu) out = ggml_gelu(ctx, ggml_add(ctx, out, b));
+        gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, out);
+    }
+    void set_mel(const std::vector<float> & m, int n_len) {   // whisper's slice at offset 0: [n_mel][2*n_ctx]
+        float * d = (float *)mel->data;
+        const int64_t nf = mel->ne[0];
+        std::memset(d, 0, ggml_nbytes(mel));
+        for (int64_t j = 0; j < mel->ne[1]; j++)
+            for (int64_t i = 0; i < std::min<int64_t>(nf, n_len); i++) d[j*nf + i] = m[j*n_len + i];
+    }
+    void run(int threads) { check(ggml_graph_compute_with_ctx(ctx, gf, threads) == GGML_STATUS_SUCCESS, "graph compute failed"); }
+    ~conv1_graph() { ggml_free(ctx); }
+};
+
+static whisper_context * load_quiet(const char * model_path) {
+    whisper_log_set([](enum ggml_log_level, const char *, void *) {}, nullptr);
+    whisper_context_params cparams = whisper_context_default_params();
+    cparams.use_gpu = false;
+    whisper_context * ctx = whisper_init_from_file_with_params(model_path, cparams);
+    check(ctx != nullptr, "model failed to load");
+    return ctx;
+}
+static std::map<std::string, ggml_tensor *> & model_tensors(whisper_context * ctx) {
+    char * model = (char *)ctx + VOAICE_OFF_CTX_MODEL;
+    auto & tensors = *reinterpret_cast<std::map<std::string, ggml_tensor *> *>(model + VOAICE_OFF_MODEL_TENSORS);
+    check((int)tensors.size() == *reinterpret_cast<int *>(model + VOAICE_OFF_MODEL_N_LOADED), "layout check failed: tensor map size != n_loaded");
+    return tensors;
+}
+static ggml_backend_sched_t state_sched(whisper_state * st, size_t off) {
+    ggml_backend_sched_t s = *reinterpret_cast<ggml_backend_sched_t *>((char *)st + off + VOAICE_OFF_WSCHED_SCHED);
+    check(s != nullptr && ggml_backend_sched_get_n_backends(s) >= 1, "layout check failed: whisper_state scheduler");
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(s); i++)   // CPU only: the build has no other backend
+        check(std::strcmp(ggml_backend_name(ggml_backend_sched_get_backend(s, i)), "CPU") == 0, "a scheduler backend is not the CPU");
+    return s;
+}
+
+static void record_vecdot(whisper_context * ctx, const std::string & outdir) {
+    auto & tensors = model_tensors(ctx);
+    const ggml_type_traits_cpu * tr = ggml_get_type_traits_cpu(GGML_TYPE_F16);
+    FILE * f = std::fopen((outdir + "/vecdot.bin").c_str(), "wb");
+    if (!f) die("cannot write vecdot.bin");
+    size_t records = 0;
+    auto put = [&](const uint16_t * x, const uint16_t * y, int n) {
+        float s = 0.0f;
+        tr->vec_dot(n, &s, 0, x, 0, y, 0, 1);
+        const uint32_t un = (uint32_t)n, r = f32_bits(s);
+        std::fwrite(&un, 4, 1, f); std::fwrite(x, 2, n, f); std::fwrite(y, 2, n, f); std::fwrite(&r, 4, 1, f);
+        records++;
+    };
+    uint64_t r = 0x2545F4914F6CDD1DULL;
+    auto rnd = [&]() { r ^= r << 13; r ^= r >> 7; r ^= r << 17; return r; };
+    std::vector<uint16_t> a, b, all;
+    std::string per;
+    for (auto & kv : tensors) {                    // sorted by name; every f16 tensor: its rows as mul_mat reads them
+        ggml_tensor * t = kv.second;
+        if (t->type != GGML_TYPE_F16) continue;
+        const bool conv = kv.first.find(".conv") != std::string::npos;
+        const int64_t len = conv ? t->ne[0] * t->ne[1] : t->ne[0];   // a conv weight is reshaped to [K*IC, OC]
+        const int64_t rows = ggml_nelements(t) / len;
+        all.resize(ggml_nelements(t));
+        ggml_backend_tensor_get(t, all.data(), 0, ggml_nbytes(t));
+        const int pairs = 16;
+        for (int k = 0; k < pairs; k++) {
+            const int64_t i = (int64_t)(rnd() % rows), j = (int64_t)(rnd() % rows);
+            put(&all[i * len], &all[j * len], (int)len);
+        }
+        per += kv.first + "\t" + std::to_string(len) + "\t" + std::to_string(pairs) + "\n";
+    }
+    {   // every length 1..300 (every tail 0..31, no main loop below 32) on two real conv2 rows
+        ggml_tensor * t = tensors.at("encoder.conv2.weight");
+        all.resize(ggml_nelements(t));
+        ggml_backend_tensor_get(t, all.data(), 0, ggml_nbytes(t));
+        for (int n = 1; n <= 300; n++) put(&all[7 * 1152], &all[300 * 1152], n);
+        per += "prefixes of encoder.conv2.weight rows 7 x 300\t1..300\t300\n";
+    }
+    {   // random finite f16 patterns (every exponent, both signs, subnormals): cancellation and rounding everywhere
+        a.resize(1536); b.resize(1536);
+        auto finite = [&]() { uint16_t h; do { h = (uint16_t)rnd(); } while ((h & 0x7C00) == 0x7C00); return h; };
+        const int lens[] = {240, 1152, 384, 1536, 33, 63, 64, 95};
+        for (int k = 0; k < 64; k++) {
+            const int n = lens[k % 8];
+            for (int i = 0; i < n; i++) { a[i] = finite(); b[i] = finite(); }
+            put(a.data(), b.data(), n);
+        }
+        per += "random finite f16 patterns\t33..1536\t64\n";
+    }
+    std::fclose(f);
+    FILE * m = std::fopen((outdir + "/vecdot.tsv").c_str(), "w");
+    std::fprintf(m, "records\t%zu\nvec_dot_is_ggml_vec_dot_f16\t%s\nvec_dot_type\t%s\nnrows\t%lld\n"
+                    "avx2\t%s\nfma\t%s\nf16c\t%s\navx512f\t%s\n%s",
+                 records, tr->vec_dot == (ggml_vec_dot_t)ggml_vec_dot_f16 ? "yes" : "NO", ggml_type_name(tr->vec_dot_type),
+                 (long long)tr->nrows, __builtin_cpu_supports("avx2") ? "yes" : "no", __builtin_cpu_supports("fma") ? "yes" : "no",
+                 __builtin_cpu_supports("f16c") ? "yes" : "no", __builtin_cpu_supports("avx512f") ? "yes" : "no", per.c_str());
+    std::fclose(m);
+    std::fprintf(stderr, "whisper_oracle: vec_dot_f16: %zu records (real rows of every f16 tensor, lengths 1..300, random patterns)\n", records);
+}
+
+static int record_conv1(const char * model_path, const std::string & outdir, int nwav, char ** wavs) {
+    if (mkdir(outdir.c_str(), 0755) != 0 && errno != EEXIST) die("cannot create outdir (its parent must exist)");
+    whisper_context * ctx = load_quiet(model_path);
+    record_vecdot(ctx, outdir);
+    auto & tensors = model_tensors(ctx);
+    ggml_tensor * w1 = tensors.at("encoder.conv1.weight");
+    ggml_tensor * b1 = tensors.at("encoder.conv1.bias");
+    const int n_ctx = whisper_model_n_audio_ctx(ctx), n_mel = whisper_model_n_mels(ctx);
+    for (int a = 0; a < nwav; a++) {
+        std::string path = wavs[a];
+        std::string stem = path.substr(path.find_last_of('/') + 1);
+        stem = stem.substr(0, stem.find_last_of('.'));
+        const std::string dir = outdir + "/" + stem;
+        mkdir(dir.c_str(), 0755);
+        std::vector<float> pcm = read_wav(path.c_str());
+        node_capture caps[2];
+        std::vector<uint8_t> unobserved;
+        std::vector<float> mel_copy;
+        int n_len = 0;
+        const int threads[2] = {1, 4};
+        for (int k = 0; k < 3; k++) {              // k = 0, 1: observed at 1 and 4 threads; k = 2: not observed
+            whisper_state * st = whisper_init_state(ctx);
+            check(st != nullptr, "whisper_init_state failed");
+            check(whisper_pcm_to_mel_with_state(ctx, st, pcm.data(), (int)pcm.size(), 1) == 0, "pcm_to_mel failed");
+            if (k == 0) {
+                auto & mel = *reinterpret_cast<mel_mirror *>((char *)st + VOAICE_OFF_STATE_MEL);
+                check(mel.n_len_org == whisper_n_len_from_state(st), "layout check failed: mel.n_len_org");
+                mel_copy = mel.data; n_len = mel.n_len;
+            }
+            ggml_backend_sched_t sc = state_sched(st, VOAICE_OFF_STATE_SCHED_CONV);
+            state_sched(st, VOAICE_OFF_STATE_SCHED_ENCODE);
+            if (k < 2) ggml_backend_sched_set_eval_callback(sc, conv_cb, &caps[k]);
+            check(whisper_encode_with_state(ctx, st, 0, k < 2 ? threads[k] : 1) == 0, "whisper_encode failed");
+            if (k < 2) check(caps[k].stage == 4, "the conv graph did not show IM2COL, MUL_MAT, ADD, GELU in order");
+            ggml_tensor * ec = *reinterpret_cast<ggml_tensor **>((char *)st + VOAICE_OFF_STATE_EMBD_CONV);
+            check(ec != nullptr && std::strcmp(ec->name, "embd_conv") == 0, "layout check failed: embd_conv");
+            if (k == 2) {                          // read after the encoder ran: embd_conv is a graph output, kept
+                unobserved.resize(ggml_nbytes(ec));
+                ggml_backend_tensor_get(ec, unobserved.data(), 0, unobserved.size());
+            }
+            whisper_free_state(st);
+        }
+        node_capture & c = caps[0];
+        check(c.im2col.size() == (size_t)240 * 2 * n_ctx * 2 && c.mm.size() == (size_t)2 * n_ctx * 384 * 4, "unexpected conv1 shapes");
+        write_bin(dir + "/im2col.u16", (const uint16_t *)c.im2col.data(), c.im2col.size() / 2);
+        write_bin(dir + "/conv1.f32", (const float *)c.mm.data(), c.mm.size() / 4);
+        write_bin(dir + "/conv1_bias.f32", (const float *)c.add.data(), c.add.size() / 4);
+        write_bin(dir + "/conv1_gelu.f32", (const float *)c.gelu.data(), c.gelu.size() / 4);
+        FILE * nf = std::fopen((dir + "/nodes.tsv").c_str(), "w");
+        for (auto & l : c.lines) std::fprintf(nf, "%s\n", l.c_str());
+        std::fclose(nf);
+        const bool thr = c.im2col == caps[1].im2col && c.mm == caps[1].mm && c.add == caps[1].add && c.gelu == caps[1].gelu;
+        const bool unobs = unobserved == c.last;
+        bool alone = true;
+        for (int bg = 0; bg < 2; bg++) {           // the standalone graph --bench-conv1 times, against the scheduler's nodes
+            conv1_graph g(w1, b1, 2 * n_ctx, n_mel, bg == 1);
+            g.set_mel(mel_copy, n_len);
+            for (int th : {1, 4}) {
+                g.run(th);
+                const std::vector<uint8_t> & want = bg ? c.gelu : c.mm;
+                alone = alone && ggml_nbytes(g.out) == want.size() && std::memcmp(g.out->data, want.data(), want.size()) == 0;
+            }
+        }
+        FILE * m = std::fopen((dir + "/conv1.tsv").c_str(), "w");
+        std::fprintf(m, "n_len\t%d\noffset\t0\nnodes\t%zu\nthreads_1_vs_4_bit_identical\t%s\nembd_conv_observed_eq_unobserved\t%s\n"
+                        "standalone_graph_eq_sched\t%s\n", n_len, c.lines.size(), thr ? "yes" : "NO", unobs ? "yes" : "NO", alone ? "yes" : "NO");
+        std::fclose(m);
+        std::fprintf(stderr, "whisper_oracle: %s: conv graph %zu nodes; conv1 im2col + mul_mat + add + gelu recorded; 1 vs 4 threads "
+                             "identical: %s; embd_conv with and without observing: %s; standalone graph = scheduler: %s\n",
+                     stem.c_str(), c.lines.size(), thr ? "yes" : "NO", unobs ? "yes" : "NO", alone ? "yes" : "NO");
+    }
+    whisper_free(ctx);
+    return 0;
+}
+
+// --bench-conv1 <model.bin> <wav> <threads> <what>: conv1 through the standalone graph above (what = conv1 | gelu:
+// conv1 alone, or conv1 + bias + GELU), in a fresh process. wall = best of 10 computes, cpu = CPU ms per compute over
+// >= 1 s, mem = the bytes ggml holds for the op's own tensors (im2col + the output, + the add and GELU outputs), from
+// ggml_nbytes (ggml_graph_compute_with_ctx needs no work buffer here: src1 is already f16), rss = VmHWM delta of the
+// first compute
+static int bench_conv1(const char * model_path, const char * wav, int threads, const char * what) {
+    whisper_context * ctx = load_quiet(model_path);
+    auto & tensors = model_tensors(ctx);
+    whisper_state * st = whisper_init_state(ctx);
+    std::vector<float> pcm = read_wav(wav);
+    check(whisper_pcm_to_mel_with_state(ctx, st, pcm.data(), (int)pcm.size(), 1) == 0, "pcm_to_mel failed");
+    auto & mel = *reinterpret_cast<mel_mirror *>((char *)st + VOAICE_OFF_STATE_MEL);
+    const bool bg = std::strcmp(what, "gelu") == 0;
+    conv1_graph g(tensors.at("encoder.conv1.weight"), tensors.at("encoder.conv1.bias"), 2 * whisper_model_n_audio_ctx(ctx),
+                  whisper_model_n_mels(ctx), bg);
+    g.set_mel(mel.data, mel.n_len);
+    size_t op_bytes = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(g.gf); i++) {
+        ggml_tensor * t = ggml_graph_node(g.gf, i);
+        if (t->view_src == nullptr) op_bytes += ggml_nbytes(t);
+    }
+    const long before = status_kb("VmRSS:");
+    const bool reset = reset_peak_rss();
+    g.run(threads);
+    const long peak = reset ? status_kb("VmHWM:") : -1;
+    double best = 1e30;
+    for (int r = 0; r < 10; r++) { const double t = now_ms(); g.run(threads); best = std::min(best, now_ms() - t); }
+    const double c0 = cpu_seconds(), w0 = now_ms();
+    int reps = 0;
+    while (reps < 10 || now_ms() - w0 < 1000.0) { g.run(threads); reps++; }
+    const double c1 = cpu_seconds();
+    std::printf("bench-conv1-reference what %s threads %d wall_best_ms %.3f cpu_ms_per_call %.3f cpu_reps %d op_mem_kb %zu rss_peak_delta_kb %ld\n",
+                what, threads, best, (c1 - c0) * 1000.0 / reps, reps, (op_bytes + 1023) / 1024, peak >= 0 ? peak - before : -1);
+    whisper_free_state(st);
+    whisper_free(ctx);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    if (argc >= 4 && std::strcmp(argv[1], "--conv1") == 0) return record_conv1(argv[2], argv[3], argc - 4, argv + 4);
+    if (argc == 6 && std::strcmp(argv[1], "--bench-conv1") == 0) return bench_conv1(argv[2], argv[3], std::atoi(argv[4]), argv[5]);
     if (argc == 3 && std::strcmp(argv[1], "--f16") == 0) return record_f16(argv[2]);
     if (argc == 3 && std::strcmp(argv[1], "--bench-f16") == 0) return bench_f16(argv[2]);
     if (argc == 5 && std::strcmp(argv[1], "--bench-mel") == 0) return bench_mel(argv[2], argv[3], std::atoi(argv[4]));

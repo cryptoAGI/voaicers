@@ -1,5 +1,78 @@
 # Changelog
 
+## 0.0.6 — 2026-10-08 — `ggml_vec_dot_f16` and encoder conv1, bit-exact against the conv graph's own nodes
+
+**The encoder's first layer — im2col to f16, the f16 · f16 dot product in the AVX build's float order, + bias and
+GELU — bit for bit as the shipped ggml-cpu computes it inside whisper's own scheduler, at 1 and 4 threads, then about
+four times faster with less memory.** Record: `testing/results/0.0.6.txt`; how it was decided:
+`testing/conv1/NOTES.md`.
+
+### The order, decided first (and the roadmap renumbered)
+- conv1 = `ggml_conv_1d_ph(w f16 [3, 80, 384], mel, 1, 1)` = `im2col` → f16 [240, 3000] (the portable
+  `GGML_CPU_FP32_TO_FP16`, 0.0.3) and `mul_mat(im2col, w)`, where the **weights are the second operand** and already
+  the F16 `vec_dot_type`: nothing is converted, and each of the 1,152,000 outputs is one
+  `ggml_vec_dot_f16(240, im2col row, weight row)`, whole in one thread (mul_mat chunks rows, never a dot).
+- So conv1 could not be exact without the kernel the roadmap had at 0.0.9: it is **brought forward into 0.0.6** and
+  the rows after it renumbered (0.0.9 is now the activation-side products: f32 rows → f16 by `from_float`, then this
+  dot). conv1's bias and GELU nodes came along (one f32 add; 0.0.3's GELU), ahead of 0.0.7.
+- `ggml_vec_dot_f16` on this build (read in the source, then in `objdump` — 8 `vcvtph2ps`, 4 ymm `vfmadd231ps`, 2
+  `vhaddps`, 1 `vaddsd`): four accumulators of eight lanes over blocks of 32; `(acc0 + acc2) + (acc1 + acc3)`; high
+  half onto low; two `hadd`s; the f32 **widened to double**; the last `n mod 32` products added **in double** in index
+  order; one rounding to f32. Every product of two halves is exact in f32, so the FMA equals a multiply and an add
+  here — the portable model needs no FMA to be exact. `GGML_LLAMAFILE` is off (no tinyBLAS), the CPU repack has no
+  f16 case, and the F16 traits' `vec_dot` is the exported `ggml_vec_dot_f16` (the record checks the pointer).
+
+### The oracle
+- `whisper_oracle --conv1`: the layout probe now finds `whisper_state::sched_conv` / `sched_encode` / `embd_conv`;
+  `ggml_backend_sched_set_eval_callback` on the conv scheduler copies every node as it is computed (self-checks: only
+  the CPU backend; IM2COL, MUL_MAT, ADD, GELU in order; `embd_conv` named). Observing changes nothing (`embd_conv`
+  identical with and without the callback, 8 / 8); the reference's own nodes are identical at 1 and 4 threads
+  (8 / 8); the standalone graph the benchmark times equals the scheduler's node (8 / 8, at 1 and 4 threads).
+- `oracle_conv1_im2col_bit_exact`: **5,760,000 / 5,760,000** f16 values (8 inputs, from voaice's own mel of each WAV).
+- `oracle_conv1_bit_exact`: the MUL_MAT, + bias and GELU nodes, **0 values differ** on all 8 inputs at 1 and at 4
+  threads — 55,296,000 values compared.
+- `oracle_vec_dot_f16_kernel`: **1,436 / 1,436** dots by the shipped kernel through `ggml_get_type_traits_cpu`: 16 row
+  pairs of each of the model's 70 f16 tensors (n = 240, 384, 1,152, 1,536), every length 1–300 on real conv2 rows, 64
+  random finite-f16 vectors; 303 distinct lengths.
+- Discriminators, all caught: one f32 accumulator (**1,265** / 1,436 dots; on conv1 **1,068,048** / 1,152,000 values),
+  the tail added in f32 (**211** / 1,436), the accumulators reduced in sequence (**680** / 1,436), im2col kept in f32
+  without its f16 rounding (**1,151,932** / 1,152,000 conv1 values).
+- **What this holds for:** this laptop's native libggml-cpu (Ryzen 3 3200U, Zen+: AVX2 + FMA + F16C, no AVX-512),
+  which takes the AVX path. Production's Zen 3 has the same extensions, so its native build compiles the same path —
+  but production's library was not run by this oracle. Offsets other than 0, and `base.en`, were not compared.
+
+### Measured (gate step 8, only after 4d passed; 2 cores / 4 threads, load 1.7–3 from interactive use)
+conv1 on the first 30-s window (3000 frames; every input costs the same). The reference: the same ops as a ggml graph
+on the shipped CPU backend. Wall = best of 10. The gate's own run was noisy, so three more runs of the step follow it:
+
+| | reference | voaice | gate run | three reruns |
+|---|---|---|---|---|
+| conv1, 1 thread | 86–89 ms | 21.4–24.2 ms (33.1 in the gate) | 2.63× | 3.66× · 3.97× · 4.03× |
+| conv1, 2 threads | 51–54 ms (80 in the gate) | 13.5–15.9 ms | 5.79× | 3.76× · 3.21× · 4.00× |
+| conv1, 4 threads | 46–59 ms | 14.7–24.6 ms | 1.87× | 3.31× · 3.94× · 3.42× |
+| conv1 + bias + GELU, 1 thread | 94–119 ms | 24.7–30.7 ms | 3.78× | 3.80× · 3.88× · 3.90× |
+| conv1 + bias + GELU, 4 threads | 50–53 ms | 15.9–16.3 ms | 3.19× | 3.30× · 3.09× · 3.16× |
+
+- **About 4× the reference at one thread and 3–4× at two and four**, in **13–43 % of its CPU time** (gate: 39 against
+  90 CPU-ms at one thread, 38 against 302 at two, 57 against 344 at four).
+- Memory: voaice's heap at the call's peak is **4,508 KiB — the output (4,500) and two 7.5 KB tiles**; the reference's
+  graph holds **5,907 KiB** (im2col 1,406 + the product 4,500), and **14,907 KiB** with the bias and GELU outputs,
+  which voaice writes in place (the add and GELU are fused into each tile's epilogue).
+- What changed, bits fixed: the weights widened to f32 once; no im2col and no rounded copy of the mel — each thread
+  builds tiles of 8 frames from the mel, rounding 8 lanes at once through F16C (equal to the bit trick except on NaN;
+  a block holding a NaN takes the bit trick); eight dots share each weight load; the pairwise reduction and the
+  double tail run across eight frames in vector registers; threads split frames; the caller keeps the output.
+- 4 threads gain nothing over 2 here (2 physical cores; the loop is bound by the FMA pipes the SMT siblings share).
+
+### Added
+- `src/conv.rs`: `Conv1` (`new`, `from_parts`, `run`, `run_bias`, `run_gelu`, `run_into`), `vec_dot_f16`,
+  `dot_f16_model`, `im2col_f16`, `wrong::{single_accumulator, tail_in_f32, sequential_reduce}`; unit tests (the AVX2
+  tile against the model at 8 lengths, the whole path against im2col + model at offsets, short windows and a short
+  last tile, the NaN block). `voaice conv1`, `voaice bench-conv1`. `tests/conv1.rs` (5 oracle tests).
+- `whisper_oracle --conv1`, `--bench-conv1`; layout probe offsets; gate steps 4d and 8 (all earlier checks kept).
+- The production Opus re-ask (step 4b) was skipped in this run on purpose (production was not to be touched); the
+  comparisons ran against the recorded answers.
+
 ## 0.0.5 — 2026-10-08 — the audio reader whisper-cli runs, bit-exact against its own libcommon.a
 
 **Any PCM or float WAV, at any rate and channel count, to whisper's 16 kHz mono f32 — dr_wav's conversions, miniaudio

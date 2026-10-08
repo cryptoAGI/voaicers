@@ -14,7 +14,7 @@ Built the way [bankml](https://github.com/cryptoAGI/bankml) was built against ll
   <img src="https://img.shields.io/badge/dependencies-0-56D364?style=flat-square" alt="zero dependencies">
   <img src="https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-2563EB?style=flat-square" alt="MIT OR Apache-2.0">
   <img src="https://img.shields.io/badge/log--mel-bit--exact%20vs%20whisper.cpp%20(ggml%200.16.0)-39D3C7?style=flat-square" alt="log-mel bit-exact">
-  <img src="https://img.shields.io/badge/status-0.0.5%20%C2%B7%20loader%2C%20front%20end%2C%20f16%20%2B%20GELU%2C%20resampler%20bit--exact%2C%20Ogg%2FOpus%20reader%3B%20no%20transcript%20yet-F59E0B?style=flat-square" alt="status">
+  <img src="https://img.shields.io/badge/status-0.0.6%20%C2%B7%20loader%2C%20front%20end%2C%20f16%20%2B%20GELU%2C%20resampler%2C%20encoder%20conv1%20bit--exact%2C%20Ogg%2FOpus%20reader%3B%20no%20transcript%20yet-F59E0B?style=flat-square" alt="status">
   <a href="https://github.com/cryptoAGI/voaicers/releases/latest"><img src="https://img.shields.io/github/v/release/cryptoAGI/voaicers?style=flat-square&label=release&color=0ECB81" alt="latest release"></a>
 </p>
 
@@ -27,10 +27,12 @@ mindX's production speech-to-text is whisper.cpp built against ggml 0.16.0, runn
 *a result counts only when an oracle has checked it, and the oracle is the reference's own compiled library run on
 the same input, compared by bit pattern.* Speed is measured only after that.
 
-**0.0.5 does not transcribe yet.** It is the first three stages, the front end optimized (0.0.2) with its bits unchanged,
+**0.0.6 does not transcribe yet.** It is the first three stages, the front end optimized (0.0.2) with its bits unchanged,
 the first two encoder kernels (0.0.3): the f32 ↔ f16 conversions and GELU, (0.0.4) the streaming Ogg/Opus reader
-that will bring `.opus` input to them without a WAV on disk, and (0.0.5) the audio reader whisper-cli itself runs:
-any WAV to 16 kHz mono f32 through miniaudio's conversions, mixdown and resampler, bit for bit.
+that will bring `.opus` input to them without a WAV on disk, (0.0.5) the audio reader whisper-cli itself runs:
+any WAV to 16 kHz mono f32 through miniaudio's conversions, mixdown and resampler, bit for bit, and (0.0.6) the
+encoder's first layer: ggml's f16 dot product in its AVX float order and conv1 with its bias and GELU, checked node by
+node against the reference's own scheduler.
 
 | stage | what | oracle result (this machine, 2026-10-07) |
 |---|---|---|
@@ -41,6 +43,7 @@ any WAV to 16 kHz mono f32 through miniaudio's conversions, mixdown and resample
 | 3b | GELU (0.0.3): `ggml_table_gelu_f16` and the op with its ±10 clamps | **65,536 / 65,536** table entries; the op on 1,495,192 values and on all 2³² f32 patterns; the unfused GELU rejected (it differs in one entry) |
 | 4 | the streaming Ogg/Opus reader (0.0.4): pages, Ogg's CRC-32, lacing and continuation, `OpusHead` / `OpusTags`, granules and pre-skip → the exact duration, one page in memory | against **opus-tools 0.2, libopus 1.4 and libogg 1.3.5 on production**: **35 / 35** files on 18 checks each — the duration equals **opusdec's sample count** on every file, every page's granule and every packet's samples equal libogg's and libopus's; **21 / 21** corrupted files refused by name; pre-skip added, no end trim, and zlib's CRC (0 / 427 pages) all caught |
 | 5 | any WAV → 16 kHz mono f32 as whisper-cli reads it (0.0.5): dr_wav's u8 / s16 / s24 / s32 / f32 conversions, miniaudio's mono average, its linear resampler with the order-4 low-pass, the length rule and its zero tail — streamed, any chunking | against **whisper-cli's own `libcommon.a`** (`read_audio_data`, miniaudio 0.11.24): **55 / 55** files, **1,955,875** samples bit-identical across 8–48 kHz, 1 / 2 / 6 channels, every format; random chunking identical; low-pass order 2 / 6, mixdown `L + R` / `L`, and the length without its extra frame all caught |
+| 6 | `ggml_vec_dot_f16` and encoder conv1 + bias + GELU (0.0.6): im2col to f16, every output one f16 dot in the AVX build's order (4 × 8 lanes, pairwise reduce, a double tail) — then faster, no im2col held | the conv graph's **own nodes**, read through ggml's scheduler eval callback: im2col **5,760,000 / 5,760,000** f16 values; the product, + bias and GELU **0 differ** on all 8 inputs at 1 and 4 threads (55,296,000 values); the kernel **1,436 / 1,436** dots on real rows of all 70 f16 tensors; one accumulator, a tail in f32, a sequential reduce, im2col without its f16 rounding — all caught |
 
 Efficiency, measured only after the oracles passed in the same gate run (0.0.2, this laptop, 4 CPUs at load ≈ 7.6,
 so ±20 % is noise): the mel is **6.1× faster than 0.0.1** (rebuilt from its tag in the same run) and **6.8× faster
@@ -64,6 +67,12 @@ for 33 s of 6 kb/s speech** (about 730,000× real time) and 0.03–0.10 ms for e
 length. Ogg's CRC sliced by eight runs at 1.4–1.6 GiB/s, **4.1–4.6× the byte-at-a-time table**. Record:
 [`testing/results/0.0.4.txt`](testing/results/0.0.4.txt). It also found that streamair 0.0.1's writer accepts an end
 trim past the last page, which opusinfo calls an error (TODO.md).
+
+0.0.6, after its oracles (same laptop, 2 cores / 4 threads, load 1.7–3): conv1 on a 30-s window takes **21–24 ms
+against the reference's 86–89** at one thread (about **4×**; 3–4× at two and four threads), with conv1 + bias + GELU
+in **4,508 KiB of heap against the 14,907 KiB** the reference's graph holds — no im2col is kept, the add and GELU
+are applied in place. The gate's own run of that step was noisy (2.6× at one thread); the CHANGELOG lists it with
+three reruns. Record: [`testing/results/0.0.6.txt`](testing/results/0.0.6.txt).
 
 **A determinism note on the reference itself:** whisper.cpp's transcript depends on its thread count. At 1 thread it
 is identical run to run; at 4 threads the token ids and text stay the same but every token's probability differs in
@@ -143,6 +152,8 @@ target/release/voaice bench-opus in.opus          # CRC sliced vs bytewise, read
 testing/opus/oracle.sh check                      # ask opus-tools on production again about the pinned .opus files
 target/release/voaice resample in.wav [out.f32]   # (0.0.5) any WAV -> 16 kHz mono f32, bit for bit as whisper-cli reads it
 target/release/voaice bench-resample in.wav       # the whole read: wall, CPU per call, heap, RSS
+target/release/voaice conv1 models/ggml-tiny.en.bin in.wav [out.f32] [--threads N]   # (0.0.6) conv1 + bias + GELU, 384 x 3000
+target/release/voaice bench-conv1 models/ggml-tiny.en.bin in.wav conv1|gelu [--threads N]   # its wall, CPU, heap, RSS
 ```
 
 Input: `voaice mel` still takes 16-bit PCM, mono, 16 kHz WAV; `voaice resample` (0.0.5) takes any PCM 8/16/24/32-bit
@@ -154,12 +165,14 @@ Disk: the reference checkout and build are about 160 MB in `upstream/` (gitignor
 
 ```
 Cargo.toml  rust-toolchain.toml      zero dependencies; Rust 1.99.0 pinned like bankml
-src/        sha256.rs model.rs wav.rs mel.rs f16.rs gelu.rs ogg.rs resample.rs measure.rs lib.rs main.rs
+src/        sha256.rs model.rs wav.rs mel.rs f16.rs gelu.rs conv.rs ogg.rs resample.rs measure.rs lib.rs main.rs
 tests/oracle.rs                      the oracle comparisons (#[ignore]: need the model and a recorded oracle)
 testing/oracle/                      build.sh, layout_probe.cpp, whisper_oracle.cpp, resample_oracle.cpp (0.0.5)
 tests/resample.rs                    (0.0.5) the resampler against whisper-cli's libcommon.a (#[ignore]: needs the record)
 testing/make_resample_audio.py       (0.0.5) the 55-file resampler corpus, pinned in testing/pins/resample.sha256
 testing/resample/NOTES.md            (0.0.5) what read_audio_data does, read from the pinned source line by line
+tests/conv1.rs                       (0.0.6) conv1 and ggml_vec_dot_f16 against the conv graph's nodes (#[ignore])
+testing/conv1/NOTES.md               (0.0.6) the order decision, the disassembly, the oracle's findings as they came
 tests/opus.rs                        (0.0.4) the Ogg/Opus oracle comparisons, offline against the recorded reference
 testing/make_audio.py                the 8 test WAVs, pinned in testing/pins/audio.sha256
 testing/opus/                        oracle.sh record|check, reference.py, mutate.py; 35 pinned .opus files + answers
@@ -202,12 +215,15 @@ go up 0.0.1 at a time, with a milestone at every tenth step. The order of work:
 - [x] **0.0.5:** the audio reader whisper-cli runs: dr_wav's conversions, miniaudio's mono average, its linear
   resampler with the order-4 low-pass and its length rule; 55 / 55 files, 1,955,875 samples bit-identical to
   whisper-cli's `libcommon.a`, streamed in any chunking ([record](testing/results/0.0.5.txt)).
-- [ ] **0.0.6–0.0.9:** conv1, conv2 + positions, layer norm, the f16 dot in AVX2 lane order — one per step, each
-  bit-exact ([plan](docs/ROADMAP.md)).
+- [x] **0.0.6:** `ggml_vec_dot_f16` (brought forward: conv1 is nothing but that dot) and encoder conv1 + bias + GELU,
+  bit-exact against the conv graph's own nodes through the scheduler's eval callback, at 1 and 4 threads; then
+  faster with no im2col held ([record](testing/results/0.0.6.txt)).
+- [ ] **0.0.7–0.0.9:** conv2 + positions, layer norm, the matrix products on activations (f32 → f16 rows, then the
+  0.0.6 dot) — one per step, each bit-exact ([plan](docs/ROADMAP.md)).
 - [ ] **Stage 0b:** pin `ggml-base.en.bin` (production's default model). Record the VPS's ISA so the oracle
   reproduces production's native ggml-cpu kernels (Zen 3, AVX2 + FMA).
-- [ ] **Stage 3, the encoder (0.1.0):** ~~the GELU f16 table, f32↔f16 conversion~~ (0.0.3), `vec_dot_f16` in AVX2
-  lane order, conv1 and conv2 through im2col, layer norm, flash attention, four blocks, then `embd_enc` bit-exact. Each intermediate is observed through ggml's scheduler callback.
+- [ ] **Stage 3, the encoder (0.1.0):** ~~the GELU f16 table, f32↔f16 conversion~~ (0.0.3), ~~`vec_dot_f16` in AVX2
+  lane order, conv1~~ (0.0.6), conv2 through im2col, layer norm, flash attention, four blocks, then `embd_enc` bit-exact. Each intermediate is observed through ggml's scheduler callback.
 - [ ] **Stage 4, the decoder (0.2.0):** cross-attention, the f16 KV cache, and all 51,864 logits bit-exact per
   step through `whisper_get_logits_from_state`.
 - [ ] **Stage 5, the transcript (0.3.0):** the greedy loop, logit filters, timestamp rules, 30-second seek.
