@@ -33,10 +33,10 @@ pub fn digest(data: &[u8]) -> [u8; 64] {
         msg.push(0);
     }
     msg.extend_from_slice(&bits.to_be_bytes());
-    for block in msg.chunks_exact(128) {
+    for block in msg.as_chunks::<128>().0 {
         let mut w = [0u64; 80];
-        for (i, c) in block.chunks_exact(8).enumerate() {
-            w[i] = u64::from_be_bytes(c.try_into().unwrap());
+        for (i, c) in block.as_chunks::<8>().0.iter().enumerate() {
+            w[i] = u64::from_be_bytes(*c);
         }
         for t in 16..80 {
             let s0 = w[t - 15].rotate_right(1) ^ w[t - 15].rotate_right(8) ^ (w[t - 15] >> 7);

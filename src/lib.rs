@@ -17,9 +17,6 @@ pub mod measure;
 pub mod mel;
 pub mod model;
 pub mod sha256;
-// sha512.rs predates clippy 1.99's `chunks_exact_to_as_chunks` lint; allowed here so the gate's `clippy -D warnings`
-// passes without editing that module (it belongs to the vclone work, not to 0.0.3)
-#[allow(clippy::chunks_exact_to_as_chunks)]
 pub mod sha512;
 pub mod vclone;
 pub mod wav;
