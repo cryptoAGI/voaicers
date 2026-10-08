@@ -61,9 +61,22 @@ whisper.cpp (upstream/PIN) in the same run; only then is its speed measured.
       families 2 / 3 / 255, chained and multiplexed streams (refused by name today), the reference's own speed (the
       gate does not time on production).
 
-## Next: 0.0.5 — the resampler whisper-cli uses (see docs/ROADMAP.md)
-- [ ] miniaudio's linear resampler and its low-pass filter as compiled in the pinned whisper.cpp, 48 kHz → 16 kHz and
-      the other rates, mono mixdown — the samples `read_audio_data` produces, bit for bit.
+## Done: 0.0.5 — the audio reader whisper-cli uses (CHANGELOG.md, testing/resample/NOTES.md)
+- [x] dr_wav's f32 conversions, miniaudio's `mono_out` mixdown, the linear resampler with its order-4 low-pass, the
+      length rule and its zero tail — 55 / 55 files, 1,955,875 samples bit-identical to whisper-cli's `libcommon.a`;
+      streamed in any chunking; discriminators caught.
+- [ ] Not covered: what miniaudio decodes besides WAV (FLAC, MP3, Vorbis — whisper-cli reads them all), WAV's A-law,
+      µ-law, ADPCM, f64 and odd bit depths, RF64 / Wave64 (each refused by name); the `--diarize` stereo path
+      (`L + R`, channels kept); input from stdin (`-`). Rates other than the seven in the corpus are computed by the same
+      code but were not each checked; a rate whose reduced pair puts a different `sin` argument in play is a different
+      coefficient set (computed through the platform libm's `sin`, glibc's here).
+- [ ] The low-pass is a serial IIR chain, so the inner loop is latency-bound (≈ 12 cycles a stage a sample); the
+      coefficients and float order are fixed by the oracle. What remains to win is around it: `.opus` decoded straight
+      into this converter (v0.4.0), and the mel fed from it without the whole vector.
+
+## Next: 0.0.6 — encoder conv1 (see docs/ROADMAP.md)
+- [ ] `im2col` to f16 (0.0.3's portable f32→f16), then `mul_mat` against the f16 weights; oracle: the conv1 node's
+      output through ggml's scheduler callback.
 
 ## Then, in order
 

@@ -1,0 +1,287 @@
+# voaice.rs 0.0.5 release gate — 2026-10-08T09:19:58Z
+# host: x86_64, 4 cpus, AMD Ryzen 3 3200U with Radeon Vega Mobile Gfx; load 1.62 1.45 0.72
+# rustc: rustc 1.99.0 (b940084d7 2026-09-28); gcc: gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
+## 1. reference
+built testing/oracle/bin/whisper_oracle (reference 080bbbe85230f624f0b52127f1ae1218247989f9, ggml 0.16.0)
+## 2. inputs
+model models/ggml-tiny.en.bin sha256 921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f (pinned)
+audio ok: 8 files match testing/pins/audio.sha256
+resampler audio ok: 55 files match testing/pins/resample.sha256
+## 3. record (the shipped libwhisper.so, in process)
+whisper_oracle: chirp: 40000 samples, mel 80x3250, threads agree: yes, 1 segments
+whisper_oracle: jfk: 176000 samples, mel 80x4100, threads agree: yes, 2 segments
+whisper_oracle: jfk_x3: 528000 samples, mel 80x6300, threads agree: yes, 6 segments
+whisper_oracle: min_len: 201 samples, mel 80x3001, threads agree: yes, 0 segments
+whisper_oracle: noise_loud: 16000 samples, mel 80x3100, threads agree: yes, 0 segments
+whisper_oracle: odd_len: 12345 samples, mel 80x3077, threads agree: yes, 1 segments
+whisper_oracle: short: 4800 samples, mel 80x3030, threads agree: yes, 0 segments
+whisper_oracle: silence: 16000 samples, mel 80x3100, threads agree: yes, 1 segments
+whisper_oracle: f16: 65536 f16 widened 4 ways; 1429656 f32 narrowed 3 ways; all 2^32 f32 digested (chunks where libggml-base == ggml-cpu tail: 65536, == ggml-cpu row: 65280 of 65536); gelu table; gelu op on 1495192 values (1 vs 4 threads identical: yes) and on all 2^32
+(the f16 record took 53 s: all 2^32 f32 patterns, three conversions and the GELU op, one thread)
+resample_oracle (libcommon.a's read_audio_data): 55 files recorded, 1955875 samples
+libcommon.a's common-whisper.cpp.o (miniaudio inside): 0 FMA instructions, 0 ymm uses
+## 4. voaice.rs
+    Finished `release` profile [optimized] target(s) in 10.05s
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 0 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test guard_refuses_a_modified_model ... guard: refused: modified tiny.en has the size of ggml-tiny.en.bin (77704715 bytes) but sha256 97fcb6d6c685525d1c12436fe4407284eef7477a9cbce735a09ba20eaf4bb1f8, not the pinned 921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f
+ok
+test oracle_f16_discriminates_round_half_away ... oracle_f16_discriminates: round-half-away differs in 31752 of 1429656 boundary values (first: input 0x33000000 -> ours 1, reference 0), and in 8448 of 65536 chunks of all 2^32
+ok
+test oracle_f16_to_f32_all_65536 ... oracle_f16_to_f32 (port: scalar for base/table/tail, row for the F16C row):
+  ggml base    : 65536 / 65536 identical
+  ggml table   : 65536 / 65536 identical
+  ggml cpu_tail: 65536 / 65536 identical
+  ggml cpu_row : 65536 / 65536 identical
+ok
+test oracle_f32_to_f16_boundary_set ... oracle_f32_to_f16_boundary_set (1429656 inputs, 4047 NaN; the portable and F16C conversions differ on 4029, all NaN):
+  scalar   vs libggml-base ggml_fp32_to_fp16      : 1429656 / 1429656 identical
+  scalar   vs ggml-cpu GGML_CPU_FP32_TO_FP16 (tail): 1429656 / 1429656 identical
+  row      vs ggml-cpu ggml_cpu_fp32_to_fp16 (F16C): 1429656 / 1429656 identical
+  vcvtps2ph model vs ggml_cpu_fp32_to_fp16 (F16C)  : 1429656 / 1429656 identical
+ok
+test oracle_f32_to_f16_every_pattern ... oracle_f32_to_f16_every_pattern (10.7 s here; the reference's own scalar copies agree on 65536 chunks, its row and scalar on 65280):
+  scalar vs libggml-base          : 65536 / 65536 chunks identical (all of 4,294,967,296 patterns)
+  scalar vs ggml-cpu tail         : 65536 / 65536 chunks identical (all of 4,294,967,296 patterns)
+  row vs ggml-cpu row (F16C)      : 65536 / 65536 chunks identical (all of 4,294,967,296 patterns)
+  vcvtps2ph model vs ggml-cpu row : 65536 / 65536 chunks identical (all of 4,294,967,296 patterns)
+ok
+test oracle_gelu_op ... oracle_gelu_op:
+  vector: 1495192 / 1495192 identical
+  scalar: 1495192 / 1495192 identical
+  every f32 pattern (13.1 s here): vector 65536 / 65536 chunks identical, scalar 65536 / 65536
+ok
+test oracle_gelu_table_all_65536 ... oracle_gelu_table: 65536 / 65536 entries identical (built in 2.04 ms)
+ok
+test oracle_gelu_table_discriminates_unfused ... oracle_gelu_discriminates: the unfused GELU differs in 1 of 65536 table entries (first: input 0x0000bfff -> ours 43474, reference 43475)
+ok
+test oracle_mel_bit_exact ... oracle_mel (2316640 values):
+  chirp       80 x 3250 =  260000 values: 0 differ, max 0 ULP
+  jfk         80 x 4100 =  328000 values: 0 differ, max 0 ULP
+  jfk_x3      80 x 6300 =  504000 values: 0 differ, max 0 ULP
+  min_len     80 x 3001 =  240080 values: 0 differ, max 0 ULP
+  noise_loud  80 x 3100 =  248000 values: 0 differ, max 0 ULP
+  odd_len     80 x 3077 =  246160 values: 0 differ, max 0 ULP
+  short       80 x 3030 =  242400 values: 0 differ, max 0 ULP
+  silence     80 x 3100 =  248000 values: 0 differ, max 0 ULP
+ok
+test oracle_mel_discriminates_fused_fft ... oracle_mel_discriminates: fused-FFT variant on jfk: 25242 of 328000 values differ, max 32768 ULP
+ok
+test oracle_mel_threads_bit_identical ... oracle_mel_threads: 8 inputs x threads {2, 3, 4, 8}: 9266560 values, all identical to 1 thread and to the reference
+ok
+test oracle_model_hparams_tensors_vocab_filters ... oracle_model: 167 tensors (77110272 bytes) identical by sha256, filterbank 80x201 bit-exact, 51864 vocab strings identical (1 hold a NUL the C API cannot show past)
+ok
+test oracle_pcm_input_identical ... ok
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 32.36s
+## 4b. the Ogg/Opus reader (0.0.4): opus-tools 0.2 (opusinfo, opusdec), libopus 1.4, libogg 1.3.5 on mindX production
+35 pinned files: sha256 ok
+reference: {"date": "2026-10-08T04:32:13Z", "host_cpu": "AMD EPYC 7543P 32-Core Processor", "reference": {"libopus": "libopus 1.4", "opus_tools": "opusinfo from opus-tools 0.2"}, "packages": "libogg0 1.3.5-3build1; libopus0 1.4-1bu…
+test bounded_memory_one_byte_at_a_time ... ok
+test oracle_opus_adversarial_files_refused ...   refused    m_crc_field              byte 3939 (page 3): Crc: stored e908fb4a, computed e908fb4b  | reference: opusinfo 28 warning(s), opusdec Some(476160) samples (exit Some(0))
+  refused    m_body_bit               byte 3939 (page 3): Crc: stored e908fb4b, computed eed9cf60  | reference: opusinfo 28 warning(s), opusdec Some(476160) samples (exit Some(0))
+  refused    m_truncated_mid_page     byte 35424 (page 13): TruncatedPage: 3 of 35 body bytes  | reference: opusinfo 1 warning(s), opusdec Some(527688) samples (exit Some(0))
+  refused    m_truncated_last_byte    byte 35424 (page 13): TruncatedPage: 34 of 35 body bytes  | reference: opusinfo 1 warning(s), opusdec Some(527688) samples (exit Some(0))
+  refused    m_truncated_header       byte 35424 (page 13): TruncatedPage: 10 of 27 header bytes  | reference: opusinfo 1 warning(s), opusdec Some(527688) samples (exit Some(0))
+  refused    m_no_eos                 byte 35424 (page 13): NoEndOfStream: the file ends with no end-of-stream page  | reference: opusinfo 1 warning(s), opusdec Some(527688) samples (exit Some(0))
+  refused    m_dropped_page           byte 7175 (page 4): Sequence: page sequence 5, expected 4  | reference: opusinfo 11 warning(s), opusdec Some(476160) samples (exit Some(0))
+  refused    m_duplicated_page        byte 10027 (page 5): Sequence: page sequence 4, expected 5  | reference: opusinfo 12 warning(s), opusdec Some(572160) samples (exit Some(0))
+  refused    m_capture                byte 3917 (page 3): CapturePattern: [4f, 67, 67, 58] where OggS should be  | reference: opusinfo 28 warning(s), opusdec Some(476160) samples (exit Some(0))
+  refused    m_version                byte 3921 (page 3): Version: stream structure version 1  | reference: opusinfo 13 warning(s), opusdec Some(476160) samples (exit Some(0))
+  refused    m_granule_backwards      byte 7163 (page 4): GranuleBackwards: granule 95040 after 96000  | reference: opusinfo 2 warning(s), opusdec the base's samples
+  refused    m_granule_mismatch       byte 7163 (page 4): GranuleMismatch: granule 144960, expected 96000 + 48000 = 144000  | reference: opusinfo 1 warning(s), opusdec the base's samples
+  refused    m_granule_beyond_eos     byte 35430 (page 13): GranuleBeyondSamples: granule 534072, but the packets decode only to 528960  | reference: opusinfo 1 warning(s), opusdec Some(528648) samples (exit Some(0))
+  refused    m_serial                 byte 3931 (page 3): Serial: serial 00000fa5 in a stream of 00000fa4  | reference: opusinfo 19 warning(s), opusdec Some(476160) samples (exit Some(0))
+  refused    m_bos_again              byte 3922 (page 3): HeaderFlags: BOS on a page after the first  | reference: opusinfo 1 warning(s), opusdec the base's samples
+  refused    m_continued_flag         byte 3922 (page 3): Continuation: continued flag with no packet to continue  | reference: opusinfo 11 warning(s), opusdec Some(527040) samples (exit Some(0))
+  refused    m_eos_removed            byte 35430 (page 13): GranuleMismatch: granule 528312, expected 528000 + 960 = 528960  | reference: opusinfo 2 warning(s), opusdec Some(528648) samples (exit Some(0))
+  refused    m_head_magic             byte 28 (page 0): OpusHead: not an OpusHead packet (19 bytes)  | reference: opusinfo 0 warning(s), opusdec None samples (exit Some(1))
+  refused    m_tags_magic             byte 47 (page 1): OpusTags: not an OpusTags packet (764 bytes)  | reference: opusinfo 553 warning(s), opusdec None samples (exit Some(1))
+  refused    m_appended_stream        byte 35487 (page 14): DataAfterEnd: bytes after the end-of-stream page (a chained or appended stream)  | reference: opusinfo 3 warning(s), opusdec Some(1056000) samples (exit Some(0))
+  accepted   m_start_offset           start granule 48000, duration 528000 = opusdec's 528000 (reference warned: false)
+  refused    m_preskip_over           byte 847 (page 2): PreSkip: the stream ends at 915 samples, before its pre-skip of 2000  | reference: opusinfo 1 warning(s), opusdec None samples (exit Some(1))
+oracle_opus_adversarial_files_refused: 21 / 21 refused with the expected kind, 1 / 1 valid variant accepted; the reference noticed 21 of the 21 (opusinfo warned or opusdec's output changed)
+ok
+test oracle_opus_discriminators ... oracle_opus_discriminators over 35 files, 427 pages:
+  pre-skip added instead of subtracted: wrong on 34 / 35 files (right only where pre-skip is 0)
+  no end trimming:                      wrong on 34 / 35 files
+  code-3 frame count ignored:           wrong on 3 / 35 files (those with multi-frame packets)
+  zlib's CRC-32:                        verifies 0 / 427 pages; Ogg's verifies 427 / 427
+ok
+test oracle_opus_good_files ... oracle_opus_good_files: 35 files (14 by streamair, 21 by opusenc)
+   35 / 35  audio packets (libogg)
+   35 / 35  bytes (opusinfo total data length)
+   35 / 35  channels (opusinfo, opusdec)
+   35 / 35  comments (a picture as opusinfo summarises it)
+   35 / 35  decoded samples (libopus per packet)
+   35 / 35  duration = opusdec's samples
+   35 / 35  every packet's bytes, samples (libogg + libopus)
+   35 / 35  every page's sequence, granule, flags (libogg)
+   35 / 35  input rate
+   35 / 35  last granule (libogg)
+   35 / 35  output gain
+   35 / 35  packet duration max/avg/min (opusinfo)
+   35 / 35  pages (libogg)
+   35 / 35  playback length (opusinfo)
+   35 / 35  pre-skip
+   35 / 35  samples kept by packet = duration
+   35 / 35  the reference found no fault
+   35 / 35  vendor
+ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test end_trimming_stays_on_the_last_page ... ok
+test the_silence_cli_lengths_read_back_exactly ... ok
+test writer_to_reader_round_trips ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s
+voaice opus info on one pinned file:
+    file            testing/opus/files/e_six_family1_96k.opus
+    bytes           17468
+    pages           4
+    packets         51 audio (16464 bytes; largest 425 bytes)
+    version         1
+    channels        6
+    pre-skip        312
+    input rate      16000 Hz
+    output gain     0 (Q7.8) = 0 dB
+    mapping family  1 (4 streams, 2 coupled; mapping [0, 4, 1, 2, 3, 5])
+    vendor          libopus 1.4, libopusenc 0.2.1
+    comments        2
+      ENCODER=opusenc from opus-tools 0.2
+      ENCODER_OPTIONS=--serial 4004 --bitrate 96
+    packet samples  960 min, 960 max (48 kHz)
+    start granule   0
+    last granule    48312
+    decoded         48960 samples at 48 kHz
+    end trim        648 samples
+    duration        48000 samples at 48 kHz (0m:01.000s)
+reference re-run on root@168.231.126.58: 57 / 57 answers identical to the record
+## 4c. the resampler (0.0.5): whisper-cli's read_audio_data (miniaudio 0.11.24 in the build's libcommon.a)
+test oracle_resample_bit_exact ... r8000_m_s16             8000 Hz 1 ch s16   10407 frames ->   20814 samples (zero tail 0): identical
+r8000_s_s16             8000 Hz 2 ch s16   10407 frames ->   20814 samples (zero tail 0): identical
+r8000_m_f32             8000 Hz 1 ch f32   10407 frames ->   20814 samples (zero tail 0): identical
+r8000_s_f32             8000 Hz 2 ch f32   10407 frames ->   20814 samples (zero tail 0): identical
+r16000_m_s16           16000 Hz 1 ch s16   20808 frames ->   20808 samples (zero tail 0): identical
+r16000_s_s16           16000 Hz 2 ch s16   20808 frames ->   20808 samples (zero tail 0): identical
+r16000_m_f32           16000 Hz 1 ch f32   20808 frames ->   20808 samples (zero tail 0): identical
+r16000_s_f32           16000 Hz 2 ch f32   20808 frames ->   20808 samples (zero tail 0): identical
+r22050_m_s16           22050 Hz 1 ch s16   28674 frames ->   20806 samples (zero tail 0): identical
+r22050_s_s16           22050 Hz 2 ch s16   28674 frames ->   20806 samples (zero tail 0): identical
+r22050_m_f32           22050 Hz 1 ch f32   28674 frames ->   20806 samples (zero tail 0): identical
+r22050_s_f32           22050 Hz 2 ch f32   28674 frames ->   20806 samples (zero tail 0): identical
+r22050_m_u8            22050 Hz 1 ch u8    28674 frames ->   20806 samples (zero tail 0): identical
+r22050_m_s24           22050 Hz 1 ch s24   28674 frames ->   20806 samples (zero tail 0): identical
+r22050_m_s32           22050 Hz 1 ch s32   28674 frames ->   20806 samples (zero tail 0): identical
+r24000_m_s16           24000 Hz 1 ch s16   31210 frames ->   20806 samples (zero tail 0): identical
+r24000_s_s16           24000 Hz 2 ch s16   31210 frames ->   20806 samples (zero tail 0): identical
+r24000_m_f32           24000 Hz 1 ch f32   31210 frames ->   20806 samples (zero tail 0): identical
+r24000_s_f32           24000 Hz 2 ch f32   31210 frames ->   20806 samples (zero tail 0): identical
+r32000_m_s16           32000 Hz 1 ch s16   41611 frames ->   20806 samples (zero tail 0): identical
+r32000_s_s16           32000 Hz 2 ch s16   41611 frames ->   20806 samples (zero tail 0): identical
+r32000_m_f32           32000 Hz 1 ch f32   41611 frames ->   20806 samples (zero tail 0): identical
+r32000_s_f32           32000 Hz 2 ch f32   41611 frames ->   20806 samples (zero tail 0): identical
+r44100_m_s16           44100 Hz 1 ch s16   57342 frames ->   20804 samples (zero tail 0): identical
+r44100_s_s16           44100 Hz 2 ch s16   57342 frames ->   20804 samples (zero tail 0): identical
+r44100_m_f32           44100 Hz 1 ch f32   57342 frames ->   20804 samples (zero tail 0): identical
+r44100_s_f32           44100 Hz 2 ch f32   57342 frames ->   20804 samples (zero tail 0): identical
+r44100_s_u8            44100 Hz 2 ch u8    57342 frames ->   20804 samples (zero tail 0): identical
+r44100_s_s24           44100 Hz 2 ch s24   57342 frames ->   20804 samples (zero tail 0): identical
+r44100_s_s32           44100 Hz 2 ch s32   57342 frames ->   20804 samples (zero tail 0): identical
+r48000_m_s16           48000 Hz 1 ch s16   62413 frames ->   20805 samples (zero tail 0): identical
+r48000_s_s16           48000 Hz 2 ch s16   62413 frames ->   20805 samples (zero tail 0): identical
+r48000_m_f32           48000 Hz 1 ch f32   62413 frames ->   20805 samples (zero tail 0): identical
+r48000_s_f32           48000 Hz 2 ch f32   62413 frames ->   20805 samples (zero tail 0): identical
+r48000_m_u8            48000 Hz 1 ch u8    62413 frames ->   20805 samples (zero tail 0): identical
+r48000_m_s24           48000 Hz 1 ch s24   62413 frames ->   20805 samples (zero tail 0): identical
+r48000_m_s32           48000 Hz 1 ch s32   62413 frames ->   20805 samples (zero tail 0): identical
+r48000_c6_s16_ext      48000 Hz 6 ch s16   48011 frames ->   16004 samples (zero tail 0): identical
+r44100_m_f32_hot       44100 Hz 1 ch f32   44103 frames ->   16001 samples (zero tail 0): identical
+r48000_m_s16_n1        48000 Hz 1 ch s16       1 frames ->       1 samples (zero tail 0): identical
+r48000_m_s16_n2        48000 Hz 1 ch s16       2 frames ->       1 samples (zero tail 0): identical
+r48000_m_s16_n3        48000 Hz 1 ch s16       3 frames ->       2 samples (zero tail 1): identical
+r48000_m_s16_n4        48000 Hz 1 ch s16       4 frames ->       2 samples (zero tail 0): identical
+r48000_m_s16_n5        48000 Hz 1 ch s16       5 frames ->       2 samples (zero tail 0): identical
+r44100_m_s16_n1        44100 Hz 1 ch s16       1 frames ->       1 samples (zero tail 0): identical
+r44100_m_s16_n2        44100 Hz 1 ch s16       2 frames ->       1 samples (zero tail 0): identical
+r44100_m_s16_n7        44100 Hz 1 ch s16       7 frames ->       2 samples (zero tail 0): identical
+r8000_m_s16_n1          8000 Hz 1 ch s16       1 frames ->       2 samples (zero tail 0): identical
+r8000_m_s16_n2          8000 Hz 1 ch s16       2 frames ->       4 samples (zero tail 0): identical
+r8000_m_s16_n3          8000 Hz 1 ch s16       3 frames ->       6 samples (zero tail 0): identical
+r16000_m_s16_n1        16000 Hz 1 ch s16       1 frames ->       1 samples (zero tail 0): identical
+r48000_s_s16_list      48000 Hz 2 ch s16   24005 frames ->    8002 samples (zero tail 0): identical
+r48000_m_s16_trunc     48000 Hz 1 ch s16   30000 frames ->   10001 samples (zero tail 1): identical
+jfk_48k                48000 Hz 1 ch s16  528000 frames ->  176001 samples (zero tail 1): identical
+bench_44k1_s_60s       44100 Hz 2 ch s16 2646000 frames ->  960000 samples (zero tail 0): identical
+resampler: 55/55 files, 1955875 samples bit-identical to whisper-cli's read_audio_data (3 files end in the length rule's zero tail)
+ok
+test oracle_resample_discriminates ... discriminator: low-pass order 2 instead of 4 -> 45/50 resampled files differ
+discriminator: low-pass order 6 instead of 4 -> 45/50 resampled files differ
+discriminator: stereo mixdown as L + R -> 8/8 stereo s16 files differ
+discriminator: stereo mixdown as L only -> 8/8 stereo s16 files differ
+discriminator: output length = samples the resampler made (no zero tail) -> 3/55 files differ
+ok
+test oracle_resample_streaming_equals_whole ... streaming: 55/55 files pushed in random 1..9000-byte pieces equal the reference bit for bit
+ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+## 5. efficiency (only now): log-mel; wall = best of 10 calls, cpu = CPU ms per call (utime+stime, all threads,
+##    loop >= 1 s), heap = bytes live at the first call's peak (KiB; voaice's counting allocator, the reference's
+##    operator new counted), rss = VmHWM of the first call minus VmRSS before it (KiB; heap reuse can hide growth)
+0.0.1 rebuilt from tag v0.0.1 (8ecf659): its `voaice mel` times the mel call alone, 1 thread, best of 10
+wav         samples |   ref_1t  v001_1t    vo_1t |   ref_4t    vo_4t |  x_v001 | cpu_ref1  cpu_vo1 | cpu_ref4  cpu_vo4 | heap_r heap_v |  rss_r  rss_v
+chirp         40000 |    6.451    7.000    1.209 |    4.431    1.083 |   5.79x |    6.735    1.537 |   14.433    2.563 |   3068   1016 |   2884     64
+jfk          176000 |   34.547   28.000    4.739 |   19.499    3.557 |   5.91x |   30.938    5.076 |   57.115   10.287 |   3868   1282 |   3584   1176
+jfk_x3       528000 |   78.798   82.700   14.761 |   48.817    8.670 |   5.60x |   82.308   15.781 |  179.412   30.973 |   5925   1969 |   5732   1932
+min_len         201 |    0.675    1.000    0.188 |    1.049    0.188 |   5.32x |    0.710    0.195 |    2.487    0.201 |   2836    938 |   2712     64
+noise_loud    16000 |    3.006    3.500    0.604 |    2.916    0.599 |   5.79x |    3.279    0.641 |    7.259    0.636 |   2928    969 |   2744      0
+odd_len       12345 |    2.479    2.900    0.546 |    2.458    0.500 |   5.31x |    2.577    0.527 |    6.421    0.527 |   2908    962 |   2604      0
+short          4800 |    1.352    1.700    0.308 |    1.701    0.301 |   5.52x |    1.390    0.319 |    3.695    0.313 |   2860    947 |   2796     64
+silence       16000 |    2.858    3.500    0.590 |    2.768    0.587 |   5.93x |    3.077    0.612 |    6.542    0.609 |   2928    969 |   2740      0
+geometric mean of wall-time ratios over 8 inputs: voaice at 1 thread is 5.64x faster than 0.0.1 and 4.95x faster than the reference at 1 thread; at 4 threads, 5.09x faster than the reference at 4
+## 5b. efficiency (only now): f32<->f16 and GELU. init = the first GELU table build in a fresh process (best of
+##     5 processes; the reference's ggml_cpu_init also fills its quick-GELU and f32<-f16 tables and two 256-entry
+##     ones, voaice only the GELU table it needs); rows = best of 10 calls on 384x1500 values; gelu = the op on
+##     1536x1500 (the encoder MLP's size), 1 thread; the reference's through a ggml graph, whose two tensor copies
+##     are measured alone and taken off (gelu_net)
+reference: bench-f16-reference fp32_to_fp16_row_ms 0.262 fp16_to_fp32_row_ms 0.100 gelu_ms 11.990 gelu_copies_ms 2.380 n_row 576000 n_gelu 2304000
+voaice:    bench-f16 fp32_to_fp16_row_ms 0.098 fp16_to_fp32_row_ms 0.132 gelu_ms 2.754 gelu_scalar_ms 7.603 n_row 576000 n_gelu 2304000
+measure                         reference     voaice    ratio
+gelu table, first build (ms)        2.085      1.907    1.09x
+fp32_to_fp16 row 576k (ms)          0.262      0.098    2.67x
+fp16_to_fp32 row 576k (ms)          0.100      0.132    0.76x
+gelu op 2.3M, net (ms)              9.610      2.754    3.49x
+gelu op 2.3M, scalar path (ms)      9.610      7.603    1.26x
+## 6. efficiency (only now): the Ogg/Opus reader. crc = 16 MiB, best of 7, sliced-by-8 against one byte at a time;
+##    read = Reader::new + every packet + the end checks, best of 10 (mem: from a slice; file: open + read), cpu =
+##    CPU ms per read over >= 1 s; heap = bytes live at one read's peak (the counting allocator), reading from the file
+e_jfk_x3_m_6k_comp0     bytes 24617 pages 36 packets 1651 duration 1584000 crc_sliced_mib_s 1606 crc_bytewise_mib_s 356 crc_speedup 4.51 read_mem_ms 0.0422 read_mem_mib_s 557 read_mem_cpu_ms 0.0400 read_file_ms 0.1315 read_file_mib_s 179 read_file_cpu_ms 0.1288 heap_peak_bytes 66281 audio_s_per_cpu_s 825330
+e_jfk_m_2.5ms_24k       bytes 50156 pages 20 packets 4403 duration 528000 crc_sliced_mib_s 1627 crc_bytewise_mib_s 354 crc_speedup 4.60 read_mem_ms 0.0867 read_mem_mib_s 552 read_mem_cpu_ms 0.0949 read_file_ms 0.1363 read_file_mib_s 351 read_file_cpu_ms 0.1452 heap_peak_bytes 66289 audio_s_per_cpu_s 115896
+e_jfk_m_60ms_24k        bytes 34119 pages 14 packets 184 duration 528000 crc_sliced_mib_s 1649 crc_bytewise_mib_s 355 crc_speedup 4.64 read_mem_ms 0.0275 read_mem_mib_s 1184 read_mem_cpu_ms 0.0269 read_file_ms 0.0665 read_file_mib_s 489 read_file_cpu_ms 0.0657 heap_peak_bytes 66288 audio_s_per_cpu_s 409244
+sa_silence_60           bytes 7782 pages 63 packets 3001 duration 2880000 crc_sliced_mib_s 1649 crc_bytewise_mib_s 357 crc_speedup 4.62 read_mem_ms 0.0484 read_mem_mib_s 153 read_mem_cpu_ms 0.0501 read_file_ms 0.1878 read_file_mib_s 40 read_file_cpu_ms 0.1941 heap_peak_bytes 65499 audio_s_per_cpu_s 1198500
+sa_continuation         bytes 135850 pages 7 packets 9 duration 8228 crc_sliced_mib_s 1628 crc_bytewise_mib_s 357 crc_speedup 4.56 read_mem_ms 0.0896 read_mem_mib_s 1446 read_mem_cpu_ms 0.0917 read_file_ms 0.1261 read_file_mib_s 1028 read_file_cpu_ms 0.1251 heap_peak_bytes 135453 audio_s_per_cpu_s 1869
+e_picture_24k           bytes 68384 pages 4 packets 16 duration 14400 crc_sliced_mib_s 1628 crc_bytewise_mib_s 359 crc_speedup 4.54 read_mem_ms 0.0673 read_mem_mib_s 969 read_mem_cpu_ms 0.0695 read_file_ms 0.0857 read_file_mib_s 761 read_file_cpu_ms 0.0871 heap_peak_bytes 197958 audio_s_per_cpu_s 4318
+## 7. efficiency (only now): the resampler. One call = the whole read of a file (open, parse, convert, mix,
+##    resample, the vector out); wall = best of 10, cpu = CPU ms per call over >= 1 s, heap = bytes live at the first
+##    call's peak (voaice: the counting allocator; reference: malloc/calloc/realloc interposed), rss = VmHWM delta
+file                   in_s  samples |   ref_ms    vo_ms      x |  cpu_ref   cpu_vo | heap_r heap_v | rss_r rss_v | cpu_ms/as
+jfk_48k               11.00   176001 |    6.174    4.780  1.29x |    6.433    4.760 |    698    688 |  1156   976 |    0.433
+bench_44k1_s_60s      60.00   960000 |   42.197   19.718  2.14x |   44.348   20.000 |   3762   3750 |  4368  4040 |    0.333
+r48000_s_s16           1.30    20805 |    0.914    0.457  2.00x |    0.933    0.471 |     91     82 |   720   616 |    0.362
+r44100_s_s16           1.30    20804 |    0.860    0.422  2.04x |    0.902    0.433 |     91     82 |   704   524 |    0.333
+r22050_m_s16           1.30    20806 |    0.528    0.260  2.03x |    0.423    0.491 |     91     82 |   720   576 |    0.378
+r8000_s_s16            1.30    20814 |    0.446    0.174  2.56x |    0.352    0.176 |     91     82 |   716   604 |    0.135
+r16000_s_s16           1.30    20808 |    0.105    0.026  4.04x |    0.085    0.027 |     91     82 |   420   244 |    0.021
+r48000_c6_s16_ext      1.00    16004 |    1.121    0.808  1.39x |    1.028    0.588 |     72     63 |   700   580 |    0.588
+geometric mean over 8 files: voaice reads 2.06x faster than whisper-cli's read_audio_data (cpu_ms/as = voaice CPU ms per second of output audio)
+## transcripts recorded (not yet reproduced by voaice.rs: encoder and decoder are later stages)
+chirp:  (whistling) 
+jfk:  And so my fellow Americans ask not what your country can do for you  ask what you can do for your country. 
+jfk_x3:  And so my fellow Americans ask not what your country can do for you  ask what you can do for your country  And so my fellow Americans ask not what your country can do for you  ask what you can do for your country  And so my fellow Americans ask not what your country can do for you  for you ask what you can do for your country. 
+min_len: 
+noise_loud: 
+odd_len:  [BLANK_AUDIO] 
+short: 
+silence:  [BLANK_AUDIO] 
+GATE PASSED

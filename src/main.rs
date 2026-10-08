@@ -7,6 +7,8 @@
 //!   voaice bench-f16 init|rows                             (0.0.3) the GELU table's build; f32<->f16 rows and the GELU op
 //!   voaice opus info <file.opus>                           (0.0.4) read the Ogg/Opus stream page by page: headers, counts, exact duration
 //!   voaice bench-opus <file.opus>                           (0.0.4) the CRC (sliced vs one byte at a time), the reader's throughput, heap peak
+//!   voaice resample <in.wav> [out.f32]                     (0.0.5) any WAV -> whisper's 16 kHz mono f32, as whisper-cli reads it
+//!   voaice bench-resample <in.wav>                          (0.0.5) that read's heap peak, wall (best of 10), CPU per call, peak RSS
 //!   voaice vclone check <file.voaice>...                   recompute each identity's vprint and compare every field
 //!   voaice vclone print <8 metrics>                         the dvscope/1 print of eight values (vprint.py's twin)
 //!   voaice vclone log <events.jsonl>                        verify a forge log's chain and say whether it is mintable
@@ -15,7 +17,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::process::ExitCode;
-use voaice::{f16, gelu, measure, mel, model::Model, ogg, sha256, vclone, wav};
+use voaice::{f16, gelu, measure, mel, model::Model, ogg, resample, sha256, vclone, wav};
 
 /// The system allocator, counting live heap bytes and their peak, so `bench-mel` can report the heap a call needs
 /// (std only: a `GlobalAlloc` wrapper, no crate). Thread stacks are mapped, not allocated, and are not counted.
@@ -145,12 +147,68 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("bench-f16") if args.len() == 2 => bench_f16(&args[1]),
         Some("opus") if args.len() == 3 && args[1] == "info" => opus_info(&args[2]),
         Some("bench-opus") if args.len() == 2 => bench_opus(&args[1]),
+        Some("resample") if args.len() == 2 || args.len() == 3 => {
+            let start = std::time::Instant::now();
+            let (fmt, pcm) = resample::read(Path::new(&args[1]))?;
+            let took = start.elapsed();
+            let bytes: Vec<u8> = pcm.iter().flat_map(|v| v.to_le_bytes()).collect();
+            println!(
+                "resample {} Hz {} ch {} {} frames -> 16000 Hz mono f32 {} samples, sha256 {}, {:.2} ms",
+                fmt.rate,
+                fmt.channels,
+                fmt.sample.name(),
+                fmt.frames(),
+                pcm.len(),
+                sha256::hex(&sha256::digest(&bytes)),
+                took.as_secs_f64() * 1e3
+            );
+            if let Some(out) = args.get(2) {
+                std::fs::write(out, &bytes).map_err(|e| format!("{out}: {e}"))?;
+            }
+            Ok(())
+        }
+        Some("bench-resample") if args.len() == 2 => {
+            // each call is the whole read, as the reference's: open, parse, convert, mix, resample, the vector out
+            let path = Path::new(&args[1]);
+            let mut err = None;
+            let mut heap_peak = None;
+            let mut samples = 0;
+            let b = measure::bench(
+                || {
+                    let live = LIVE.load(Relaxed);
+                    PEAK.store(live, Relaxed);
+                    match resample::read(path) {
+                        Err(e) => err = Some(e),
+                        Ok((_, pcm)) => {
+                            heap_peak.get_or_insert(PEAK.load(Relaxed) - live);
+                            samples = pcm.len();
+                        }
+                    }
+                },
+                10,
+                1.0,
+            );
+            if let Some(e) = err {
+                return Err(e);
+            }
+            let opt = |v: Option<String>| v.unwrap_or_else(|| "n/a".into());
+            println!(
+                "bench-resample samples {samples} heap_peak_kb {} wall_best_ms {:.3} cpu_ms_per_call {} cpu_reps {} rss_peak_delta_kb {} rss_peak_kb {}",
+                heap_peak.unwrap_or(0).div_ceil(1024),
+                b.wall_best_ms,
+                opt(b.cpu_ms_per_call.map(|c| format!("{c:.3}"))),
+                b.cpu_reps,
+                opt(b.rss_peak_delta_kb.map(|v| v.to_string())),
+                opt(b.rss_peak_kb.map(|v| v.to_string()))
+            );
+            Ok(())
+        }
         Some("vclone") => vclone_cmd(&args[1..]),
         Some("version") => {
             println!("voaice {} (reference: whisper.cpp 080bbbe8, ggml 0.16.0)", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        _ => Err("usage: voaice info <model.bin> | voaice mel <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-mel <model.bin> <in.wav> [--threads N] | voaice bench-f16 init|rows | voaice opus info <file.opus> | voaice bench-opus <file.opus> | voaice vclone check <file.voaice>... | voaice vclone print <8 metrics> | voaice vclone log <events.jsonl> | voaice version".into()),
+        _ => Err("usage: voaice info <model.bin> | voaice mel <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-mel <model.bin> <in.wav> [--threads N] | voaice bench-f16 init|rows | voaice opus info <file.opus> | voaice bench-opus <file.opus> | voaice resample <in.wav> [out.f32] | voaice bench-resample <in.wav> | voaice vclone check <file.voaice>... | voaice vclone print <8 metrics> | voaice vclone log <events.jsonl> | voaice version".into()),
     }
 }
 

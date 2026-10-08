@@ -57,6 +57,21 @@ Below the oracles, `cargo test` carries a second witness for the mel that needs 
 the optimized path, at 1, 2, 3, 4 and 7 threads and in its fused variant, to give the same bits on synthetic audio
 and a synthetic filterbank with zero runs.
 
+### The audio reader (0.0.5) — `tests/resample.rs` against whisper-cli's own `libcommon.a`
+
+`testing/oracle/resample_oracle.cpp` links the pinned build's `examples/libcommon.a` — the object whisper-cli is
+linked with: `common-whisper.cpp` and miniaudio 0.11.24 inside it, compiled `-O3 -DNDEBUG -fPIC` with no `-march`
+(the gate counts its FMA instructions: 0) — and calls `read_audio_data(path, pcm, pcms, /*stereo=*/false)` exactly as
+whisper-cli does without `--diarize`, writing the vector it returns. The corpus is `testing/make_resample_audio.py`
+(55 files, sha256-pinned in `testing/pins/resample.sha256`). How the source was read is in
+`testing/resample/NOTES.md`.
+
+| oracle | compares | result (0.0.5) |
+|---|---|---|
+| `oracle_resample_bit_exact` | voaice's `resample::read` (streamed from the file) against the vector, length and every bit pattern: 8 / 16 / 22.05 / 24 / 32 / 44.1 / 48 kHz × mono, stereo × s16, f32; u8, s24, s32 at 22.05 / 44.1 / 48 kHz; six channels in WAVE_FORMAT_EXTENSIBLE; f32 at ±4, ±1, −0.0 and subnormal; 1, 2, 3, 4, 5, 7-frame inputs; a padded odd LIST chunk; a data chunk claiming more than the file holds; JFK held to 48 kHz; 60 s of 44.1 kHz stereo | **55 / 55** files, **1,955,875 / 1,955,875** samples; 3 files end in the length rule's zero tail, reproduced |
+| `oracle_resample_streaming_equals_whole` | the data chunk pushed through `Converter` in pseudo-random 1–9,000-byte pieces (frames split across pushes) | **55 / 55** files equal the reference |
+| `oracle_resample_discriminates` | wrong readings of miniaudio: a low-pass of order 2 or 6; the stereo mixdown as `L + R` (the diarize path's) or the left channel alone; the output length as the samples the resampler makes | order 2: **45 / 50** resampled files differ, order 6: **45 / 50** (the 5 not caught are 1–2-frame inputs whose only output is the leading 0); `L + R`: **8 / 8**, `L` alone: **8 / 8** stereo s16 files; the length: **3 / 55** (exactly the files with a zero tail) |
+
 ## Efficiency — measured only after the oracles pass
 
 (0.0.4) Step 6 of the gate measures the Ogg/Opus reader after 4b passed: Ogg's CRC on 16 MiB sliced-by-8 against the

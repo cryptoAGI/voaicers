@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.0.5 — 2026-10-08 — the audio reader whisper-cli runs, bit-exact against its own libcommon.a
+
+**Any PCM or float WAV, at any rate and channel count, to whisper's 16 kHz mono f32 — dr_wav's conversions, miniaudio
+0.11.24's mono average, its linear resampler with the order-4 low-pass and its length rule — bit for bit as
+whisper-cli's `read_audio_data` reads the same file, streamed in any chunking.** Record: `testing/results/0.0.5.txt`.
+
+### The oracle
+- `testing/oracle/resample_oracle` links the pinned build's `examples/libcommon.a` (the object whisper-cli links;
+  `-O3 -DNDEBUG`, no `-march`, 0 FMA instructions counted) and calls `read_audio_data` as whisper-cli does without
+  `--diarize`. Corpus: `testing/make_resample_audio.py`, 55 files pinned in `testing/pins/resample.sha256`.
+- `oracle_resample_bit_exact`: **55 / 55** files, **1,955,875 / 1,955,875** samples — 8 / 16 / 22.05 / 24 / 32 /
+  44.1 / 48 kHz, mono and stereo, s16 / f32 / u8 / s24 / s32, six channels in WAVE_FORMAT_EXTENSIBLE, f32 beyond full
+  scale and subnormal, 1–7-frame inputs, a LIST chunk, a truncated data chunk, JFK at 48 kHz, 60 s of 44.1 kHz stereo.
+  3 files end in the length rule's zero tail (the rule promises one frame more than the resampler makes); reproduced.
+- `oracle_resample_streaming_equals_whole`: random 1–9,000-byte pushes, frames split across them: **55 / 55**.
+- Discriminators: low-pass order 2 or 6 — **45 / 50** resampled files differ each (the other 5 are 1–2-frame inputs
+  whose only output is the leading 0); stereo mixdown as `L + R` or `L` alone — **8 / 8**; the length without the
+  promised frame — **3 / 55** (exactly the zero-tail files). All caught.
+- How the source was read, line by line: `testing/resample/NOTES.md`.
+
+### Measured (gate step 7, only after 4c passed; same laptop, 1-minute load 1.6 at the start)
+One call = the whole read of a file, each side in a fresh process; wall = best of 10.
+
+| file | audio | reference | voaice | × | heap ref / voaice |
+|---|---|---|---|---|---|
+| JFK held to 48 kHz mono | 11 s | 6.17 ms | 4.78 ms | 1.29× | 698 / 688 KiB |
+| 44.1 kHz stereo, 60 s | 60 s | 42.2 ms | 19.7 ms | 2.14× | 3,762 / 3,750 KiB |
+| 48 kHz stereo | 1.3 s | 0.91 ms | 0.46 ms | 2.00× | 91 / 82 KiB |
+| 8 kHz stereo (upsampling) | 1.3 s | 0.45 ms | 0.17 ms | 2.56× | 91 / 82 KiB |
+| 16 kHz stereo (no resampler) | 1.3 s | 0.11 ms | 0.03 ms | 4.04× | 91 / 82 KiB |
+| 48 kHz, six channels | 1.0 s | 1.12 ms | 0.81 ms | 1.39× | 72 / 63 KiB |
+
+Geometric mean over 8 files: **2.06×** the reference; about **0.33 CPU-ms per second of output audio** when
+resampling. The low-pass is a serial IIR chain whose float order the oracle fixes, so the win is around it (no
+intermediate buffers, one pass), not inside it. The heap is the output vector on both sides.
+
+### Added
+- `src/resample.rs` (`read`, `Converter` push/finish, `Linear`, `parse_header`); `voaice resample`,
+  `voaice bench-resample`; `tests/resample.rs`; the gate's steps 4c and 7; `ATTRIBUTION.md` credits miniaudio / dr_wav
+  (public domain or MIT-0; nothing copied).
+- Not covered (refused by name): FLAC / MP3 / Vorbis, A-law, µ-law, ADPCM, f64, RF64 / Wave64, stdin, the diarize path.
+
 ## 0.0.4 — 2026-10-08 — the streaming Ogg/Opus reader, exact against opus-tools 0.2
 
 **An `.opus` file read page by page from any `std::io::Read` — every page's CRC, sequence and flags checked, packets

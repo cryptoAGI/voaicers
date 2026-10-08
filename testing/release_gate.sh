@@ -19,6 +19,11 @@
 #      mindX production (testing/opus/oracle.sh check) when the host answers — skipped, and said so, when it does not
 #   6. (0.0.4) the reader's efficiency, only after 4b passed: the CRC sliced against one byte at a time, the whole
 #      read from memory and from the file, CPU per read, heap peak (`voaice bench-opus`)
+#   4c. (0.0.5) the audio reader + mixdown + resampler against whisper-cli's read_audio_data (the build's libcommon.a,
+#      testing/oracle/bin/resample_oracle) on the pinned corpus (testing/make_resample_audio.py), bit for bit; chunked
+#      streaming equal to the whole; discriminators (another low-pass order, another mixdown, another length rule)
+#   7. (0.0.5) its efficiency, only after 4c passed: each side reads the same file whole, in a fresh process (`voaice
+#      bench-resample`, `resample_oracle --bench`)
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
@@ -48,6 +53,7 @@ have=$(sha256sum "$model" | cut -d' ' -f1)
 [ "$have" = "$pin_sha" ] || { log "FAIL: $model sha256 $have != pin $pin_sha"; exit 1; }
 log "model $model sha256 $have (pinned)"
 python3 testing/make_audio.py | tee -a "$out"
+python3 testing/make_resample_audio.py | tee -a "$out"
 
 log "## 3. record (the shipped libwhisper.so, in process)"
 rm -rf .oracle/tiny.en
@@ -56,6 +62,11 @@ rm -rf .oracle/f16
 t0=$(date +%s)
 testing/oracle/bin/whisper_oracle --f16 .oracle/f16 2>&1 | tee -a "$out"
 log "(the f16 record took $(( $(date +%s) - t0 )) s: all 2^32 f32 patterns, three conversions and the GELU op, one thread)"
+
+rm -rf .oracle/resample && mkdir -p .oracle/resample
+testing/oracle/bin/resample_oracle .oracle/resample .audio/resample/*.wav > .oracle/resample.log
+log "resample_oracle (libcommon.a's read_audio_data): $(wc -l < .oracle/resample.log) files recorded, $(awk '{s+=$2} END{print s}' .oracle/resample.log) samples"
+log "libcommon.a's common-whisper.cpp.o (miniaudio inside): $(objdump -d upstream/whisper.cpp/build/examples/CMakeFiles/common.dir/common-whisper.cpp.o | grep -cE 'vfn?m(add|sub)') FMA instructions, $(objdump -d upstream/whisper.cpp/build/examples/CMakeFiles/common.dir/common-whisper.cpp.o | grep -c '%ymm') ymm uses"
 
 log "## 4. voaice.rs"
 cargo build --release 2>&1 | tail -1 | tee -a "$out"
@@ -86,6 +97,13 @@ else
   log "SKIPPED: $opus_host unreachable — the reference was not asked again in this run; the comparisons above are"
   log "         against its answers recorded in testing/opus/reference.jsonl ($(grep -o '"date": "[^"]*"' testing/opus/reference.meta.json))"
 fi
+
+log "## 4c. the resampler (0.0.5): whisper-cli's read_audio_data (miniaudio 0.11.24 in the build's libcommon.a)"
+step=.oracle/resample_step.log
+cargo test --release --test resample -- --ignored --nocapture --test-threads=1 2>&1 \
+  | grep -vE "^\s*(Compiling|Finished|Running)|^$|^running" > "$step" || true
+tee -a "$out" < "$step"
+grep -q "test result: ok. 3 passed" "$step" || { log "FAIL: the resampler oracle comparisons did not all pass"; exit 1; }
 
 nt=$(nproc)
 log "## 5. efficiency (only now): log-mel; wall = best of 10 calls, cpu = CPU ms per call (utime+stime, all threads,"
@@ -156,6 +174,25 @@ log "##    CPU ms per read over >= 1 s; heap = bytes live at one read's peak (th
 for f in e_jfk_x3_m_6k_comp0 e_jfk_m_2.5ms_24k e_jfk_m_60ms_24k sa_silence_60 sa_continuation e_picture_24k; do
   log "$(printf '%-22s ' "$f") $(target/release/voaice bench-opus "testing/opus/files/$f.opus" | sed 's/^bench-opus //')"
 done
+log "## 7. efficiency (only now): the resampler. One call = the whole read of a file (open, parse, convert, mix,"
+log "##    resample, the vector out); wall = best of 10, cpu = CPU ms per call over >= 1 s, heap = bytes live at the first"
+log "##    call's peak (voaice: the counting allocator; reference: malloc/calloc/realloc interposed), rss = VmHWM delta"
+log "$(printf '%-18s %8s %8s | %8s %8s %6s | %8s %8s | %6s %6s | %5s %5s | %8s' file in_s samples ref_ms vo_ms x cpu_ref cpu_vo heap_r heap_v rss_r rss_v cpu_ms/as)"
+sum=0; k=0
+for f in jfk_48k bench_44k1_s_60s r48000_s_s16 r44100_s_s16 r22050_m_s16 r8000_s_s16 r16000_s_s16 r48000_c6_s16_ext; do
+  r=$(testing/oracle/bin/resample_oracle --bench ".audio/resample/$f.wav")
+  v=$(target/release/voaice bench-resample ".audio/resample/$f.wav")
+  secs=$(awk -v n="$(echo "$v" | field samples)" 'BEGIN{printf "%.2f", n/16000}')
+  rw=$(echo "$r" | field wall_best_ms); vw=$(echo "$v" | field wall_best_ms)
+  log "$(printf '%-18s %8s %8s | %8.3f %8.3f %5.2fx | %8s %8s | %6s %6s | %5s %5s | %8s' "$f" "$secs" "$(echo "$v" | field samples)" \
+    "$rw" "$vw" "$(awk -v a="$rw" -v b="$vw" 'BEGIN{print a/b}')" \
+    "$(echo "$r" | field cpu_ms_per_call)" "$(echo "$v" | field cpu_ms_per_call)" \
+    "$(echo "$r" | field heap_peak_kb)" "$(echo "$v" | field heap_peak_kb)" \
+    "$(echo "$r" | field rss_peak_delta_kb)" "$(echo "$v" | field rss_peak_delta_kb)" \
+    "$(awk -v c="$(echo "$v" | field cpu_ms_per_call)" -v s="$secs" 'BEGIN{printf "%.3f", c/s}')")"
+  sum=$(awk -v s="$sum" -v a="$rw" -v b="$vw" 'BEGIN{print s + log(a/b)}'); k=$((k + 1))
+done
+log "$(awk -v s="$sum" -v k="$k" 'BEGIN{printf "geometric mean over %d files: voaice reads %.2fx faster than whisper-cli'"'"'s read_audio_data (cpu_ms/as = voaice CPU ms per second of output audio)", k, exp(s/k)}')"
 log "## transcripts recorded (not yet reproduced by voaice.rs: encoder and decoder are later stages)"
 for d in .oracle/tiny.en/*/; do log "$(basename "$d"): $(tr '\n' ' ' < "$d/transcript.txt")"; done
 log "GATE PASSED"

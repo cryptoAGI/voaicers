@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT OR Apache-2.0
 # Build the pinned whisper.cpp (if needed), the layout probe, and the oracle harness.
-#   testing/oracle/build.sh            -> testing/oracle/bin/whisper_oracle
+#   testing/oracle/build.sh            -> testing/oracle/bin/whisper_oracle, testing/oracle/bin/resample_oracle
 # The reference is upstream/whisper.cpp at the commit in upstream/PIN, CPU only, Release, shared libraries, GGML_NATIVE
 # (as mindX production builds it). The oracle links the shipped libwhisper.so / libggml*.so; the probe only computes
 # struct offsets (see layout_probe.cpp).
@@ -42,5 +42,10 @@ g++ -std=gnu++17 -O0 -w $defs -DWHISPER_VERSION=\"1.9.1\" $inc "$root/testing/or
 "$out/layout_probe" > "$out/layout.h"
 # 2. the oracle
 g++ -std=gnu++17 -O2 -Wall $defs $inc -I"$out" "$root/testing/oracle/whisper_oracle.cpp" -o "$out/whisper_oracle" $lib
+# 3. (0.0.5) the audio reader's oracle: the build's own libcommon.a (whisper-cli's read_audio_data + miniaudio, as compiled
+#    for whisper-cli: -O3 -DNDEBUG, no -march); built with whisper-cli, and here if missing
+[ -f "$up/build/examples/libcommon.a" ] || cmake --build "$up/build" -j"$(nproc)" --target common >/dev/null
+g++ -std=gnu++17 -O2 -Wall -Wno-unused-result -I"$up/examples" $inc "$root/testing/oracle/resample_oracle.cpp" \
+  -o "$out/resample_oracle" "$up/build/examples/libcommon.a" $lib
 echo "built ${out#"$root"/}/whisper_oracle (reference $pin_commit, ggml $gv)"   # repo-relative: a record is not a map of this machine
 cat "$out/layout.h"
