@@ -36,14 +36,34 @@ whisper.cpp (upstream/PIN) in the same run; only then is its speed measured.
       oracle sees the row tail's copy, the table-init's copy and the GELU op's copy). They are checked when their
       nodes are, through the scheduler callback (0.0.6 onward).
 
-## Next: 0.0.4 — the streaming Ogg/Opus reader (see docs/ROADMAP.md for the decade to v0.1.0)
-- [ ] Pages (capture pattern, version, header type, granule, serial, sequence, CRC-32 0x04C11DB7 unreflected, lacing),
-      packets across pages, `OpusHead` (version, channels, pre-skip, input rate, gain, mapping) and `OpusTags`; the
-      exact duration = last granule − pre-skip; bounded memory (one page at a time). Share the page format with
-      streamair's writer.
-- [ ] Oracle: opus-tools' `opusinfo` / `opusdec` on the same files — not installed on this laptop; pin and build it
-      under `upstream/` or run the oracle where production's opus-tools 0.2 is. Discriminator: a corrupted CRC and a
-      wrong pre-skip must be refused / caught.
+## Done in 0.0.4 — the streaming Ogg/Opus reader (`src/ogg.rs`)
+- [x] Pages from any `std::io::Read`, one page buffer (65,307 bytes) allocated once and reused; a packet inside a page
+      handed out as a slice of it, a packet across pages assembled in a second buffer sized exactly to the longest
+      such packet. Checked on every page: `OggS`, version 0, the flags (BOS first only, EOS last only, continued
+      exactly when a packet is carried), one serial, consecutive sequence numbers, Ogg's CRC-32 (0x04C11DB7,
+      unreflected, init 0 — sliced by 8, 4.5× the byte-at-a-time table).
+- [x] `OpusHead` (version, channels, pre-skip, input rate, gain, mapping family with the family-1 table validated) and
+      `OpusTags` (vendor and comments, kept up to a bound; a longer packet is marked truncated, not refused), each
+      on its pages as RFC 7845 §3 places them.
+- [x] Granules (RFC 7845 §4): the start of a stream that began past zero, every mid-stream granule equal to the last
+      plus the samples completed, end trimming on the last page only and never past its samples or before the
+      pre-skip; per packet its TOC samples and how many to skip and keep. Duration = last granule − start − pre-skip.
+- [x] Every refusal a named `Kind` with the byte offset and the page (23 kinds).
+- [x] Oracle (`tests/opus.rs`, `testing/opus/`): opus-tools 0.2 + libopus 1.4 + libogg 1.3.5 on production, recorded:
+      35 / 35 files on 18 checks each (duration = opusdec's samples, every page and packet by libogg digest),
+      21 / 21 adversarial files refused by name, 1 valid variant accepted; discriminators caught (pre-skip added,
+      no end trim, code-3 count ignored, zlib's CRC verifies 0 / 427 pages). `voaice opus info`, `voaice bench-opus`.
+- [x] streamair → voaice round trips (streamair/tests/roundtrip.rs): 400 random streams back exactly.
+- [ ] **Found, not fixed (streamair's next step):** streamair 0.0.1's `mux` accepts an end trim larger than the
+      samples on the last page (it bounds the trim by 5,760), which makes the EOS granule go backwards; opusinfo calls
+      such a file an ERROR, voaice refuses it (`known_issue_the_writer_accepts_end_trimming_past_the_last_page`).
+- [ ] Not yet covered by the oracle: the family-1 mapping table's values (opusinfo does not print them), mapping
+      families 2 / 3 / 255, chained and multiplexed streams (refused by name today), the reference's own speed (the
+      gate does not time on production).
+
+## Next: 0.0.5 — the resampler whisper-cli uses (see docs/ROADMAP.md)
+- [ ] miniaudio's linear resampler and its low-pass filter as compiled in the pinned whisper.cpp, 48 kHz → 16 kHz and
+      the other rates, mono mixdown — the samples `read_audio_data` produces, bit for bit.
 
 ## Then, in order
 

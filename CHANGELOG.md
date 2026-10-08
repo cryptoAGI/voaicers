@@ -1,5 +1,96 @@
 # Changelog
 
+## 0.0.4 — 2026-10-08 — the streaming Ogg/Opus reader, exact against opus-tools 0.2
+
+**An `.opus` file read page by page from any `std::io::Read` — every page's CRC, sequence and flags checked, packets
+reassembled across lacing and continuation, `OpusHead` and `OpusTags` parsed, granules and pre-skip turned into the
+exact playable length in 48 kHz samples — with memory bounded by one page, never the file. On 35 files the length
+equals the samples production's opusdec plays, and every page and packet equals what libogg and libopus see.**
+Record: `testing/results/0.0.4.txt`.
+
+### The oracle (opus-tools is not on the dev laptop; it runs where production has it)
+- The reference: **opus-tools 0.2 (`opusinfo`, `opusdec`), libopus 1.4, libogg 1.3.5** on mindX production
+  (AMD EPYC 7543P; packages `opus-tools 0.2-1build3`, `libopus0 1.4-1build1`, `libogg0 1.3.5-3build1`), reached
+  read-only over ssh, all work in `/tmp/voaice_oracle_004`, removed after; no service touched.
+  `testing/opus/reference.py` records per file: opusdec's WAV frame count at `--rate 48000`, opusinfo's printed
+  fields and warnings, and libogg (through ctypes) page by page and packet by packet, each packet's samples from
+  libopus's `opus_packet_get_nb_samples`. The files and the answers are pinned (`testing/opus/files.sha256`,
+  `reference.jsonl`), so `cargo test` checks offline; the gate asks the reference again when the host answers (this
+  run: **57 / 57 answers identical** to the record). opusenc with a fixed serial reproduced the same bytes twice.
+- `oracle_opus_good_files`: **35 / 35 files on each of 18 checks** — 14 written by streamair (silence of five lengths;
+  1, 7, 255 and 300 packets per page; a 70,000-byte packet and one of exactly 255 × 255 bytes across pages; every
+  frame size and frame-count code; stereo; pre-skip 0 and 3,840) and 21 encoded by opusenc on production from the
+  pinned WAVs (2.5 / 5 / 10 / 20 / 40 / 60 ms frames, 6–96 kb/s, hard CBR, complexity 0, stereo, downmix, **six
+  channels in mapping family 1**, a 68 KB OpusTags with a picture spanning pages, UTF-8 comments, a 201-sample file
+  whose only audio page is its last). The checks: **duration = opusdec's sample count**, the per-packet keep counts
+  sum to it, pre-skip, channels, input rate, gain, vendor, comments (the picture as opusinfo summarises it, decoded
+  from base64), playback length, packet duration max/avg/min, bytes, pages, audio packets, decoded samples, every
+  page's (sequence, granule, flags) and every packet's (bytes, samples) by FNV-1a digest against libogg, the last
+  granule, and that the reference itself found no fault (only advisory warnings: "high muxing delay" on pages longer
+  than a second, "implausibly low preskip" on pre-skip 0).
+- `oracle_opus_adversarial_files_refused`: **21 / 21** corruptions refused with the named error, its byte offset and
+  page (CRC byte, body bit, capture, version, serial, BOS again, continued flag, dropped and duplicated page, three
+  truncations, a cut at a page boundary, EOS removed, granule backwards / off by a packet / beyond the samples at EOS,
+  OpusHead and OpusTags magic, pre-skip past the end, an appended stream), and **1 / 1** valid variant accepted (every
+  granule +48,000: a stream that starts mid-broadcast; 528,000 samples = opusdec's). The test rebuilds each file from
+  its rule and checks its sha256 against what the reference saw; the reference noticed all 21 as well.
+- Discriminators (`oracle_opus_discriminators`): pre-skip **added** instead of subtracted is wrong on 34 / 35 files
+  (right only on the pre-skip-0 file); no end trimming, 34 / 35; the code-3 frame count ignored, 3 / 35 (the files
+  with multi-frame packets); **zlib's CRC-32 verifies 0 of the 427 pages**, Ogg's all 427. Each is caught.
+- Round trips (`streamair/tests/roundtrip.rs`): streamair's writer → voaice's reader on 400 random streams, every
+  packet's bytes, the duration and the length back exactly.
+
+### Found
+- **streamair 0.0.1's `mux` accepts an end trim larger than the samples on the last page** (it bounds the trim by
+  5,760 samples), so the EOS granule goes backwards. opusinfo 0.2 on production calls such a file an ERROR ("interior
+  holes or more than one page of end trimming") and opusdec plays the untrimmed length; voaice refuses it
+  (`GranuleBackwards`). Pinned as `known_issue_the_writer_accepts_end_trimming_past_the_last_page`; the fix is
+  streamair's next step (its source is not changed here).
+
+### Measured (gate step 6, only after 4b passed; 4-CPU Ryzen 3 3200U, 1-minute load 1.98 at the start, falling from 6.8)
+
+| file | bytes | audio | read from a slice | CPU per read | from the file | heap peak |
+|---|---|---|---|---|---|---|
+| JFK ×3, 6 kb/s, 1,651 packets | 24,617 | 33 s | 0.044 ms (534 MiB/s) | 0.045 ms (**≈ 730,000× real time**) | 0.125 ms | **66,281 B** |
+| JFK, 2.5 ms frames, 4,403 packets | 50,156 | 11 s | 0.087 ms (552 MiB/s) | 0.095 ms | 0.137 ms | 66,289 B |
+| JFK, 60 ms frames, 184 packets | 34,119 | 11 s | 0.032 ms (1,005 MiB/s) | 0.030 ms | 0.065 ms | 66,288 B |
+| 60 s of 1-byte DTX packets | 7,782 | 60 s | 0.047 ms (157 MiB/s) | 0.063 ms | 0.256 ms | 65,499 B |
+| 70,000 + 65,025-byte packets | 135,850 | 0.17 s | 0.093 ms (1,392 MiB/s) | 0.103 ms | 0.146 ms | 135,453 B |
+| 68 KB OpusTags with a picture | 68,384 | 0.3 s | 0.105 ms (623 MiB/s) | 0.100 ms | 0.126 ms | 197,958 B |
+
+- **Ogg CRC-32 sliced by 8: 1,406–1,580 MiB/s against 326–349 MiB/s one byte at a time — 4.06–4.61×** (16 MiB, best
+  of 7, six runs). Both are in the crate; the tests require them equal at every length 0–299 and alignment 0–7.
+- The heap is one page (65,307 bytes, allocated once) and a few hundred bytes of headers; a packet across pages adds
+  exactly its length (the carry buffer reserves exactly: 135,453 = 65,307 + 70,000 + 146 — an amortised doubling
+  had made it 195,503); OpusTags is held only while it is parsed. Nothing grows with the file.
+- Time per read is per page and per packet, not per byte: small packets (DTX, 2.5 ms) read slower in MiB/s and faster
+  in audio seconds. From the file it is three `read` calls a page and the `open`; no buffering layer is added.
+- The reference's speed is **not** compared: opusinfo is not on this laptop and the gate does not time on production.
+- The earlier stages, re-measured in the same run: the mel 4.78× the reference at one thread (5.52× at 4), the GELU
+  op 3.24× (10.5 against 3.25 ms) — lower than 0.0.3's recorded 5.65× and 4.31× at a different load; their code is
+  unchanged.
+
+### Added
+- `src/ogg.rs`: `Reader` (`new`, `with_max_packet`, `head`, `tags`, `next_packet` → `Packet { data, samples,
+  decoded_before, skip, keep, page, first_page, offset }`, `summary`, `finish`), `OpusHead` and `OpusTags` (with
+  `parse`), `Summary`, `Error { kind, offset, page, detail }` with 23 named `Kind`s, `crc32` (sliced by 8),
+  `crc32_update`, `crc32_bytewise`, `page_crc`, `packet_samples`, `fnv1a`. Rules enforced: RFC 3533 framing; RFC
+  7845 §3 header placement (OpusHead alone on the BOS page with granule 0; OpusTags ending a page, granule 0); §4
+  granules (start past zero allowed, never before it unless the first audio page is also the last; mid-stream
+  granules exact; end trimming only on the EOS page, never past its samples, never before the pre-skip); §5 headers
+  (major version 0, family 0 ≤ 2 channels, family 1 ≤ 8 with its table validated). Refused by name, not read:
+  chained streams (bytes after EOS) and multiplexed ones (a second serial). OpusTags beyond the packet bound
+  (1 MiB by default) is kept up to it and marked truncated; an audio packet beyond it is refused.
+- `voaice opus info <file.opus>`, `voaice bench-opus <file.opus>`.
+- `tests/opus.rs` (4 tests), unit tests in `src/ogg.rs` (7), `testing/opus/` (`oracle.sh record|check`,
+  `reference.py`, `make_inputs.py`, `mutate.py`, 35 pinned files, the recorded answers), gate steps 4b and 6.
+- streamair: `examples/opus_corpus.rs` (its 9 corpus files) and `tests/roundtrip.rs`; `streamair/src` unchanged.
+
+### Not checked yet
+- The family-1 channel mapping table's values (opusinfo does not print it; the six-channel file's channels, pre-skip
+  and duration are checked, the table only for structure). Mapping families 2, 3 and 255: no file in the corpus.
+- Chained and multiplexed streams are refused, not read; granules past 2⁶³ are refused as missing.
+
 ## 0.0.3 — 2026-10-08 — f32 ↔ f16 and GELU, bit-exact on every input
 
 **The first two encoder kernels, as the shipped ggml-cpu computes them: every f16 pattern widened, every one of the

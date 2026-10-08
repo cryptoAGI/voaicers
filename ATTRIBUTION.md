@@ -11,7 +11,8 @@ here with its licence.
 |---|---|---|
 | [whisper.cpp](https://github.com/ggml-org/whisper.cpp), by Georgi Gerganov and contributors | MIT | voaice.rs reproduces its compiled output bit for bit. It is pinned at commit [`080bbbe8`](https://github.com/ggml-org/whisper.cpp/commit/080bbbe85230f624f0b52127f1ae1218247989f9), the build mindX production runs ([upstream/PIN](upstream/PIN), [docs/REFERENCE.md](docs/REFERENCE.md)). The checkout and build live in `upstream/`, which is gitignored |
 | [ggml](https://github.com/ggml-org/ggml) 0.16.0, by Georgi Gerganov and contributors | MIT | the tensor library inside whisper.cpp. Its CPU kernels set the float order the encoder and decoder must reproduce |
-| [libopus](https://opus-codec.org) 1.4 and [opus-tools](https://github.com/xiph/opus-tools) 0.2, by Xiph.Org and contributors | BSD-3-Clause | streamair's oracle: production's `opusinfo` and `opusdec` judge every file, and libopus's encoder is the target for byte-exact packets. No code is copied from it |
+| [libopus](https://opus-codec.org) 1.4 and [opus-tools](https://github.com/xiph/opus-tools) 0.2, by Xiph.Org and contributors | BSD-3-Clause | streamair's oracle and voaice.rs 0.0.4's: production's `opusinfo` and `opusdec` judge every file (and libopus's `opus_packet_get_nb_samples` each packet's length), and libopus's encoder is the target for byte-exact packets. No code is copied from it |
+| [libogg](https://xiph.org/ogg/) 1.3.5, by Xiph.Org and contributors | BSD-3-Clause | voaice.rs 0.0.4's oracle: production's library, called through ctypes, reports every page and packet the reader must match. No code is copied from it |
 
 ## Models and data
 

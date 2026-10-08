@@ -14,7 +14,7 @@ Built the way [bankml](https://github.com/cryptoAGI/bankml) was built against ll
   <img src="https://img.shields.io/badge/dependencies-0-56D364?style=flat-square" alt="zero dependencies">
   <img src="https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-2563EB?style=flat-square" alt="MIT OR Apache-2.0">
   <img src="https://img.shields.io/badge/log--mel-bit--exact%20vs%20whisper.cpp%20(ggml%200.16.0)-39D3C7?style=flat-square" alt="log-mel bit-exact">
-  <img src="https://img.shields.io/badge/status-0.0.3%20%C2%B7%20loader%2C%20front%20end%2C%20f16%20%2B%20GELU%20bit--exact%3B%20no%20transcript%20yet-F59E0B?style=flat-square" alt="status">
+  <img src="https://img.shields.io/badge/status-0.0.4%20%C2%B7%20loader%2C%20front%20end%2C%20f16%20%2B%20GELU%20bit--exact%2C%20Ogg%2FOpus%20reader%3B%20no%20transcript%20yet-F59E0B?style=flat-square" alt="status">
   <a href="https://github.com/cryptoAGI/voaicers/releases/latest"><img src="https://img.shields.io/github/v/release/cryptoAGI/voaicers?style=flat-square&label=release&color=0ECB81" alt="latest release"></a>
 </p>
 
@@ -27,8 +27,9 @@ mindX's production speech-to-text is whisper.cpp built against ggml 0.16.0, runn
 *a result counts only when an oracle has checked it, and the oracle is the reference's own compiled library run on
 the same input, compared by bit pattern.* Speed is measured only after that.
 
-**0.0.3 does not transcribe yet.** It is the first three stages, the front end optimized (0.0.2) with its bits unchanged,
-and the first two encoder kernels (0.0.3): the f32 ↔ f16 conversions and GELU.
+**0.0.4 does not transcribe yet.** It is the first three stages, the front end optimized (0.0.2) with its bits unchanged,
+the first two encoder kernels (0.0.3): the f32 ↔ f16 conversions and GELU, and (0.0.4) the streaming Ogg/Opus reader
+that will bring `.opus` input to them without a WAV on disk.
 
 | stage | what | oracle result (this machine, 2026-10-07) |
 |---|---|---|
@@ -37,6 +38,7 @@ and the first two encoder kernels (0.0.3): the f32 ↔ f16 conversions and GELU.
 | 2 | the log-mel front end — allocation-free, threaded (0.0.2) | **2,316,640 / 2,316,640** f32 values bit-exact over 8 inputs, **max 0 ULP**; at 2, 3, 4 and 8 threads identical to 1 thread (9,266,560 values); the fused-FFT discriminator still rejected (25,242 values differ) |
 | 3a | f32 ↔ f16 as ggml-cpu converts (0.0.3): the portable bit trick, the F16C row, f16 → f32 | **65,536 / 65,536** f16 patterns four ways; **all 4,294,967,296 f32 patterns** three ways (1,429,656 boundary values compared one by one, the rest by per-chunk digest); round-half-away rejected |
 | 3b | GELU (0.0.3): `ggml_table_gelu_f16` and the op with its ±10 clamps | **65,536 / 65,536** table entries; the op on 1,495,192 values and on all 2³² f32 patterns; the unfused GELU rejected (it differs in one entry) |
+| 4 | the streaming Ogg/Opus reader (0.0.4): pages, Ogg's CRC-32, lacing and continuation, `OpusHead` / `OpusTags`, granules and pre-skip → the exact duration, one page in memory | against **opus-tools 0.2, libopus 1.4 and libogg 1.3.5 on production**: **35 / 35** files on 18 checks each — the duration equals **opusdec's sample count** on every file, every page's granule and every packet's samples equal libogg's and libopus's; **21 / 21** corrupted files refused by name; pre-skip added, no end trim, and zlib's CRC (0 / 427 pages) all caught |
 
 Efficiency, measured only after the oracles passed in the same gate run (0.0.2, this laptop, 4 CPUs at load ≈ 7.6,
 so ±20 % is noise): the mel is **6.1× faster than 0.0.1** (rebuilt from its tag in the same run) and **6.8× faster
@@ -53,6 +55,13 @@ reference's 26.0** at one thread (**4.3×**; an earlier run of the same gate, at
 f32↔f16 rows run the same `vcvtps2ph`/`vcvtph2ps` as the reference, so their 1.24× and 1.07× are noise (0.90× and
 1.01× in the earlier run); the GELU table builds in 2.5 ms against `ggml_cpu_init`'s 3.2, which also fills tables
 voaice does not need. Record: [`testing/results/0.0.3.txt`](testing/results/0.0.3.txt).
+
+0.0.4, in its own gate run after its oracles (same laptop, load ≈ 2 falling from 6.8): the reader takes **0.045 CPU-ms
+for 33 s of 6 kb/s speech** (about 730,000× real time) and 0.03–0.10 ms for each 11 s JFK file, with a heap of
+**66 KB whatever the file's length** — one 65,307-byte page buffer, reused; a packet that spans pages adds exactly its
+length. Ogg's CRC sliced by eight runs at 1.4–1.6 GiB/s, **4.1–4.6× the byte-at-a-time table**. Record:
+[`testing/results/0.0.4.txt`](testing/results/0.0.4.txt). It also found that streamair 0.0.1's writer accepts an end
+trim past the last page, which opusinfo calls an error (TODO.md).
 
 **A determinism note on the reference itself:** whisper.cpp's transcript depends on its thread count. At 1 thread it
 is identical run to run; at 4 threads the token ids and text stay the same but every token's probability differs in
@@ -127,19 +136,25 @@ target/release/voaice info models/ggml-tiny.en.bin     # refuses any file that i
 target/release/voaice mel  models/ggml-tiny.en.bin in.wav [out.f32] [--threads N]
 target/release/voaice bench-mel models/ggml-tiny.en.bin in.wav [--threads N]   # heap, wall, CPU, RSS
 target/release/voaice bench-f16 init|rows                                     # the GELU table's build; f16 rows, GELU
+target/release/voaice opus info in.opus           # (0.0.4) pages, packets, headers, the exact duration; refuses by name
+target/release/voaice bench-opus in.opus          # CRC sliced vs bytewise, read throughput, CPU per read, heap peak
+testing/opus/oracle.sh check                      # ask opus-tools on production again about the pinned .opus files
 ```
 
-Input: 16-bit PCM, mono, 16 kHz WAV; anything else is refused, not converted (resampling is a later stage).
+Input: 16-bit PCM, mono, 16 kHz WAV; anything else is refused, not converted (resampling is a later stage). `.opus`
+files are read and measured (0.0.4) but not yet decoded.
 Disk: the reference checkout and build are about 160 MB in `upstream/` (gitignored), the model 78 MB in `models/`.
 
 ## Layout
 
 ```
 Cargo.toml  rust-toolchain.toml      zero dependencies; Rust 1.99.0 pinned like bankml
-src/        sha256.rs model.rs wav.rs mel.rs f16.rs gelu.rs measure.rs lib.rs main.rs
+src/        sha256.rs model.rs wav.rs mel.rs f16.rs gelu.rs ogg.rs measure.rs lib.rs main.rs
 tests/oracle.rs                      the oracle comparisons (#[ignore]: need the model and a recorded oracle)
 testing/oracle/                      build.sh, layout_probe.cpp, whisper_oracle.cpp
+tests/opus.rs                        (0.0.4) the Ogg/Opus oracle comparisons, offline against the recorded reference
 testing/make_audio.py                the 8 test WAVs, pinned in testing/pins/audio.sha256
+testing/opus/                        oracle.sh record|check, reference.py, mutate.py; 35 pinned .opus files + answers
 testing/release_gate.sh              the gate → testing/results/<version>.txt
 upstream/PIN                         the reference (commit, ggml version, build, model sha256)
 docs/                                ARCHITECTURE · oracles · REFERENCE · ROADMAP
@@ -172,8 +187,12 @@ go up 0.0.1 at a time, with a milestone at every tenth step. The order of work:
 - [x] **0.0.3:** f32 ↔ f16 and GELU, the first encoder kernels: every f16 and every f32 bit pattern converted as
   ggml-cpu converts it (the portable bit trick and the F16C row), the GELU table 65,536 / 65,536 and the op on all
   2³² inputs; the GELU op 4.3× the reference at one thread (3.0× in an earlier run: noisy host), the rows at parity (the same `vcvtps2ph`) ([record](testing/results/0.0.3.txt)).
-- [ ] **0.0.4–0.0.9:** the streaming Ogg/Opus reader, the resampler whisper-cli uses, conv1, conv2 + positions, layer
-  norm, the f16 dot in AVX2 lane order — one per step, each bit-exact ([plan](docs/ROADMAP.md)).
+- [x] **0.0.4:** the streaming Ogg/Opus reader: every page checked (CRC sliced by 8, 4.1–4.6× the byte table),
+  packets across pages, `OpusHead` / `OpusTags`, granules and pre-skip → the exact duration in one page of memory;
+  35 / 35 files exact against production's opusdec / opusinfo / libogg / libopus, 21 / 21 corruptions refused by name
+  ([record](testing/results/0.0.4.txt)).
+- [ ] **0.0.5–0.0.9:** the resampler whisper-cli uses, conv1, conv2 + positions, layer norm, the f16 dot in AVX2
+  lane order — one per step, each bit-exact ([plan](docs/ROADMAP.md)).
 - [ ] **Stage 0b:** pin `ggml-base.en.bin` (production's default model). Record the VPS's ISA so the oracle
   reproduces production's native ggml-cpu kernels (Zen 3, AVX2 + FMA).
 - [ ] **Stage 3, the encoder (0.1.0):** ~~the GELU f16 table, f32↔f16 conversion~~ (0.0.3), `vec_dot_f16` in AVX2
@@ -192,7 +211,8 @@ go up 0.0.1 at a time, with a milestone at every tenth step. The order of work:
 ### streamair (CPU → .opus)
 - [x] **0.0.1:** the Ogg/Opus container. Production's opusinfo reads every test file without a warning, and
   opusdec decodes exactly the samples written.
-- [ ] **0.0.2–0.0.9:** a streaming writer with bounded memory, a reader for round trips, the range encoder, the
+- [ ] **0.0.2–0.0.9:** a streaming writer with bounded memory (and end trimming bounded by the last page, found by
+  voaice.rs 0.0.4's reader, whose round trips now read streamair's output), the range encoder, the
   MDCT, band energies, PVQ, bit allocation.
 - [ ] **0.1.0:** a mono CELT encoder (fullband, 20 ms, CBR), byte-exact against libopus 1.4 at a stated complexity.
 - [ ] **0.2.0–0.3.0:** VBR at voaice's bitrates, stereo, SILK and hybrid.

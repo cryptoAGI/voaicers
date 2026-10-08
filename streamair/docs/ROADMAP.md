@@ -7,7 +7,8 @@ build it.
 | milestone | what it delivers | oracle |
 |---|---|---|
 | **0.0.1** ✓ | the Ogg/Opus container: CRC, pager, lacing, continuation, OpusHead/OpusTags, granules, pre-skip, end trim | opusinfo clean, opusdec exact sample count |
-| 0.0.2–0.0.9 | a streaming writer (bounded memory, flush policy from latency), a reader for round trips, the range encoder (RFC 6716 §4.1 / §5.1), CELT's MDCT, band energies, PVQ, the bit allocation | each stage's output against libopus 1.4 internals, through a compiled harness |
+| (reader) | the round-trip reader is voaice.rs 0.0.4's `voaice::ogg` (proven against opus-tools 0.2): `tests/roundtrip.rs` reads back 400 random streams exactly, and `examples/opus_corpus.rs` writes 9 of the 14 streamair files in its oracle corpus (the other 5 are `streamair silence`) | voaice.rs `testing/opus/` |
+| 0.0.2–0.0.9 | a streaming writer (bounded memory, flush policy from latency; and end trimming bounded by the last page's samples — voaice.rs 0.0.4's reader found that 0.0.1's `mux` accepts a trim past them, which opusinfo calls an error), the range encoder (RFC 6716 §4.1 / §5.1), CELT's MDCT, band energies, PVQ, the bit allocation | each stage's output against libopus 1.4 internals, through a compiled harness |
 | **0.1.0** | **a CELT encoder**, mono, fullband 20 ms, constant bitrate, bit-exact against libopus 1.4 at one stated complexity | the packets byte for byte; opusdec decodes them |
 | 0.2.0 | VBR, the bitrates voaice uses (24 kbps speech, 64–96 kbps music), stereo | the same, per configuration |
 | 0.3.0 | SILK and hybrid for narrow-band speech | the same |

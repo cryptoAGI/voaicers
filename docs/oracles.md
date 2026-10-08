@@ -25,12 +25,45 @@ oracle run.
 | `oracle_gelu_table_discriminates_unfused` | the discriminator: GELU in the source's order without the FMA GCC formed | differs in 1 entry (`0xBFFF`, −1.999) — rejected; the FMA changes exactly one entry |
 | `oracle_gelu_op` | (0.0.3) `ggml_gelu` through a graph on the shipped CPU backend (1 thread; 4 threads recorded identical) on the boundary set plus every f16 value (1,495,192), then on all 2³² by digest; the vector and the scalar path | **1,495,192/1,495,192** both paths; **65,536/65,536** chunks of all 2³² both paths |
 
+### The Ogg/Opus reader (0.0.4) — `tests/opus.rs`, offline against a recorded reference
+
+The reference is not on the dev laptop (no opus-tools), so it is run where it is — mindX production: **opus-tools 0.2
+(`opusinfo`, `opusdec`), libopus 1.4 and libogg 1.3.5** (Ubuntu packages `opus-tools 0.2-1build3`, `libopus0
+1.4-1build1`, `libogg0 1.3.5-3build1`) — read-only over ssh, in one scratch directory that is removed after
+(`testing/opus/oracle.sh`). Its answers are recorded with the files they are about, so the comparison runs offline in
+plain `cargo test`, and the gate asks the reference again when the host answers.
+
+| what | how |
+|---|---|
+| the files | 35 good ones pinned by sha256 (`testing/opus/files.sha256`): 14 written by streamair (silence of 0.001 / 1 / 2.5 / 7.3333 / 60 s; packets per page 1, 7, 255 and 300; a 70,000-byte packet and one of exactly 255 × 255 bytes crossing pages; every frame size and frame-count code; stereo; pre-skip 0 and 3,840) and 21 encoded by `opusenc` on production from the pinned WAVs (JFK at 2.5 / 5 / 10 / 20 / 40 / 60 ms frames, 6 to 64 kb/s, hard CBR, complexity 0, `--max-delay 0`, stereo, downmix, **six channels in mapping family 1**, a PNG that makes OpusTags 68 KB and span pages, UTF-8 and `=`-bearing comments, the 201-sample file whose only audio page is also its last). opusenc is given a fixed serial; two recordings produced the same bytes |
+| the reference's answers | `testing/opus/reference.py` per file: **opusdec `--rate 48000` to WAV, frames counted from the data chunk** (the exact samples it plays); opusinfo's fields as printed (pre-skip, gain, channels, original rate, vendor, comments, packet duration max/avg/min, playback length, total data length) and its warnings; and **libogg through ctypes**: pages and packets as `ogg_sync_pageout` / `ogg_stream_packetout` give them, an FNV-1a digest of every page's (sequence, granule, flags) and of every audio packet's (bytes, samples), with each packet's samples from libopus's own `opus_packet_get_nb_samples` |
+| the adversarial files | 22 made from two good files by `testing/opus/mutate.py` (a CRC byte, a body bit, the capture pattern, the version, a serial, BOS again, the continued flag, a dropped and a duplicated page, three truncations and a cut at a page boundary, EOS removed, granules backwards / off by a packet / beyond the samples at EOS, the OpusHead and OpusTags magic, pre-skip past the end, a second stream appended — and one *valid* change, every granule +48,000, a stream that starts mid-broadcast); `tests/opus.rs` makes the same bytes by the same rules and checks their sha256 against what the reference saw |
+
+| oracle | compares | result (0.0.4) |
+|---|---|---|
+| `oracle_opus_good_files` | 18 checks per file: **duration = opusdec's sample count**; the per-packet keep counts sum to it; pre-skip, channels (opusinfo and opusdec), input rate, gain, vendor, comments (a picture as opusinfo summarises it, decoded from base64), playback length, packet duration max/avg/min, total bytes; pages, audio packets, decoded samples (libopus per packet), every page's sequence/granule/flags and every packet's bytes/samples (libogg digests), the last granule; and that the reference itself found no fault (advisory warnings only: "high muxing delay", "implausibly low preskip") | **35 / 35 files on each of the 18 checks** |
+| `oracle_opus_adversarial_files_refused` | each corruption refused with its named error kind, the byte offset and page in the message; the valid variant accepted with opusdec's count | **21 / 21 refused** as expected, **1 / 1** valid variant accepted (start granule 48,000, duration 528,000 = opusdec's); the reference noticed all 21 too (opusinfo warned, or opusdec's output changed or failed) |
+| `oracle_opus_discriminators` | readers wrong in plausible ways, run against the same answers | pre-skip **added**: wrong on 34 / 35 (right only where pre-skip is 0); no end trimming: wrong on 34 / 35; the code-3 frame count ignored: wrong on 3 / 35 (the files with multi-frame packets); **zlib's CRC-32 verifies 0 of the 427 pages**, Ogg's all 427 |
+| `bounded_memory_one_byte_at_a_time` | a source that yields one byte per `read` gives the same summary | identical on the continuation, picture and 2.5 ms files |
+| streamair `tests/roundtrip.rs` | streamair's writer → voaice's reader on 400 random streams (1–300 packets, 1–260 per page, payloads to 70,000 bytes, every TOC code, mono/stereo, pre-skip 0–3,999, a trim within the last packet) | every packet's bytes, the duration and the file length back exactly |
+
+**Not checked by any oracle yet:** the channel mapping *table* of family 1 (opusinfo does not print it; the
+six-channel file's channel count, pre-skip and duration are checked, the table is parsed and validated for structure
+only); mapping families 2, 3 and 255 (no file in the corpus); chained and multiplexed streams (refused by name, not
+read); granule positions past 2⁶³.
+
 Below the oracles, `cargo test` carries a second witness for the mel that needs no model:
 `same_bits_as_the_0_0_1_port_at_every_thread_count` keeps 0.0.1's allocating port verbatim (test-only) and requires
 the optimized path, at 1, 2, 3, 4 and 7 threads and in its fused variant, to give the same bits on synthetic audio
 and a synthetic filterbank with zero runs.
 
 ## Efficiency — measured only after the oracles pass
+
+(0.0.4) Step 6 of the gate measures the Ogg/Opus reader after 4b passed: Ogg's CRC on 16 MiB sliced-by-8 against the
+one-byte-at-a-time table (best of 7); `Reader::new` + every packet + the end checks from a slice and from the file
+(best of 10, and CPU per read over ≥ 1 s); the heap live at one read's peak through the counting allocator. The
+reference's speed is **not** compared: opusinfo is not on this laptop and the gate does not run timing on production.
+
 
 Step 5 of the gate, in the same run, each row a fresh process for the reference (`whisper_oracle --bench-mel`) and
 for voaice (`voaice bench-mel`), measured the same way on both sides:

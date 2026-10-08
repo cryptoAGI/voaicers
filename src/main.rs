@@ -5,6 +5,8 @@
 //!   voaice mel   <model.bin> <in.wav> [out] [--threads N]   the log-mel spectrogram: shape and sha256 (and raw f32 to `out`)
 //!   voaice bench-mel <model.bin> <in.wav> [--threads N]     the mel's heap peak, wall (best of 10), CPU per call, peak RSS
 //!   voaice bench-f16 init|rows                             (0.0.3) the GELU table's build; f32<->f16 rows and the GELU op
+//!   voaice opus info <file.opus>                           (0.0.4) read the Ogg/Opus stream page by page: headers, counts, exact duration
+//!   voaice bench-opus <file.opus>                           (0.0.4) the CRC (sliced vs one byte at a time), the reader's throughput, heap peak
 //!   voaice vclone check <file.voaice>...                   recompute each identity's vprint and compare every field
 //!   voaice vclone print <8 metrics>                         the dvscope/1 print of eight values (vprint.py's twin)
 //!   voaice vclone log <events.jsonl>                        verify a forge log's chain and say whether it is mintable
@@ -13,7 +15,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::process::ExitCode;
-use voaice::{f16, gelu, measure, mel, model::Model, sha256, vclone, wav};
+use voaice::{f16, gelu, measure, mel, model::Model, ogg, sha256, vclone, wav};
 
 /// The system allocator, counting live heap bytes and their peak, so `bench-mel` can report the heap a call needs
 /// (std only: a `GlobalAlloc` wrapper, no crate). Thread stacks are mapped, not allocated, and are not counted.
@@ -141,12 +143,14 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("bench-f16") if args.len() == 2 => bench_f16(&args[1]),
+        Some("opus") if args.len() == 3 && args[1] == "info" => opus_info(&args[2]),
+        Some("bench-opus") if args.len() == 2 => bench_opus(&args[1]),
         Some("vclone") => vclone_cmd(&args[1..]),
         Some("version") => {
             println!("voaice {} (reference: whisper.cpp 080bbbe8, ggml 0.16.0)", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        _ => Err("usage: voaice info <model.bin> | voaice mel <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-mel <model.bin> <in.wav> [--threads N] | voaice bench-f16 init|rows | voaice vclone check <file.voaice>... | voaice vclone print <8 metrics> | voaice vclone log <events.jsonl> | voaice version".into()),
+        _ => Err("usage: voaice info <model.bin> | voaice mel <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-mel <model.bin> <in.wav> [--threads N] | voaice bench-f16 init|rows | voaice opus info <file.opus> | voaice bench-opus <file.opus> | voaice vclone check <file.voaice>... | voaice vclone print <8 metrics> | voaice vclone log <events.jsonl> | voaice version".into()),
     }
 }
 
@@ -196,6 +200,107 @@ fn bench_f16(what: &str) -> Result<(), String> {
     let ge = best(&mut || g.row(&x, &mut y));
     let ges = best(&mut || g.row_scalar(&x, &mut y));
     println!("bench-f16 fp32_to_fp16_row_ms {to16:.3} fp16_to_fp32_row_ms {to32:.3} gelu_ms {ge:.3} gelu_scalar_ms {ges:.3} n_row {n} n_gelu {ng}");
+    Ok(())
+}
+
+/// opusinfo's "Playback length" format: minutes, seconds and milliseconds, each truncated.
+fn playback_length(samples: u64) -> String {
+    let t = samples as f64 / 48000.0;
+    let m = (t as u64) / 60;
+    let s = t as u64 - m * 60;
+    let ms = ((t - (m * 60) as f64 - s as f64) * 1000.0) as u64;
+    format!("{m}m:{s:02}.{ms:03}s")
+}
+
+/// `voaice opus info <file.opus>` — every field the oracle compares, read in one pass with bounded memory.
+fn opus_info(path: &str) -> Result<(), String> {
+    let f = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut r = ogg::Reader::new(f).map_err(|e| format!("{path}: {e}"))?;
+    let (head, tags) = (r.head().clone(), r.tags().clone());
+    let mut packet_bytes = 0u64;
+    while let Some(p) = r.next_packet().map_err(|e| format!("{path}: {e}"))? {
+        packet_bytes += p.data.len() as u64;
+    }
+    let s = r.summary();
+    println!("file            {path}");
+    println!("bytes           {}", s.bytes);
+    println!("pages           {}", s.pages);
+    println!("packets         {} audio ({} bytes; largest {} bytes)", s.packets, packet_bytes, s.max_packet_bytes);
+    println!("version         {}", head.version);
+    println!("channels        {}", head.channels);
+    println!("pre-skip        {}", head.pre_skip);
+    println!("input rate      {} Hz", head.input_rate);
+    println!("output gain     {} (Q7.8) = {} dB", head.gain_q8, head.gain_q8 as f64 / 256.0);
+    if head.mapping_family == 0 {
+        println!("mapping family  0");
+    } else {
+        println!("mapping family  {} ({} streams, {} coupled; mapping {:?})", head.mapping_family, head.streams, head.coupled, head.mapping);
+    }
+    println!("vendor          {}", tags.vendor);
+    println!("comments        {}{}", tags.declared, if tags.truncated { " (truncated at the packet bound)" } else { "" });
+    for c in &tags.comments {
+        let shown: String = c.chars().take(120).collect();
+        println!("  {shown}{}", if shown.len() < c.len() { " …" } else { "" });
+    }
+    println!("packet samples  {} min, {} max (48 kHz)", s.min_packet_samples, s.max_packet_samples);
+    println!("start granule   {}", s.start_granule);
+    println!("last granule    {}", s.last_granule);
+    println!("decoded         {} samples at 48 kHz", s.decoded);
+    println!("end trim        {} samples", s.end_trim);
+    println!("duration        {} samples at 48 kHz ({})", s.duration, playback_length(s.duration));
+    Ok(())
+}
+
+/// `voaice bench-opus <file.opus>` — measured after the oracle (the gate's step 6): the CRC on 16 MiB, sliced against
+/// one byte at a time; the whole reader over the file from memory and from the file system; the heap one read needs.
+fn bench_opus(path: &str) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut s: u64 = 7;
+    let buf: Vec<u8> = (0..16 << 20).map(|_| { s = s.wrapping_mul(6364136223846793005).wrapping_add(1); (s >> 33) as u8 }).collect();
+    let best = |f: &mut dyn FnMut()| {
+        f();
+        (0..7).map(|_| { let t = std::time::Instant::now(); f(); t.elapsed().as_secs_f64() }).fold(f64::INFINITY, f64::min)
+    };
+    let mut c = (0, 0);
+    let t8 = best(&mut || c.0 = std::hint::black_box(ogg::crc32(std::hint::black_box(&buf))));
+    let t1 = best(&mut || c.1 = std::hint::black_box(ogg::crc32_bytewise(std::hint::black_box(&buf))));
+    if c.0 != c.1 {
+        return Err("sliced and bytewise CRCs differ".into());
+    }
+    let mib = buf.len() as f64 / (1 << 20) as f64;
+    drop(buf);
+    let read = |src: &mut dyn std::io::Read| -> Result<ogg::Summary, String> {
+        ogg::Reader::new(src).and_then(|r| r.finish()).map_err(|e| e.to_string())
+    };
+    // the heap of one read from the file: the page buffer, the carry and the tags, nothing proportional to the file
+    let live = LIVE.load(Relaxed);
+    PEAK.store(live, Relaxed);
+    let mut file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let sum = read(&mut file)?;
+    drop(file);
+    let heap_peak = PEAK.load(Relaxed) - live;
+    let mut err = None;
+    let mem = measure::bench(|| if let Err(e) = read(&mut &bytes[..]) { err = Some(e) }, 10, 1.0);
+    let disk = measure::bench(|| {
+        match std::fs::File::open(path) {
+            Ok(mut f) => if let Err(e) = read(&mut f) { err = Some(e) },
+            Err(e) => err = Some(e.to_string()),
+        }
+    }, 10, 1.0);
+    if let Some(e) = err {
+        return Err(e);
+    }
+    let mbs = |ms: f64| bytes.len() as f64 / (1 << 20) as f64 / (ms / 1e3);
+    let opt = |v: Option<f64>| v.map(|c| format!("{c:.4}")).unwrap_or_else(|| "n/a".into());
+    println!(
+        "bench-opus bytes {} pages {} packets {} duration {} crc_sliced_mib_s {:.0} crc_bytewise_mib_s {:.0} crc_speedup {:.2} read_mem_ms {:.4} read_mem_mib_s {:.0} read_mem_cpu_ms {} read_file_ms {:.4} read_file_mib_s {:.0} read_file_cpu_ms {} heap_peak_bytes {} audio_s_per_cpu_s {:.0}",
+        bytes.len(), sum.pages, sum.packets, sum.duration,
+        mib / t8, mib / t1, t1 / t8,
+        mem.wall_best_ms, mbs(mem.wall_best_ms), opt(mem.cpu_ms_per_call),
+        disk.wall_best_ms, mbs(disk.wall_best_ms), opt(disk.cpu_ms_per_call),
+        heap_peak,
+        sum.duration as f64 / 48000.0 / (mem.cpu_ms_per_call.unwrap_or(mem.wall_best_ms) / 1e3)
+    );
     Ok(())
 }
 

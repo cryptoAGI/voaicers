@@ -13,6 +13,12 @@
 #      and at N = nproc threads, and against 0.0.1's code path rebuilt from its tag in the same run; then (0.0.3) the
 #      GELU table's build, the f32<->f16 rows and the GELU op against the reference's (`voaice bench-f16`,
 #      `whisper_oracle --bench-f16`)
+#   4b. (0.0.4) the Ogg/Opus reader against opus-tools 0.2 / libopus 1.4 / libogg 1.3.5: the pinned files
+#      (testing/opus/files.sha256) and the reference's recorded answers (testing/opus/reference.jsonl) compared offline
+#      (tests/opus.rs), streamair's writer read back (streamair/tests/roundtrip.rs); then the reference asked again on
+#      mindX production (testing/opus/oracle.sh check) when the host answers — skipped, and said so, when it does not
+#   6. (0.0.4) the reader's efficiency, only after 4b passed: the CRC sliced against one byte at a time, the whole
+#      read from memory and from the file, CPU per read, heap peak (`voaice bench-opus`)
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
@@ -58,6 +64,28 @@ cargo test --release 2>&1 | grep -E "^test result" | tee -a "$out"
 cargo test --release --test oracle -- --ignored --nocapture --test-threads=1 2>&1 \
   | grep -vE "^\s*(Compiling|Finished|Running)|^$|^running" | tee -a "$out"
 grep -q "test result: ok. 13 passed" "$out" || { log "FAIL: the oracle comparisons did not all pass"; exit 1; }
+
+log "## 4b. the Ogg/Opus reader (0.0.4): opus-tools 0.2 (opusinfo, opusdec), libopus 1.4, libogg 1.3.5 on mindX production"
+(cd testing/opus/files && sha256sum -c --quiet ../files.sha256) && log "$(wc -l < testing/opus/files.sha256) pinned files: sha256 ok"
+log "reference: $(cut -c1-220 testing/opus/reference.meta.json)…"
+step=.oracle/opus_step.log   # each check reads its own step's output, not the whole record (earlier steps print counts too)
+cargo test --release --test opus -- --nocapture --test-threads=1 2>&1 \
+  | grep -vE "^\s*(Compiling|Finished|Running)|^$|^running" > "$step" || true
+tee -a "$out" < "$step"
+grep -q "test result: ok. 4 passed" "$step" || { log "FAIL: the Ogg/Opus oracle comparisons did not all pass"; exit 1; }
+cargo test --release --manifest-path streamair/Cargo.toml --test roundtrip 2>&1 | grep -E "^test |^test result" > "$step" || true
+tee -a "$out" < "$step"
+grep -q "test result: ok. 3 passed" "$step" || { log "FAIL: streamair -> voaice round trips"; exit 1; }
+log "voaice opus info on one pinned file:"
+target/release/voaice opus info testing/opus/files/e_six_family1_96k.opus | sed 's/^/    /' | tee -a "$out" >/dev/null
+opus_host=${VOAICE_OPUS_HOST:-root@168.231.126.58}
+if ssh -o BatchMode=yes -o ConnectTimeout=10 "$opus_host" true 2>/dev/null; then
+  testing/opus/oracle.sh check "$opus_host" 2>&1 | tee -a "$out"
+  [ "${PIPESTATUS[0]}" = 0 ] || { log "FAIL: the reference's answers on $opus_host changed"; exit 1; }
+else
+  log "SKIPPED: $opus_host unreachable — the reference was not asked again in this run; the comparisons above are"
+  log "         against its answers recorded in testing/opus/reference.jsonl ($(grep -o '"date": "[^"]*"' testing/opus/reference.meta.json))"
+fi
 
 nt=$(nproc)
 log "## 5. efficiency (only now): log-mel; wall = best of 10 calls, cpu = CPU ms per call (utime+stime, all threads,"
@@ -122,6 +150,12 @@ row "fp32_to_fp16 row 576k (ms)" "$(echo "$rr" | field fp32_to_fp16_row_ms)" "$(
 row "fp16_to_fp32 row 576k (ms)" "$(echo "$rr" | field fp16_to_fp32_row_ms)" "$(echo "$vr" | field fp16_to_fp32_row_ms)"
 row "gelu op 2.3M, net (ms)" "$gnet" "$(echo "$vr" | field gelu_ms)"
 row "gelu op 2.3M, scalar path (ms)" "$gnet" "$(echo "$vr" | field gelu_scalar_ms)"
+log "## 6. efficiency (only now): the Ogg/Opus reader. crc = 16 MiB, best of 7, sliced-by-8 against one byte at a time;"
+log "##    read = Reader::new + every packet + the end checks, best of 10 (mem: from a slice; file: open + read), cpu ="
+log "##    CPU ms per read over >= 1 s; heap = bytes live at one read's peak (the counting allocator), reading from the file"
+for f in e_jfk_x3_m_6k_comp0 e_jfk_m_2.5ms_24k e_jfk_m_60ms_24k sa_silence_60 sa_continuation e_picture_24k; do
+  log "$(printf '%-22s ' "$f") $(target/release/voaice bench-opus "testing/opus/files/$f.opus" | sed 's/^bench-opus //')"
+done
 log "## transcripts recorded (not yet reproduced by voaice.rs: encoder and decoder are later stages)"
 for d in .oracle/tiny.en/*/; do log "$(basename "$d"): $(tr '\n' ' ' < "$d/transcript.txt")"; done
 log "GATE PASSED"
