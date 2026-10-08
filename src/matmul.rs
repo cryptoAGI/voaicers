@@ -174,6 +174,11 @@ impl Linear {
         out
     }
 
+    /// Bytes held: the f16 weights, their widened copy in the kernel's layout, the bias.
+    pub fn bytes(&self) -> usize {
+        2 * self.w.capacity() + 4 * self.wp.capacity() + 4 * self.b.as_ref().map_or(0, |b| b.capacity())
+    }
+
     /// The reference thread count to reproduce in the conversion (only a NaN can tell; see [`split_ranges`]).
     pub fn with_split(mut self, nth: usize) -> Linear {
         self.split = nth.max(1);

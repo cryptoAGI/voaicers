@@ -1,5 +1,122 @@
 # Changelog
 
+## 0.1.3 — 2026-10-08 — the self-attention products and the f16 self KV cache, bit-exact: every decoder layer, every call
+
+**In every decoder layer, before self-attention itself, `whisper_build_graph_decoder` computes attn_ln, Q + bias ×
+`KQscale`, K × `KQscale` (no bias), V + bias and copies K and V to f16 into `kv_self` at the slot
+`whisper_kv_cache_find_slot` found; the host builds the causal KQ_mask and the graph casts it to f16. voaice computes
+the same twelve nodes, keeps the same cells, builds the same mask and leaves the same cache — every cell of every
+layer after every call — bit for bit on every decoder call `whisper_full` makes for the 8 inputs (620 calls, both of
+0.1.2's configs, 1 and 4 threads), from the reference's layer inputs and, for layer 0, from voaice's own decoder input;
+all exact on the first oracle run. Found while recording: the reference's thread dependence starts inside layer 0,
+after these nodes, and only for one-row batches.**
+Record: `testing/results/0.1.3.txt`; how it was read and found: `testing/selfkv/NOTES.md`.
+
+### The op, read from the pin and the binary
+- whisper.cpp:2530–2590, per layer: `cur = add(mul(norm(inpL, eps), attn_ln.weight), attn_ln.bias)` (0.0.8's three
+  nodes); `Qcur = scale(add(mul_mat(attn.query.weight, cur), attn.query.bias), KQscale)` — **the bias before the
+  scale**; `Kcur = scale(mul_mat(attn.key.weight, cur), KQscale)` — **no bias** ("note: no bias for Key"; the model has
+  no `attn.key.bias`), **scaled here**, unlike the encoder's K; `Vcur = add(mul_mat(attn.value.weight, cur),
+  attn.value.bias)`; with flash_attn, `cpy(Kcur, view_1d(kv_self.k, n_tokens · 384, 2 · 384 · (il · n_ctx + kv_head)))`
+  and the same for V. `KQscale = pow(float(n_state_head), -0.25)` — 0.1.1's `0x3EB504F3`; `ggml_scale`'s b is 0 (one
+  `vmulps` per 8 values). A one-row step's MUL_MAT is the encoder's code (`from_float` split by thread, then
+  `ggml_vec_dot_f16` per output) as a matrix-vector product.
+- `kv_self` = `whisper_kv_cache_init(F16, 384, 4, GGML_PAD(448, 256) = 512)`: k and v `[4 · 512 · 384]` f16, layer il's
+  cell c at row `il · 512 + c`; cleared at init and by `whisper_kv_cache_clear` at the start of **every window**.
+- Before the graph (whisper.cpp:2872): `whisper_kv_cache_find_slot` — from the head, the first `n_tokens` free cells in
+  a row; the head stays at the slot it returns — then `kv_self.n = min(size, max(pad, GGML_PAD(cell_max, pad)))`, and
+  **the pad is 1 on the CPU** (`whisper_kv_cache_get_padding`: 32 for Metal, 256 for CUDA, else 1), so n = cell_max and
+  the mask has no padded columns; `cell_max` scans down to cell 1 (cell 0 never tested).
+- KQ_mask, f32 `[n_kv, n_tokens]`, filled on the host: −∞ where `!cell.has_seq_id(seq) || cell.pos > pos`; then
+  `ggml_cast(·, F16)`, a CPY by the scalar conversion — `ggml_compute_forward_dup` (with `dup_flt<float, ggml_fp16_t>`
+  inlined) holds no `vcvtps2ph`. flash_attn_ext asserts only an f16, contiguous mask: no `GGML_KQ_MASK_PAD` at this pin.
+
+### The oracle
+- `whisper_oracle --selfkv`: the layout probe adds `whisper_state::kv_self` and `whisper_kv_cache`'s head, size, n and
+  cells (a mirror `{int32 pos; std::set<int32> seq_id}`, its size and offsets asserted). The eval callback asks for
+  every NORM and for the eleven other nodes of each layer, identified by the model tensors they read (no names); a
+  call begins at layer 0's NORM (the one reading `add(get_rows, get_rows)`); a NORM is attn_ln's when the MUL by
+  `attn_ln.weight` reads it, and its input — the layer's input — is kept whole. Also the KQ_mask cast and its f32
+  source, the cells at the call's first node, and kv_self.k / .v whole after every call. Configs A and B at 1 and 4
+  threads observed, then unobserved at 1 and 4. Self-checks yes on 8 / 8 (listed in docs/oracles.md: the scale bits
+  and b = 0, the CPYs' destinations at `2 · 384 · (il · 512 + head)`, the products reading attn_ln, no ADD on K, mask
+  values only 0 and −∞, **head = the batch's first position and n = head + n_tokens on every call**, observed =
+  unobserved). 44 MB for 8 inputs, ~5 min.
+- `oracle_selfkv_nodes_bit_exact`: all 620 calls, every layer fed its recorded input — the twelve nodes by the model
+  and by the fast path, head / n / cells by `KvSelf::prepare`, the mask (model f32 and f16, fast f16), the whole cache
+  after each call (from the model's CPYs, and the fast path's, which starts from a buffer of 0xFFFF): **0 differ** in
+  362,112 node rows, 11,316 mask rows and 5,079,040 cache rows.
+- `oracle_selfkv_layer0_from_voaice_input`: layer 0 from 0.1.2's `DecoderInput::run_batch` at 1, 2 and 4 threads, the
+  cache kept across each run: **0 differ** in 2,040,432 rows (the twelve nodes and layer 0's 1,024 cache rows per call).
+- `oracle_selfkv_observed_run_is_the_recorded_transcript`: config A's observed 1-thread result = 0.0.1's record (128 / 128).
+- `oracle_selfkv_discriminators` (the 1-thread calls of both configs), caught on every input that decodes: the scale
+  before the products (5,664–9,672 node rows per input), Q scaled before its bias, Q not scaled, K not scaled, K given
+  a bias, V scaled, the scale in double, attn_ln's MUL + ADD fused, no f16 rounding, one accumulator, the accumulators
+  in sequence; the mask off by one, padded to 32 columns, −∞ as −65504, −∞ as f32's lowest (caught in f32 only — its
+  f16 cast is −∞); K and V a cell late, the layers 448 cells apart. The buffer left uncleared at a window: caught on
+  jfk_x3 (31,120 cache rows), the only input with a second window, and asserted indistinguishable elsewhere.
+  Indistinguishable, as predicted: the CPYs and the mask's cast by the row converter, the sequence ignored (one
+  sequence, no free cell below n). **Found: how −∞ is written is told apart only on prompts** — a step attends
+  every cell (its mask has no −∞), so only config B's 226-row prompts and jfk_x3's `[SOT, NOT]` can tell −65504 or
+  f32's lowest from −∞ (the off-by-one reading masks a step's own cell, so it is caught on every row).
+- **Found: where the reference's thread dependence starts.** Call by call at 1 and 4 threads while the batch is the
+  same, every node here is identical wherever its input is — layer 0 on every call, and the mask and the cache.
+  **Layer 1's input already differs at 4 threads on every one-row call and on no multi-row prompt** (B's 226-row
+  prompts, jfk_x3's 2-row one): the dependence enters in layer 0 after these nodes — self-attention, cross-attention
+  or the MLP — for single-row batches only. 0.1.4 reads the flash-attention path a single query takes first.
+- **What this holds for:** this laptop's native libggml-cpu (Zen+, AVX2 + FMA + F16C, no AVX-512); production's Zen 3
+  library not run; `base.en` not compared; one sequence only (best-of / beam: `seq_id` ≠ 0, `seq_cp` / `seq_rm`, a
+  cache made `factor` × larger, `find_slot`'s wrap — read from the source, not checked); a full cache not reached
+  (the longest run ends at cell 307); GPU paddings unreachable on the CPU; layers 1–3 fed the reference's inputs.
+
+### Faster, bits unchanged
+- attn_ln computed row by row into the products' f32 → f16 conversion (never written), one conversion for Q, K and V.
+- A prompt (four rows or more): 0.0.9's 4 × 3 register block over panels of 64 frames, threads by frames; the scale,
+  the biases and the f16 conversions as the panel's epilogue, K and V written straight into the cache's cells.
+- A step (up to three rows): a matrix-vector product from the **f16** weights, eight output channels at a time —
+  `vcvtph2ps` on each weight block as `ggml_vec_dot_f16` widens it, the same four chains and lane pairing — on one
+  thread: a scoped spawn costs more than a step's three products. Measured on this Zen+ core: the held f32 copy is
+  ~2× faster when one layer is hot in cache but ~1.7× slower when four layers stream past the 4 MB L3, and a real step
+  streams far more (the logits alone read 40 MB) — so a step reads the f16 bytes.
+- The mask built from the cells once per call, in f16 directly (0 → `0x0000`, −∞ → `0xFC00`).
+
+### Measured (gate step 15, only after 4k passed; Ryzen 3 3200U, 2 cores / 4 threads, load ≈ 1.0 at the gate's start and 2.8 after the measurements; rerun at ≈ 2.2–2.6 in `.oracle/step15_rerun.txt`)
+The same input on both sides and the output digests equal (Q, the K/V cells written, the f16 mask). The reference =
+the inputs set, plan and compute of exactly these nodes as a ggml graph (for **call** also the f32 mask's cast; whisper
+fills the f32 mask on the host, outside the graph); voaice = `SelfAttn::layer_into` into `KvSelf`'s cells (for call
+also `KvSelf::mask_into`, which builds the mask from the cells — more than the reference's measured work); the slot
+found once before timing on both sides. **block** = layer 0's twelve nodes; **call** = all four layers' (each reading
+the same input) and the mask. Mean per call over ≥ 1 s (gate run · rerun):
+
+| tokens | | threads | whisper.cpp | voaice.rs | × |
+|---|---|---|---|---|---|
+| **1 (a step)** | block | 1 | 120.4 · 117.5 µs | **81.0 · 76.1 µs** | **1.49 · 1.54×** |
+| | | 2 | 89.0 · 79.5 | 90.0 · 72.5 | 0.99 · 1.10× |
+| | | 4 | 506.4 · 88.6 | 81.5 · 73.4 | (noise) · 1.21× |
+| | call | 1 | 502.5 · 567.3 | **431.2 · 399.3** | **1.17 · 1.42×** |
+| | | 2 | 355.8 · 366.0 | 417.6 · 384.1 | **0.85 · 0.95×** |
+| | | 4 | 377.5 · 388.6 | 410.8 · 386.8 | **0.92 · 1.00×** |
+| **226 (config B's prompt)** | block | 1 | 27.66 · 25.73 ms | **5.83 · 4.96 ms** | **4.75 · 5.19×** |
+| | | 2 | 22.24 · 14.47 | 5.73 · 5.64 | 3.88 · 2.57× |
+| | | 4 | 14.50 · 14.50 | 4.21 · 4.91 | 3.44 · 2.95× |
+| | call | 1 | 103.5 · 126.9 | **21.7 · 20.9** | **4.76 · 6.06×** |
+| | | 2 | 79.3 · 57.7 | 24.5 · 21.0 | 3.23 · 2.74× |
+| | | 4 | 58.4 · 57.6 | 19.3 · 18.1 | 3.03 · 3.18× |
+
+- **Read with care.** A step runs on one thread in voaice at any count; **at two and four threads the reference's
+  four-layer step is as fast or faster (0.85–1.00×)** — not exceeded, and said so. One layer hot in cache is 1.5× at
+  one thread; four layers in a row stream 3.5 MB of f16 weights past this 4 MB L3 and the margin shrinks to 1.2–1.4×:
+  a step's products are bound by `vcvtph2ps` (voaice widens each weight block once; `ggml_vec_dot_f16` widens the
+  activation's block beside it every time) and by the bytes. The 4-thread 506 µs in the gate run is the reference's noise (89 µs
+  in the rerun), not claimed. The prompt — a matrix-matrix product, 0.0.9's panels — is **4.8–6.1× at one thread**,
+  2.6–3.9× at two and four (at two threads voaice gains nothing over one here: measured, not explained further).
+- Memory: one call at one thread allocates 198,184 bytes of panel scratch (226 rows; 3,840 bytes for a step) against
+  the reference's 170 KiB work buffer. Held outside the call: per layer the three products' f16 weights and their
+  widened f32 copy (the prompt's panels read the copy, a step the f16), and the 3 MiB f16 cache — 13,468 KiB for four
+  layers; the reference reads the model's weights in place and keeps the same 3 MiB cache in its state.
+- At the scale of a transcript: a step's self-attention products are ~0.4 ms of a decoder step whose other products
+  (cross-attention's, the MLP's and above all the logits' 51,864 × 384) are v0.2.0's to measure.
+
 ## 0.1.2 — 2026-10-08 — the decoder's input, bit-exact: every decoder call `whisper_full` makes
 
 **`whisper_build_graph_decoder` begins `add(get_rows(d_te, embd), get_rows(d_pe, position))` — the f16 token row

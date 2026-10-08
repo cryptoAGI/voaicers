@@ -24,6 +24,7 @@
 //!   voaice bench-cross <model.bin> <in.wav> cross|whole [--threads N]   (0.1.1) the cross K/V from embd_enc, or mel -> embd_enc -> kv_cross
 //!   voaice decin <model.bin> <token,...> [--pos N]               (0.1.2) the decoder's input for tokens at positions N..: digest per row
 //!   voaice bench-decin <model.bin> <n_tokens>                 (0.1.2) the decoder's input, batch prep + rows: wall and CPU per call
+//!   voaice bench-selfkv <model.bin> <n_tokens> block|call [--threads N]   (0.1.3) attn_ln -> Q, K, V -> the f16 self cache (+ the mask)
 //!   voaice vclone check <file.voaice>...                   recompute each identity's vprint and compare every field
 //!   voaice vclone print <8 metrics>                         the dvscope/1 print of eight values (vprint.py's twin)
 //!   voaice vclone log <events.jsonl>                        verify a forge log's chain and say whether it is mintable
@@ -32,7 +33,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::process::ExitCode;
-use voaice::{attention, conv, cross, decoder, encoder, f16, gelu, matmul, measure, mel, model::Model, norm, ogg, resample, sha256, vclone, wav};
+use voaice::{attention, conv, cross, decoder, encoder, f16, gelu, matmul, measure, mel, model::Model, norm, ogg, resample, selfkv, sha256, vclone, wav};
 
 /// The system allocator, counting live heap bytes and their peak, so `bench-mel` can report the heap a call needs
 /// (std only: a `GlobalAlloc` wrapper, no crate). Thread stacks are mapped, not allocated, and are not counted.
@@ -436,6 +437,7 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("bench-cross") if args.len() == 4 && (args[3] == "cross" || args[3] == "whole") => bench_cross(&args[1], &args[2], args[3] == "whole", threads),
         Some("decin") if args.len() == 3 || (args.len() == 5 && args[3] == "--pos") => decin_cmd(&args[1], &args[2], args.get(4)),
         Some("bench-decin") if args.len() == 3 => bench_decin(&args[1], &args[2]),
+        Some("bench-selfkv") if args.len() == 4 && (args[3] == "block" || args[3] == "call") => bench_selfkv(&args[1], &args[2], args[3] == "call", threads),
         Some("bench-attn") if args.len() == 3 => bench_attn(&args[1], &args[2], threads),
         Some("bench-encode") if args.len() == 3 => bench_encode(&args[1], &args[2], threads),
         Some("opus") if args.len() == 3 && args[1] == "info" => opus_info(&args[2]),
@@ -501,7 +503,7 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("voaice {} (reference: whisper.cpp 080bbbe8, ggml 0.16.0)", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        _ => Err("usage: voaice info <model.bin> | voaice mel <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-mel <model.bin> <in.wav> [--threads N] | voaice bench-f16 init|rows | voaice conv1 <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-conv1 <model.bin> <in.wav> conv1|gelu [--threads N] | voaice conv <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-conv <model.bin> <in.wav> conv2|stage [--threads N] | voaice norm <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-norm <model.bin> <in.wav> norm|chain [--threads N] | voaice qkv <model.bin> <in.wav> [q.f32] [--threads N] | voaice bench-mm <model.bin> <in.wav> q|fc1|fc2|qkv|mlp|block [--threads N] | voaice encode <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-attn <model.bin> <in.wav> [--threads N] | voaice bench-encode <model.bin> <in.wav> [--threads N] | voaice cross <model.bin> <in.wav> [out.f16] [--threads N] | voaice bench-cross <model.bin> <in.wav> cross|whole [--threads N] | voaice decin <model.bin> <token,...> [--pos N] | voaice bench-decin <model.bin> <n_tokens> | voaice opus info <file.opus> | voaice bench-opus <file.opus> | voaice resample <in.wav> [out.f32] | voaice bench-resample <in.wav> | voaice vclone check <file.voaice>... | voaice vclone print <8 metrics> | voaice vclone log <events.jsonl> | voaice version".into()),
+        _ => Err("usage: voaice info <model.bin> | voaice mel <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-mel <model.bin> <in.wav> [--threads N] | voaice bench-f16 init|rows | voaice conv1 <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-conv1 <model.bin> <in.wav> conv1|gelu [--threads N] | voaice conv <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-conv <model.bin> <in.wav> conv2|stage [--threads N] | voaice norm <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-norm <model.bin> <in.wav> norm|chain [--threads N] | voaice qkv <model.bin> <in.wav> [q.f32] [--threads N] | voaice bench-mm <model.bin> <in.wav> q|fc1|fc2|qkv|mlp|block [--threads N] | voaice encode <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-attn <model.bin> <in.wav> [--threads N] | voaice bench-encode <model.bin> <in.wav> [--threads N] | voaice cross <model.bin> <in.wav> [out.f16] [--threads N] | voaice bench-cross <model.bin> <in.wav> cross|whole [--threads N] | voaice decin <model.bin> <token,...> [--pos N] | voaice bench-decin <model.bin> <n_tokens> | voaice bench-selfkv <model.bin> <n_tokens> block|call [--threads N] | voaice opus info <file.opus> | voaice bench-opus <file.opus> | voaice resample <in.wav> [out.f32] | voaice bench-resample <in.wav> | voaice vclone check <file.voaice>... | voaice vclone print <8 metrics> | voaice vclone log <events.jsonl> | voaice version".into()),
     }
 }
 
@@ -594,6 +596,92 @@ fn bench_mm(model: &str, wavp: &str, what: &str, threads: usize) -> Result<(), S
 fn digest32(x: &[f32]) -> u64 {
     x.as_chunks::<2>().0.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, p| {
         (h ^ (p[0].to_bits() as u64 | (p[1].to_bits() as u64) << 32)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// `voaice bench-selfkv <model> <n_tokens> block|call` — the same measurement as `whisper_oracle --bench-selfkv`: the
+/// same input (x[i] = ((i·7919) mod 2001 − 1000) / 256) for n_tokens rows; head 0 for a prompt, 226 for a step (n = 1),
+/// the cells below the head used by sequence 0 at their own positions, `KvSelf::prepare` run once before timing (the
+/// reference finds its slot outside the graph too). block = layer 0's attn_ln -> Q, K, V -> the f16 cells; call =
+/// every layer's, each reading the same input, and the f16 mask built from the cells (the reference times only the
+/// mask's cast: whisper fills its f32 mask on the host, outside the graph — voaice's measured call does both). One call
+/// is microseconds to milliseconds: wall = the mean over >= 1 s (>= 20 calls), cpu = CPU per call over the same loop.
+fn bench_selfkv(model: &str, n: &str, call: bool, threads: usize) -> Result<(), String> {
+    let n: usize = n.parse().map_err(|e| format!("n_tokens: {e}"))?;
+    let m = Model::load_pinned(Path::new(model))?;
+    let sa = selfkv::SelfAttn::new(&m)?;
+    let mut kv = selfkv::KvSelf::for_model(&m);
+    drop(m);
+    let ns = sa.n_state;
+    let n_layer = if call { sa.layers.len() } else { 1 };
+    let head = if n == 1 { 226 } else { 0 };
+    if head + n > kv.size {
+        return Err(format!("bench-selfkv: {n} tokens do not fit the cache's {} cells", kv.size));
+    }
+    let xs: Vec<f32> = (0..n * ns).map(|i| ((i * 7919 % 2001) as i32 - 1000) as f32 / 256.0).collect();
+    for (i, c) in kv.cells.iter_mut().enumerate().take(head) {
+        *c = selfkv::Cell { pos: i as i32, seq: 1 };
+    }
+    let mut b = decoder::Batch::with_capacity(n);
+    b.prep_legacy(&vec![0; n], head as i32, 0);
+    kv.prepare(&b)?;
+    if kv.head != head || kv.n != head + n {
+        return Err("bench-selfkv: the slot is not where the reference's graph writes".into());
+    }
+    let (mut q, mut mask) = (vec![0.0f32; n * ns], Vec::with_capacity((head + n) * n));
+    let mut run = |kv: &mut selfkv::KvSelf| {
+        if call {
+            kv.mask_into(&b, &mut mask);
+        }
+        for il in 0..n_layer {
+            sa.layer_into(il, &xs, threads, kv, &mut q, selfkv::SelfTaps::default());
+        }
+    };
+    run(&mut kv);
+    let live = LIVE.load(Relaxed);
+    PEAK.store(live, Relaxed);
+    run(&mut kv); // a call after the first: what it allocates (scratch per call; the cache and q are the caller's)
+    let heap = PEAK.load(Relaxed) - live;
+    let (c0, w0) = (measure::cpu_seconds(), std::time::Instant::now());
+    let mut reps = 0u64;
+    while reps < 20 || w0.elapsed().as_secs_f64() < 1.0 {
+        run(&mut kv);
+        reps += 1;
+    }
+    let (w1, c1) = (w0.elapsed().as_secs_f64(), measure::cpu_seconds());
+    let cpu = match (c0, c1) {
+        (Some(a), Some(b)) => format!("{:.3}", (b - a) * 1e6 / reps as f64),
+        _ => "n/a".into(),
+    };
+    let fold = |h: u64, d: u64| (h ^ d).wrapping_mul(0x0000_0100_0000_01b3);
+    let mut h = digest32(&q);
+    for c in [&kv.k, &kv.v] {
+        for il in 0..n_layer {
+            for r in 0..n {
+                let at = kv.row(il, head + r) * ns;
+                h = fold(h, digest16(&c[at..at + ns]));
+            }
+        }
+    }
+    if call {
+        for row in mask.chunks_exact(kv.n) {
+            h = fold(h, row.iter().fold(0xcbf2_9ce4_8422_2325u64, |g, &v| fold(g, v as u64)));
+        }
+    }
+    let held: usize = sa.layers[..n_layer].iter().map(|l| l.q.bytes() + l.k.bytes() + l.v.bytes() + 8 * l.attn_ln.n).sum::<usize>() + kv.bytes();
+    println!(
+        "bench-selfkv threads {threads} n_tokens {n} what {} wall_us_per_call {:.3} cpu_us_per_call {cpu} reps {reps} heap_per_call_bytes {heap} held_kb {} out_digest {h:016x}",
+        if call { "call" } else { "block" },
+        w1 * 1e6 / reps as f64,
+        held.div_ceil(1024)
+    );
+    Ok(())
+}
+
+/// The oracle's digest16: 64-bit FNV-1a over the f16 bits packed four to a u64 word (little-endian).
+fn digest16(x: &[u16]) -> u64 {
+    x.as_chunks::<4>().0.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, p| {
+        (h ^ (p[0] as u64 | (p[1] as u64) << 16 | (p[2] as u64) << 32 | (p[3] as u64) << 48)).wrapping_mul(0x0000_0100_0000_01b3)
     })
 }
 

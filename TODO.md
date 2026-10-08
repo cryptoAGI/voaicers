@@ -231,10 +231,40 @@ whisper.cpp (upstream/PIN) in the same run; only then is its speed measured.
       is held as a 39.8 MB copy (38,898 KiB) beside the model's bytes — the logits product (0.1.7) reads the same
       table and should share it.
 
-## Next: 0.1.3 — the self-attention products and the f16 self KV cache (see docs/ROADMAP.md)
-- [ ] attn_ln at the decoder's row count, Q (+ bias) × `KQscale`, K × `KQscale` (no bias), V + bias, the CPYs into
-      `kv_self` at `head`, the causal `KQ_mask` (−inf where a cell's pos > the row's, or another sequence) and its f16
-      cast — through the same `sched_decode` callback and both configs of 0.1.2's record.
+## Done: 0.1.3 — the self-attention products and the f16 self KV cache (CHANGELOG.md, testing/selfkv/NOTES.md)
+- [x] Read from the pin and the binary: per decoder layer attn_ln (0.0.8's nodes at the batch's rows); Q =
+      `scale(mul_mat(q_w, cur) + q_b, KQscale)` — the bias **before** the scale; K = `scale(mul_mat(k_w, cur), KQscale)`
+      — no bias, scaled here; V = `mul_mat(v_w, cur) + v_b`; `KQscale` = 0.1.1's `0x3EB504F3`; the CPYs (the scalar bit
+      trick: `ggml_compute_forward_dup` has no `vcvtps2ph`) into `kv_self` at `2 · 384 · (il · 512 + head)` —
+      `GGML_PAD(448, 256)` = 512 cells per layer, the buffer cleared at init and at every window; `find_slot` (head walks
+      to the first free run and stays), `n = min(size, max(pad, GGML_PAD(cell_max, pad)))` with **pad = 1 on the CPU**
+      (no padded columns); KQ_mask f32 on the host (−∞ by sequence and position), cast to f16 by the same converter; a
+      one-row step's mul_mat is the encoder's code as a matrix-vector product.
+- [x] Oracle (`whisper_oracle --selfkv`, tests/selfkv.rs): every decoder call of `whisper_full` on the 8 inputs, both
+      configs, 1 and 4 threads (620 calls): every layer's twelve nodes (model and fast) fed the recorded layer inputs,
+      the cells, head and n, the mask (f32, f16), the whole cache after every call — 0 rows differ; layer 0 from
+      voaice's own decoder input at 1, 2 and 4 threads — 0 differ; seventeen discriminators caught on every input that
+      decodes and an eighteenth (the buffer left uncleared at a window) on the one input with a second window; three
+      indistinguishable as predicted (the row converter for the CPYs and for the mask's cast, the sequence ignored).
+- [x] **Found:** the reference's thread dependence starts inside layer 0 after these nodes, and only for one-row
+      batches: layer 1's input differs at 4 threads on every step, never on a multi-row prompt. Every node of this
+      increment is thread-invariant for a given input.
+- [x] Faster, bits unchanged: attn_ln fused into the conversion, one conversion for Q, K and V; a prompt in 0.0.9's
+      panels; a step a matrix-vector product read from the f16 weights (8 channels at a time, `vcvtph2ps` as the
+      reference widens) on one thread; K and V written straight into the cells; the mask built in f16 once per call.
+- [ ] Not covered: production's libggml-cpu (Zen 3); AVX-512; `base.en`; several decoders (best-of / beam: `seq_id` ≠ 0,
+      `seq_cp` / `seq_rm`, the cache made `factor` × larger, `find_slot`'s wrap); a full cache (n = 512; the longest run
+      reaches 308); the GPU paddings; non-finite activations; layers 1–3 from voaice's own inputs (0.1.4–0.1.6).
+- [ ] Efficiency left: a step's three products are `vcvtph2ps`-bound on this Zen+ core (the f32 copy is ~2× faster hot
+      in cache but ~1.7× slower when four layers stream past the L3 — and a real step streams far more: the logits read
+      40 MB); threads for a step need a persistent pool (a scoped spawn costs more than the products); at 2 threads
+      the 226-row prompt gains nothing here (the two cores' boost drops; measured, not explained further).
+
+## Next: 0.1.4 — self-attention (see docs/ROADMAP.md)
+- [ ] `flash_attn_ext(Q, K, V, KQ_mask_f16, scale 1)` over `kv_self`'s first n cells (n is not padded on the CPU, found in
+      0.1.3): which kernel a prompt takes and which a one-row step takes, read from the source and the binary — and
+      **where the thread dependence 0.1.3 found enters** (one-row batches only; the first suspect is the path a single
+      query takes).
 
 ## Then, in order
 

@@ -22,10 +22,20 @@
 //! `kv_pad` cache with its 36 zero rows attended, f32 FMA-chain scores, the online softmax with ggml's own 8-lane
 //! `ggml_v_expf` for the probabilities and glibc's `expf` for the rescale, the output accumulated in f32 — and the
 //! encoder whole ([`encoder`]): the mel → conv stage → four blocks → ln_post = `embd_enc`, bit-exact against every node
-//! of whisper's encoder graph and against `embd_enc` itself, about four times the reference's speed at one thread; plus
-//! [`measure`] (CPU time and peak RSS from `/proc`, for the gate). [`vclone`] holds voaice's voice identities: the
-//! vprint, byte-identical to cryptoAGI/voaice's vprint.py, and the hash-chained forge log (docs/VCLONE.md). The decoder
-//! (v0.2.0) is not here yet (TODO.md, docs/ROADMAP.md).
+//! of whisper's encoder graph and against `embd_enc` itself, about four times the reference's speed at one thread.
+//!
+//! The decoder, as far as 0.1.3 has it (v0.2.0 completes it; TODO.md, docs/ROADMAP.md): the cross-attention K and V
+//! (0.1.1, [`cross`]) — per decoder layer `embd_enc` × the cross key weight × `Kscale`, and × the value weight + bias,
+//! both to f16 in whisper's padded `kv_cross` layout, computed once per window; the decoder's input (0.1.2,
+//! [`decoder`]) — the prompt and batches `whisper_full` builds and `get_rows(d_te) + get_rows(d_pe)` for every row; and
+//! each decoder layer up to self-attention itself (0.1.3, [`selfkv`]) — attn_ln, Q + bias × `KQscale`, K × `KQscale`,
+//! V + bias, K and V into the f16 self cache `kv_self` at the slot whisper's cell search finds, and the causal
+//! `KQ_mask` with its f16 cast. Each of these is bit-exact against the reference's own nodes on every decoder call of
+//! the recorded transcripts. Not yet here: the decoder's self-attention and cross-attention kernels, its out
+//! projections and MLP, the final norm and the logits, and the transcript loop (sampling, timestamps, windows).
+//!
+//! Plus [`measure`] (CPU time and peak RSS from `/proc`, for the gate). [`vclone`] holds voaice's voice identities: the
+//! vprint, byte-identical to cryptoAGI/voaice's vprint.py, and the hash-chained forge log (docs/VCLONE.md).
 
 pub mod attention;
 pub mod conv;
@@ -42,6 +52,7 @@ pub mod norm;
 pub mod model;
 pub mod ogg;
 pub mod resample;
+pub mod selfkv;
 pub mod sha256;
 pub mod sha512;
 pub mod vclone;

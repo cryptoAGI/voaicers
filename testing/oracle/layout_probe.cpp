@@ -37,6 +37,15 @@ int main() {
     std::printf("#define VOAICE_OFF_STATE_SCHED_DECODE %zu\n", offsetof(whisper_state, sched_decode));
     std::printf("#define VOAICE_OFF_STATE_BATCH        %zu\n", offsetof(whisper_state, batch));
     std::printf("#define VOAICE_SIZEOF_BATCH       %zu\n", sizeof(whisper_batch));
+    // (0.1.3) the self-attention KV cache whisper_decode_internal fills: its head, n, size, cells (pos + seq_id set)
+    std::printf("#define VOAICE_OFF_STATE_KV_SELF      %zu\n", offsetof(whisper_state, kv_self));
+    std::printf("#define VOAICE_OFF_KV_HEAD            %zu\n", offsetof(whisper_kv_cache, head));
+    std::printf("#define VOAICE_OFF_KV_SIZE            %zu\n", offsetof(whisper_kv_cache, size));
+    std::printf("#define VOAICE_OFF_KV_N               %zu\n", offsetof(whisper_kv_cache, n));
+    std::printf("#define VOAICE_OFF_KV_CELLS           %zu\n", offsetof(whisper_kv_cache, cells));
+    std::printf("#define VOAICE_OFF_CELL_POS           %zu\n", offsetof(whisper_kv_cell, pos));
+    std::printf("#define VOAICE_OFF_CELL_SEQ           %zu\n", offsetof(whisper_kv_cell, seq_id));
+    std::printf("#define VOAICE_SIZEOF_KV_CELL     %zu\n", sizeof(whisper_kv_cell));
     std::printf("#define VOAICE_SIZEOF_MEL         %zu\n", sizeof(whisper_mel));
     std::printf("#define VOAICE_SIZEOF_FILTERS     %zu\n", sizeof(whisper_filters));
     return 0;

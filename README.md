@@ -14,7 +14,7 @@ Built the way [bankml](https://github.com/cryptoAGI/bankml) was built against ll
   <img src="https://img.shields.io/badge/dependencies-0-56D364?style=flat-square" alt="zero dependencies">
   <img src="https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-2563EB?style=flat-square" alt="MIT OR Apache-2.0">
   <img src="https://img.shields.io/badge/encoder-bit--exact%20vs%20whisper.cpp%20(ggml%200.16.0)-39D3C7?style=flat-square" alt="encoder bit-exact">
-  <img src="https://img.shields.io/badge/status-0.1.2%20%C2%B7%20encoder%2C%20cross--attention%20K%2FV%20and%20the%20decoder%27s%20input%20bit--exact%20vs%20whisper.cpp%2C%203.7%C3%97%20faster%3B%20the%20decoder%20toward%20v0.2.0-0ECB81?style=flat-square" alt="status">
+  <img src="https://img.shields.io/badge/status-0.1.3%20%C2%B7%20encoder%2C%20cross--attention%20K%2FV%2C%20the%20decoder%27s%20input%2C%20self--attention%20products%20and%20KV%20cache%20bit--exact%20vs%20whisper.cpp%3B%20the%20decoder%20toward%20v0.2.0-0ECB81?style=flat-square" alt="status">
   <a href="https://github.com/cryptoAGI/voaicers/releases/latest"><img src="https://img.shields.io/github/v/release/cryptoAGI/voaicers?style=flat-square&label=release&color=0ECB81" alt="latest release"></a>
 </p>
 
@@ -47,6 +47,14 @@ whisper builds around them — for a prompt and for every one-token step. It is 
 voaice builds are whisper's. Recording it showed that every prompt the recorded transcripts feed tiny.en is the single
 token `[SOT]`, so the oracle added a run with a 300-token prompt to reach the many-row batch.
 
+**0.1.3 is every decoder layer up to self-attention itself, and the self-attention KV cache**: attn_ln, Q + bias ×
+64^−0.25, K × 64^−0.25 (no bias), V + bias, K and V copied to f16 into the 512-cell `kv_self` at the slot whisper's
+cell search finds, and the causal mask with its f16 cast — every node, the cells, the mask, and the **whole cache after
+every call** bit-exact on every decoder call `whisper_full` makes for the 8 inputs. Recording it located where the
+reference's own thread dependence begins: inside layer 0, after these nodes, and only for one-row batches. A 226-row
+prompt runs 4.8–6.1× faster than whisper.cpp at one thread; a one-token step 1.2–1.5× at one thread, and not faster
+than the reference's step at two and four threads (voaice runs a step on one).
+
 It got there one increment at a time: the front end optimized (0.0.2) with its bits unchanged, the first two encoder
 kernels (0.0.3): the f32 ↔ f16 conversions and GELU, (0.0.4) the streaming Ogg/Opus reader that will bring `.opus`
 input without a WAV on disk, (0.0.5) the audio reader whisper-cli itself runs: any WAV to 16 kHz mono f32 through
@@ -57,7 +65,7 @@ products on activations: Q, K, V and their f16 copies, the out projection and th
 ggml's **tiled** kernel, which is the one whisper's graph takes (Q in f32; the f16 `kv_pad` cache with its 36 zero
 padding rows attended; the online softmax with glibc's `expf` for the rescale and ggml's own 8-lane `ggml_v_expf` for
 the probabilities; the output in f32) — and the encoder chained end to end; then (0.1.1) the cross-attention K and V
-every decoder step will read; then (0.1.2) the decoder's input.
+every decoder step will read; then (0.1.2) the decoder's input; then (0.1.3) the self-attention products and the f16 KV cache.
 
 | stage | what | oracle result (this machine, 2026-10-07) |
 |---|---|---|
@@ -75,6 +83,7 @@ every decoder step will read; then (0.1.2) the decoder's input.
 | 10 | **v0.1.0 — flash attention and the whole encoder**: ggml's tiled flash-attention kernel (f32 FMA-chain scores × 1/8 over the 1,536-row f16 `kv_pad` with its 36 +0 rows attended; tiles of 64 keys; glibc `expf` for the rescale, ggml's 8-lane `ggml_v_expf` for the probabilities, summed in f32 then double; the output in f32), then the encoder chained: mel → conv stage → 4 blocks → `ln_post` = `embd_enc`; then faster: K and V widened once per head, the softmax on the tile in registers, caller-owned buffers | every node of the encoder graph through its eval callback (97 digested per input) and `embd_enc` whole: from voaice's own mel **0 differ** at 1, 2 and 4 threads on 8 inputs (2,304 node comparisons, 3,456,000 rows; `embd_enc` 576,000 values each); attention **0 differ** in 36,864,000 values; the reference itself identical at 1..8 threads; glibc `expf` for the probabilities, `ggml_v_expf` for the rescale, no running max, the padding rows excluded, no FMA in the scores or the output, the sums in f32, a division, the one-chunk path — each caught on every input (the one-chunk model itself matches the reference's own `use_ref` output); Q scaled first is indistinguishable (×1/8 is exact), as predicted |
 | 11 | **0.1.1 — cross-attention K and V** (`whisper_build_graph_cross` on `sched_cross`): per decoder layer K = `embd_enc` × key weight × `Kscale` (a SCALE node: one f32 multiply by `(float) pow(64, −0.25)` = `0x3EB504F3`), V = `embd_enc` × value weight + bias, both CPY'd to f16 (the scalar bit trick) into `kv_cross` at row `il · 1536`, rows 1,500..1,535 of every layer +0; then faster: `embd_enc` converted once for all eight products, the epilogue straight into the cache | every node of `sched_cross` (24) and `kv_cross` itself (12,288 rows, the padding included) through the eval callback and the layout probe: from the reference's `embd_enc` **0 differ** in 864,000 node rows and 294,912 cache rows (model, 1 and 4 threads); from voaice's own mel **0 differ** at 1, 2 and 4 threads; the scale before the product, in the weights, in double, after the f16 copy, V scaled, V unbiased, V's bias on K, no f16 rounding, no padding, the non-flash layout, padding not +0 — each caught on every input; the row converter for the CPYs indistinguishable on finite values, as predicted |
 | 12 | **0.1.2 — the decoder's input** (the head of `whisper_build_graph_decoder`): `add(get_rows(d_te, embd), get_rows(d_pe, position))` — the f16 token row widened (`vcvtph2ps`, exact), the f32 position row, one f32 add — and the batch whisper builds: the prompt through `whisper_batch_prep_legacy` (positions `n_past + i`, logits on the last row only), each step one row at `prompt.size() + i`; then widened and added eight at a time into the caller's buffer | every decoder call of `whisper_full` on the 8 inputs through `sched_decode`'s eval callback, with the state's `whisper_batch` (layout probe), in two configs (the transcript record's, whose prompts are all `[SOT]`, and a 300-token prompt for the 226-row batch), at 1 and 4 threads: **0 differ** in 3,772 rows (620 calls), the batches **32 / 32** prompts and **588 / 588** steps; seven discriminators caught on every input that decodes; the operands swapped, the sum in double and (every d_pe value being an f16) the positions rounded to f16 indistinguishable |
+| 13 | **0.1.3 — the self-attention products and the f16 self KV cache** (each decoder layer up to self-attention): attn_ln (0.0.8's nodes at the batch's rows), Q = (`mul_mat` + bias) × `KQscale`, K = `mul_mat` × `KQscale` (no bias), V = `mul_mat` + bias, `KQscale` = `0x3EB504F3`; K and V CPY'd to f16 into `kv_self` (512 cells per layer) at the slot `whisper_kv_cache_find_slot` finds, `n = cell_max` (no padding on the CPU); the KQ_mask (−∞ by sequence and position) and its f16 cast; then attn_ln in the conversion, a prompt in 0.0.9's panels, a step a matrix-vector product from the f16 weights, K and V straight into the cells | every decoder call of `whisper_full` on the 8 inputs through `sched_decode`'s eval callback, with `kv_self`'s cells and buffers (layout probe), both of 0.1.2's configs at 1 and 4 threads: every layer's twelve nodes, the cells, the mask and the whole cache after every call **0 differ** (362,112 node rows, 11,316 mask rows, 5,079,040 cache rows; 620 calls), layer 0 from voaice's own decoder input **0 differ** at 1, 2 and 4 threads; seventeen discriminators caught on every input that decodes (an eighteenth, the buffer left uncleared, on the one input with a second window); the row converter for the CPYs and the mask's cast and the sequence ignored indistinguishable, as predicted |
 
 Efficiency, measured only after the oracles passed in the same gate run (0.0.2, this laptop, 4 CPUs at load ≈ 7.6,
 so ±20 % is noise): the mel is **6.1× faster than 0.0.1** (rebuilt from its tag in the same run) and **6.8× faster
@@ -152,13 +161,25 @@ microsecond is mostly ggml planning a graph, which in whisper is shared by the w
 Either way the stage is noise against a decoder step. Nothing is allocated per call; the f16 token table is held as a
 38,898 KiB copy. Record: [`testing/results/0.1.2.txt`](testing/results/0.1.2.txt).
 
+**0.1.3, after its oracles** (same laptop, load ≈ 1.0–2.8; rerun ≈ 2.2–2.6): the self-attention products and the K/V
+cache writes, the same input on both sides and the digests equal, the reference timed as exactly these nodes in a ggml
+graph. For config B's **226-row prompt**, one layer takes **5.0–5.8 ms against 25.7–27.7 ms** at one thread
+(4.75–5.19×) and all four layers with the mask **20.9–21.7 ms against 103–127 ms** (4.76–6.06×); 2.6–3.9× at two and
+four threads. For **one step**, one layer takes 76–81 µs against 117–120 µs (1.49–1.54×) and four layers 399–431 µs
+against 503–567 µs (1.17–1.42×) at one thread — **but at two and four threads the reference's four-layer step is as
+fast or faster (0.85–1.00×)**: voaice runs a step on one thread (a spawn costs more than the products), and the
+products are bound by `vcvtph2ps` and by the bytes the step streams. Not claimed as faster there. Record:
+[`testing/results/0.1.3.txt`](testing/results/0.1.3.txt).
+
 **A determinism note on the reference itself:** whisper.cpp's transcript depends on its thread count. At 1 thread it
 is identical run to run; at 4 threads the token ids and text stay the same but every token's probability differs in
 its bits, and on JFK the token timestamps move. The transcript oracle is therefore pinned at 1 thread, and a
 bit-exact transcript will mean "bit-exact at a stated thread count".
 
 The encoder is done (v0.1.0) and is exact at any thread count: the reference's own encoder output does not depend on
-it; so are the cross-attention K and V (0.1.1) and the decoder's input (0.1.2). The rest of the decoder and the transcript loop are not written; their plan — the second decade, 0.1.1 → v0.2.0, one
+it; so are the cross-attention K and V (0.1.1), the decoder's input (0.1.2) and every decoder layer's nodes up to
+self-attention with the KV cache (0.1.3) — for a given input; the reference's decoder itself is not: past these nodes
+of layer 0 its one-row steps depend on the thread count (found in 0.1.3). The rest of the decoder and the transcript loop are not written; their plan — the second decade, 0.1.1 → v0.2.0, one
 increment at a time — is in [docs/ROADMAP.md](docs/ROADMAP.md) and [TODO.md](TODO.md).
 
 ## The reference
@@ -246,6 +267,7 @@ target/release/voaice cross models/ggml-tiny.en.bin in.wav [out.f16] [--threads 
 target/release/voaice bench-cross models/ggml-tiny.en.bin in.wav cross|whole [--threads N]   # the cross K/V, or mel -> embd_enc -> kv_cross
 target/release/voaice decin models/ggml-tiny.en.bin 50257 [--pos N]   # (0.1.2) the decoder's input for tokens at positions N..: a digest per row
 target/release/voaice bench-decin models/ggml-tiny.en.bin 226   # the decoder's input for n tokens: wall and CPU per call
+target/release/voaice bench-selfkv models/ggml-tiny.en.bin 226 block|call [--threads N]   # (0.1.3) attn_ln -> Q, K, V -> the f16 self cache (+ the mask)
 ```
 
 Input: `voaice mel` still takes 16-bit PCM, mono, 16 kHz WAV; `voaice resample` (0.0.5) takes any PCM 8/16/24/32-bit
@@ -257,7 +279,7 @@ Disk: the reference checkout and build are about 160 MB in `upstream/` (gitignor
 
 ```
 Cargo.toml  rust-toolchain.toml      zero dependencies; Rust 1.99.0 pinned like bankml
-src/        sha256.rs model.rs wav.rs mel.rs f16.rs gelu.rs conv.rs norm.rs matmul.rs attention.rs encoder.rs cross.rs decoder.rs ogg.rs resample.rs measure.rs lib.rs main.rs
+src/        sha256.rs model.rs wav.rs mel.rs f16.rs gelu.rs conv.rs norm.rs matmul.rs attention.rs encoder.rs cross.rs decoder.rs selfkv.rs ogg.rs resample.rs measure.rs lib.rs main.rs
 tests/oracle.rs                      the oracle comparisons (#[ignore]: need the model and a recorded oracle)
 testing/oracle/                      build.sh, layout_probe.cpp, whisper_oracle.cpp, resample_oracle.cpp (0.0.5)
 tests/resample.rs                    (0.0.5) the resampler against whisper-cli's libcommon.a (#[ignore]: needs the record)
@@ -277,6 +299,8 @@ tests/cross.rs                       (0.1.1) the cross K/V against every node of
 testing/cross/NOTES.md               (0.1.1) the cross graph read from the pin, the encode-call finding, the oracle, the speed
 tests/decin.rs                       (0.1.2) the decoder's input and batches against every decoder call of whisper_full (#[ignore])
 testing/decin/NOTES.md               (0.1.2) the decoder's head read from the pin, the one-row prompts, the two configs, the oracle
+tests/selfkv.rs                      (0.1.3) every layer's products, the mask and kv_self against every decoder call (#[ignore])
+testing/selfkv/NOTES.md              (0.1.3) the products, the cells and the mask read from the pin, the thread finding, the step's bytes
 tests/opus.rs                        (0.0.4) the Ogg/Opus oracle comparisons, offline against the recorded reference
 testing/make_audio.py                the 8 test WAVs, pinned in testing/pins/audio.sha256
 testing/opus/                        oracle.sh record|check, reference.py, mutate.py; 35 pinned .opus files + answers
@@ -341,8 +365,10 @@ go up 0.0.1 at a time, with a milestone at every tenth step. The order of work:
   like 3.70–3.74× ([record](testing/results/0.1.1.txt)).
 - [x] **0.1.2:** the decoder's input — `get_rows(d_te) + get_rows(d_pe)` and whisper's batches, bit-exact on every
   decoder call of `whisper_full` for the 8 inputs at 1 and 4 threads ([record](testing/results/0.1.2.txt)).
-- [ ] **Stage 4, the decoder (0.1.3 → v0.2.0):** the
-  self-attention products and the f16 KV cache (0.1.3), self- and cross-attention (0.1.4, 0.1.5), the MLP (0.1.6),
+- [x] **0.1.3:** the self-attention products and the f16 KV cache — every layer's nodes up to self-attention, the
+  cells, the mask and the whole cache after every call, bit-exact on every decoder call of `whisper_full` for the 8
+  inputs at 1 and 4 threads ([record](testing/results/0.1.3.txt)).
+- [ ] **Stage 4, the decoder (0.1.4 → v0.2.0):** self- and cross-attention (0.1.4, 0.1.5), the MLP (0.1.6),
   the logits (0.1.7), the incremental step (0.1.8), fast (0.1.9) — all 51,864 logits bit-exact per step through
   `whisper_get_logits_from_state` (v0.2.0; [docs/ROADMAP.md](docs/ROADMAP.md)).
 - [ ] **Stage 5, the transcript (0.3.0):** the greedy loop, logit filters, timestamp rules, 30-second seek.

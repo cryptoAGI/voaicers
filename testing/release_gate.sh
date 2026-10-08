@@ -96,6 +96,22 @@
 #   14. (0.1.2) its efficiency, only after 4j passed: the three nodes for 1 token (a step) and 226 (config B's prompt),
 #      `voaice bench-decin` (batch prep + rows into the caller's buffer, one thread) against `whisper_oracle --bench-decin`
 #      (the inputs set, plan and compute of the same three nodes as a ggml graph) at 1 and nproc threads, digests compared
+#   4k. (0.1.3) the self-attention products and the f16 self KV cache: on EVERY decoder call whisper_full makes for the 8
+#      inputs (configs A and B of 4j, at 1 and 4 threads, then unobserved at 1 and 4), every decoder layer's attn_ln
+#      (NORM, MUL, ADD), Q (MUL_MAT, ADD, SCALE), K (MUL_MAT, SCALE), V (MUL_MAT, ADD) and the two CPYs into kv_self,
+#      read through sched_decode's eval callback with each layer's input whole, the KQ_mask's f32 rows and its f16 cast,
+#      kv_self's head, n and cells, and kv_self.k / .v after every call — every cell of every layer (`whisper_oracle
+#      --selfkv`); voaice fed each layer's recorded input (the model and the fast path) and layer 0 from its own decoder
+#      input at 1, 2 and 4 threads, its KvSelf kept across each run's calls, compared bit for bit (tests/selfkv.rs);
+#      the thread behaviour of every node recorded; discriminators (the scale before the products, Q scaled before its
+#      bias, Q or K unscaled, K biased, V scaled, the scale in double, attn_ln fused, no f16 rounding, one accumulator,
+#      the accumulators in sequence; the mask off by one, padded to 32, -inf as a finite value; K/V a cell late, the
+#      layers unpadded, the buffer not cleared at a window; the CPYs and the mask's cast by the row converter and the
+#      sequence ignored, which finite values, one sequence and no free cell make indistinguishable)
+#   15. (0.1.3) its efficiency, only after 4k passed: block = decoder layer 0's twelve nodes, call = all four layers' and
+#      the mask, for 1 token (a step at cell 226) and 226 (config B's prompt), `voaice bench-selfkv` against
+#      `whisper_oracle --bench-selfkv` (the inputs set, plan and compute of the same nodes as a ggml graph), at 1, 2 and
+#      nproc threads, digests compared
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
@@ -184,6 +200,12 @@ testing/oracle/bin/whisper_oracle --decin "$model" .oracle/decin .audio/*.wav 2>
 log "(the decin record took $(( $(date +%s) - t0 )) s: whisper_full seven times per input — config A observed at 1 and 4 threads and not observed at 1 and 4, config B observed at 1 and 4 and not observed at 1; $(du -sh .oracle/decin | cut -f1) of batches and digests)"
 gr=$(objdump -d --no-show-raw-insn "$lib" | sed -n '/<ggml_compute_forward_get_rows>:/,/^$/p'); cf=$(nfn ggml_cpu_fp16_to_fp32 0x200)
 log "libggml-cpu's ggml_compute_forward_get_rows: $(echo "$gr" | grep -c 'call.*<ggml_cpu_fp16_to_fp32@plt>') call of ggml_cpu_fp16_to_fp32 (the f16 rows), $(echo "$gr" | grep -c vcvtph2ps) vcvtph2ps inline; ggml_cpu_fp16_to_fp32: $(echo "$cf" | grep -c vcvtph2ps) vcvtph2ps (blocks of 8 and 4; the table for a tail, none at n_state 384)"
+rm -rf .oracle/selfkv
+t0=$(date +%s)
+testing/oracle/bin/whisper_oracle --selfkv "$model" .oracle/selfkv .audio/*.wav 2>&1 | cut -c1-600 | tee -a "$out"
+log "(the selfkv record took $(( $(date +%s) - t0 )) s: whisper_full eight times per input — configs A and B observed at 1 and 4 threads and not observed at 1 and 4; $(du -sh .oracle/selfkv | cut -f1) of digests, layer inputs and cache digests)"
+dp=$(objdump -d --no-show-raw-insn "$lib" | sed -n '/<ggml_compute_forward_dup>:$/,/^$/p')
+log "libggml-cpu's ggml_compute_forward_dup (dup_flt<float, ggml_fp16_t> inlined: the KQ_mask cast and the K/V CPYs): $(echo "$dp" | grep -c vcvtps2ph) vcvtps2ph (the conversion is the scalar bit trick, 0.0.9's)"
 log "this CPU: $(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -xE 'avx|avx2|fma|f16c|avx512f' | paste -sd' ') (production: Zen 3, the same extensions; its library is not the one checked here)"
 
 log "## 4. voaice.rs"
@@ -271,6 +293,13 @@ cargo test --release --test decin -- --ignored --nocapture --test-threads=1 2>&1
   | grep -vE "^\s*(Compiling|Finished|Running)|^$|^running" > "$step" || true
 tee -a "$out" < "$step"
 grep -q "test result: ok. 5 passed" "$step" || { log "FAIL: the decoder input oracle comparisons did not all pass"; exit 1; }
+
+log "## 4k. the self-attention products and kv_self (0.1.3): every layer's nodes before self-attention, the mask, the cache"
+step=.oracle/selfkv_step.log
+cargo test --release --test selfkv -- --ignored --nocapture --test-threads=1 2>&1 \
+  | grep -vE "^\s*(Compiling|Finished|Running)|^$|^running" > "$step" || true
+tee -a "$out" < "$step"
+grep -q "test result: ok. 5 passed" "$step" || { log "FAIL: the self-attention / kv_self oracle comparisons did not all pass"; exit 1; }
 nt=$(nproc)
 log "## 5. efficiency (only now): log-mel; wall = best of 10 calls, cpu = CPU ms per call (utime+stime, all threads,"
 log "##    loop >= 1 s), heap = bytes live at the first call's peak (KiB; voaice's counting allocator, the reference's"
@@ -511,7 +540,33 @@ for n in 1 226; do
   done
 done
 log "voaice: $(target/release/voaice bench-decin "$model" 1 | sed -E 's/.*(heap_per_call_bytes [0-9]+ held_kb [0-9]+).*/\1/') (the f16 token table and the f32 positions, held outside the call; the reference's are the model's)"
+log "## 15. efficiency (only now): the self-attention products and kv_self (0.1.3). The same input on both sides (x[i] ="
+log "##    ((i * 7919) mod 2001 - 1000) / 256 for every row); n = 1 is one step (its K/V into cell 226), n = 226 config B's"
+log "##    prompt (cells 0..225). block = decoder layer 0's twelve nodes: attn_ln (norm, * w, + b), Q + b, x KQscale, K x"
+log "##    KQscale, V + b, the two CPYs into the f16 cache; call = all four layers' (each reading the same input: in whisper"
+log "##    layers 1-3 read the previous layer's output, which is not this increment's) and the mask. The reference: the inputs"
+log "##    set (x; for call the f32 mask, which whisper fills on the host outside the graph), ggml_graph_plan and"
+log "##    ggml_graph_compute of exactly those nodes as a ggml graph on the shipped CPU backend; voaice: SelfAttn::layer_into"
+log "##    per layer into KvSelf's cells (and for call KvSelf::mask_into, which builds the mask from the cells: more than"
+log "##    the reference's measured cast), the slot found once before timing on both sides. wall = the mean over >= 1 s"
+log "##    (>= 20 calls), cpu = CPU us per call over the same loop; the output's digest (Q, the K/V cells written, the f16"
+log "##    mask) compared. voaice runs a step on one thread at any count (a spawn costs more than its products)"
+log "$(printf '%-6s %-5s %3s | %10s %10s %7s | %10s %10s | %s' tokens what thr ref_us vo_us x cpu_ref cpu_vo digest)"
+for n in 1 226; do
+  for what in block call; do
+    for th in 1 2 "$nt"; do
+      r=$(testing/oracle/bin/whisper_oracle --bench-selfkv "$model" "$th" "$n" "$what")
+      v=$(target/release/voaice bench-selfkv "$model" "$n" "$what" --threads "$th")
+      rd=$(echo "$r" | field out_digest); vd=$(echo "$v" | field out_digest)
+      [ "$rd" = "$vd" ] || { log "FAIL: self-attention digests differ in the benchmark ($rd vs $vd)"; exit 1; }
+      rw=$(echo "$r" | field wall_us_per_call); vw=$(echo "$v" | field wall_us_per_call)
+      log "$(printf '%-6s %-5s %3s | %10.3f %10.3f %6.2fx | %10s %10s | %s' "$n" "$what" "$th" "$rw" "$vw" "$(awk -v a="$rw" -v b="$vw" 'BEGIN{print a/b}')" \
+        "$(echo "$r" | field cpu_us_per_call)" "$(echo "$v" | field cpu_us_per_call)" "$vd")"
+    done
+  done
+done
+log "voaice: $(target/release/voaice bench-selfkv "$model" 226 call | sed -E 's/.*(heap_per_call_bytes [0-9]+ held_kb [0-9]+).*/\1/') at one thread (the scratch per call; held: the three products' f16 weights and their widened f32 copy for every layer, the 3 MiB f16 cache); the reference's work buffer: $(testing/oracle/bin/whisper_oracle --bench-selfkv "$model" 1 226 call | field work_kb) KiB, its weights the model's, its cache the state's"
 log "load after the measurements: $(cut -d' ' -f1-3 /proc/loadavg)"
-log "## transcripts recorded (not yet reproduced by voaice.rs: the encoder is v0.1.0's, the cross K/V 0.1.1's, the decoder's input 0.1.2's, the decoder is v0.2.0's)"
+log "## transcripts recorded (not yet reproduced by voaice.rs: the encoder is v0.1.0's, the cross K/V 0.1.1's, the decoder's input 0.1.2's, the self-attention products and kv_self 0.1.3's, the decoder is v0.2.0's)"
 for d in .oracle/tiny.en/*/; do log "$(basename "$d"): $(tr '\n' ' ' < "$d/transcript.txt")"; done
 log "GATE PASSED"

@@ -25,6 +25,8 @@
 //   whisper_oracle --bench-cross <model.bin> <wav> <threads>   (0.1.1) the cross graph's time, see bench_cross
 //   whisper_oracle --decin <model.bin> <outdir> <wav ...>   (0.1.2) the decoder's input on every decoder call, see record_decin
 //   whisper_oracle --bench-decin <model.bin> <threads> <n_tokens>   (0.1.2) those three nodes' time, see bench_decin
+//   whisper_oracle --selfkv <model.bin> <outdir> <wav ...>  (0.1.3) the self-attention products, the mask, kv_self, see record_selfkv
+//   whisper_oracle --bench-selfkv <model.bin> <threads> <n_tokens> block|call   (0.1.3) their time, see bench_selfkv
 //
 // --bench-mel measures the reference's whisper_pcm_to_mel_with_state the way `voaice bench-mel` measures voaice's,
 // in a fresh process each: the heap bytes live at the first call's peak (operator new counted, below), peak RSS of
@@ -79,6 +81,8 @@
 #include <cstring>
 #include <cerrno>
 #include <map>
+#include <set>
+#include <cstddef>
 #include <string>
 #include <vector>
 #include <sys/stat.h>
@@ -2490,7 +2494,440 @@ static int bench_decin(const char * model_path, int threads, int n_tokens) {
     return 0;
 }
 
+// --selfkv <model.bin> <outdir> <wav ...> (0.1.3): the self-attention products and the f16 self KV cache. whisper_full on
+// each input in 0.1.2's two configs (A: the transcript record's params; B: a 300-token prompt, no timestamps), sched_decode
+// observed at 1 and 4 threads (then unobserved at 1 and 4, the results compared). On EVERY decoder call, for every
+// decoder layer, the callback observes the nodes whisper_build_graph_decoder builds before self-attention itself:
+//   0 norm (NORM, its input = the layer's input read whole), 1 ln_mul (MUL attn_ln.weight), 2 ln_add (ADD attn_ln.bias),
+//   3 q_mm, 4 q_add (+ attn.query.bias), 5 q_scale (SCALE), 6 k_mm, 7 k_scale (SCALE; no bias), 8 v_mm, 9 v_add
+//   (+ attn.value.bias), 10 k_cpy, 11 v_cpy (the CPYs into kv_self.k / kv_self.v at row il * size + head)
+// identified by what they read (the model's tensors, structurally), plus the KQ_mask's cast to f16 (its f32 source read
+// too), the kv_self metadata (head, n, size, each cell's pos and seq_id set) and, after the last layer's two CPYs,
+// kv_self.k and kv_self.v whole. Writes per input:
+//   selfkv_calls.tsv  per call: config, threads, call index, n_tokens, head, n_kv, size, tokens, positions, the cells'
+//                     pos (cells 0..n_kv), whether every cell's seq_id set is {0} (used) or empty (unused), the offsets
+//                     of its digests in selfkv.d64 and of its layer inputs in selfkv_in.f32
+//   selfkv.d64        per call: [n_layer][12 nodes][n_tokens] row digests (digest32 / digest16 over n_state), the mask
+//                     rows f32 then f16 (n_tokens each: mask_digest, every element its own word), then kv_self after the
+//                     call: [k, v][n_layer][size] row digests (digest16 over n_state)
+//   selfkv_in.f32     per call: [n_layer][n_tokens][n_state] — each layer's input (the attn_ln NORM's src0), whole
+//   selfkv_result.tsv the observed 1-thread runs' result tokens (A, then B)
+//   selfkv.tsv        the self-checks and the facts
+struct kv_cell_mirror { int32_t pos; std::set<int32_t> seq_id; };
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winvalid-offsetof"   // the same compiler and libstdc++ as the probe's offsetof
+static_assert(sizeof(kv_cell_mirror) == VOAICE_SIZEOF_KV_CELL && offsetof(kv_cell_mirror, seq_id) == VOAICE_OFF_CELL_SEQ &&
+              offsetof(kv_cell_mirror, pos) == VOAICE_OFF_CELL_POS, "whisper_kv_cell layout changed");
+#pragma GCC diagnostic pop
+static const char * SELF_KEYS[12] = {"norm", "ln_mul", "ln_add", "q_mm", "q_add", "q_scale", "k_mm", "k_scale", "v_mm", "v_add", "k_cpy", "v_cpy"};
+static uint64_t mask_digest(const uint8_t * p, size_t n, size_t es) {   // every element its own word: odd n_kv counts
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < n; i++) { uint64_t w = 0; std::memcpy(&w, p + i * es, es); h = (h ^ w) * 0x100000001b3ULL; }
+    return h;
+}
+struct selfkv_call {
+    int n = 0, head = 0, n_kv = 0, size = 0;
+    std::vector<int32_t> tok, pos, cell_pos;
+    bool seq_ok = true;
+    std::vector<uint64_t> nodes;    // [n_layer][12][n]
+    std::vector<float> in;          // [n_layer][n][n_state]
+    std::vector<uint64_t> m32, m16, kv;
+    std::vector<uint8_t> seen;      // [n_layer][12]: times observed
+    bool mask_seen = false, done = false;
+    int mask_other = 0, mask_ninf = 0, mask_zero = 0;
+};
+struct selfkv_capture {
+    whisper_state * st = nullptr;
+    int n_state = 0, n_layer = 0;
+    std::map<const ggml_tensor *, std::pair<int, int>> w;   // model tensor -> (layer, kind): 0 ln.w 1 ln.b 2 q.w 3 q.b 4 k.w 5 v.w 6 v.b
+    std::vector<selfkv_call> calls;
+    const ggml_tensor * pend_norm = nullptr;
+    std::vector<uint8_t> pend_in;
+    std::vector<uint64_t> pend_d;
+    uint32_t scale_bits = 0;
+    int scale_inplace = 0, q_add_inplace = 0, cpy_n = 0;
+    bool scale_b_zero = true, scale_same = true, cpy_into_cache = true, mm_src1_ln = true, weights_f16 = true, k_unbiased = true,
+         mask_shape = true, mask_f16 = true, mask_once = true, kv_f16 = true;
+};
+static ggml_tensor * state_kv_self(whisper_state * st, bool v) {
+    return *reinterpret_cast<ggml_tensor **>((char *)st + VOAICE_OFF_STATE_KV_SELF + (v ? VOAICE_OFF_KV_V : VOAICE_OFF_KV_K));
+}
+template <class T> static T kv_self_field(whisper_state * st, size_t off) { return *reinterpret_cast<T *>((char *)st + VOAICE_OFF_STATE_KV_SELF + off); }
+// what a node is, by what it reads: (layer, key) or (-1, -1); key -2 = a NORM (whose layer its MUL tells), -3 = the mask cast
+static std::pair<int, int> selfkv_kind(const ggml_tensor * t, const selfkv_capture & c) {
+    auto wk = [&](const ggml_tensor * x) -> std::pair<int, int> { auto it = x ? c.w.find(x) : c.w.end(); return it == c.w.end() ? std::make_pair(-1, -1) : it->second; };
+    switch (t->op) {
+        case GGML_OP_NORM: return {-1, -2};
+        case GGML_OP_MUL: { auto k = wk(t->src[1]); if (k.second == 0) return {k.first, 1}; break; }
+        case GGML_OP_ADD: {
+            auto k = wk(t->src[1]);
+            if (k.second == 1) return {k.first, 2};
+            if (k.second == 3) return {k.first, 4};
+            if (k.second == 6) return {k.first, 9};
+            break;
+        }
+        case GGML_OP_MUL_MAT: {
+            auto k = wk(t->src[0]);
+            if (k.second == 2) return {k.first, 3};
+            if (k.second == 4) return {k.first, 6};
+            if (k.second == 5) return {k.first, 8};
+            break;
+        }
+        case GGML_OP_SCALE: {
+            const ggml_tensor * s = t->src[0];
+            if (s->op == GGML_OP_ADD && wk(s->src[1]).second == 3) return {wk(s->src[1]).first, 5};
+            if (s->op == GGML_OP_MUL_MAT && wk(s->src[0]).second == 4) return {wk(s->src[0]).first, 7};
+            break;
+        }
+        case GGML_OP_CPY: {
+            const ggml_tensor * s = t->src[0];
+            if (std::strcmp(s->name, "KQ_mask") == 0) return {-1, -3};
+            if (s->op == GGML_OP_SCALE && s->src[0]->op == GGML_OP_MUL_MAT && wk(s->src[0]->src[0]).second == 4) return {wk(s->src[0]->src[0]).first, 10};
+            if (s->op == GGML_OP_ADD && wk(s->src[1]).second == 6) return {wk(s->src[1]).first, 11};
+            break;
+        }
+        default: break;
+    }
+    return {-1, -1};
+}
+// when every node of every layer and the mask are in: the cache after the call (nothing later in the graph writes it)
+static void selfkv_finish(selfkv_capture & c, selfkv_call & k) {
+    bool all = k.mask_seen;
+    for (uint8_t s : k.seen) all = all && s == 1;
+    if (!all) return;
+    const std::vector<uint8_t> kb = tensor_bytes(state_kv_self(c.st, false)), vb = tensor_bytes(state_kv_self(c.st, true));
+    for (const std::vector<uint8_t> * b : {&kb, &vb})
+        for (size_t r = 0; r < b->size() / (2 * (size_t)c.n_state); r++) k.kv.push_back(digest16((const uint16_t *)(b->data() + r * 2 * c.n_state), c.n_state));
+    k.done = true;
+}
+static bool selfkv_cb(ggml_tensor * t, bool ask, void * ud) {
+    auto & c = *static_cast<selfkv_capture *>(ud);
+    const auto kind = selfkv_kind(t, c);
+    if (ask) {
+        // an ADD reading K (k_mm or its SCALE) would be a bias on K: not asked for, only noted
+        if (t->op == GGML_OP_ADD && t->src[0] && ((t->src[0]->op == GGML_OP_MUL_MAT && c.w.count(t->src[0]->src[0]) && c.w.at(t->src[0]->src[0]).second == 4) ||
+                                                  (t->src[0]->op == GGML_OP_SCALE && t->src[0]->src[0]->op == GGML_OP_MUL_MAT &&
+                                                   c.w.count(t->src[0]->src[0]->src[0]) && c.w.at(t->src[0]->src[0]->src[0]).second == 4)))
+            c.k_unbiased = false;
+        return kind.second != -1;
+    }
+    // a call begins at layer 0's attn_ln NORM, the one that reads the decoder's input add(get_rows(d_te), get_rows(d_pe));
+    // the NORMs after the last layer's attention (cross_attn_ln, mlp_ln) come after the call is complete and are ignored
+    const ggml_tensor * s0 = t->src[0];
+    const bool first = t->op == GGML_OP_NORM && s0->op == GGML_OP_ADD && s0->src[0]->op == GGML_OP_GET_ROWS && s0->src[1]->op == GGML_OP_GET_ROWS;
+    if (!first && (c.calls.empty() || c.calls.back().done)) {
+        check(kind.second == -2, "selfkv: a node of a call outside any call");
+        return true;
+    }
+    if (first) {   // the first node of a call: the batch and the cache's metadata
+        check(c.calls.empty() || c.calls.back().done, "selfkv: a call began before the last one was complete");
+        selfkv_call k;
+        const auto & b = *reinterpret_cast<const batch_mirror *>((const char *)c.st + VOAICE_OFF_STATE_BATCH);
+        k.n = b.n_tokens;
+        for (int i = 0; i < k.n; i++) { k.tok.push_back(b.token[i]); k.pos.push_back(b.pos[i]); }
+        k.head = (int)kv_self_field<uint32_t>(c.st, VOAICE_OFF_KV_HEAD);
+        k.n_kv = (int)kv_self_field<uint32_t>(c.st, VOAICE_OFF_KV_N);
+        k.size = (int)kv_self_field<uint32_t>(c.st, VOAICE_OFF_KV_SIZE);
+        const auto & cells = kv_self_field<std::vector<kv_cell_mirror>>(c.st, VOAICE_OFF_KV_CELLS);
+        check((int)cells.size() == k.size, "selfkv: kv_self.cells.size() != kv_self.size");
+        for (int i = 0; i < k.size; i++) {
+            if (i < k.n_kv) k.cell_pos.push_back(cells[i].pos);
+            const bool used = cells[i].pos >= 0;
+            k.seq_ok = k.seq_ok && (used ? cells[i].seq_id == std::set<int32_t>{0} : cells[i].seq_id.empty()) && (i < k.n_kv || !used);
+        }
+        k.nodes.assign((size_t)c.n_layer * 12 * k.n, 0);
+        k.in.assign((size_t)c.n_layer * k.n * c.n_state, 0.0f);
+        k.seen.assign((size_t)c.n_layer * 12, 0);
+        c.calls.push_back(std::move(k));
+    }
+    selfkv_call & k = c.calls.back();
+    if (kind.second == -2) {   // a NORM: its input and digest kept until a MUL by attn_ln.weight reads it
+        c.pend_norm = t; c.pend_in = tensor_bytes(t->src[0]); c.pend_d = row_digests(t, c.n_state);
+        return true;
+    }
+    if (kind.second == -3) {   // the mask: f32 source and f16 cast, per row
+        const ggml_tensor * m = t->src[0];
+        c.mask_shape = c.mask_shape && m->type == GGML_TYPE_F32 && m->ne[0] == k.n_kv && m->ne[1] == k.n && m->ne[2] == 1 && m->ne[3] == 1;
+        c.mask_f16 = c.mask_f16 && t->type == GGML_TYPE_F16 && ggml_nelements(t) == ggml_nelements(m);
+        c.mask_once = c.mask_once && !k.mask_seen;
+        k.mask_seen = true;
+        const std::vector<uint8_t> a = tensor_bytes(m), h = tensor_bytes(t);
+        for (int r = 0; r < k.n; r++) {
+            k.m32.push_back(mask_digest(a.data() + (size_t)r * k.n_kv * 4, k.n_kv, 4));
+            k.m16.push_back(mask_digest(h.data() + (size_t)r * k.n_kv * 2, k.n_kv, 2));
+            for (int i = 0; i < k.n_kv; i++) {
+                uint32_t u; std::memcpy(&u, a.data() + ((size_t)r * k.n_kv + i) * 4, 4);
+                if (u == 0) k.mask_zero++; else if (u == 0xFF800000u) k.mask_ninf++; else k.mask_other++;
+            }
+        }
+        selfkv_finish(c, k);
+        return true;
+    }
+    const int il = kind.first, key = kind.second;
+    check(il >= 0 && il < c.n_layer && key >= 1 && key < 12, "selfkv: an unclassified node was observed");
+    if (key == 1) {
+        check(c.pend_norm != nullptr && t->src[0] == c.pend_norm, "selfkv: attn_ln's MUL does not read the last NORM");
+        check(c.pend_in.size() == (size_t)k.n * c.n_state * 4 && c.pend_d.size() == (size_t)k.n, "selfkv: the layer input's shape");
+        std::memcpy(&k.in[(size_t)il * k.n * c.n_state], c.pend_in.data(), c.pend_in.size());
+        std::copy(c.pend_d.begin(), c.pend_d.end(), k.nodes.begin() + ((size_t)il * 12 + 0) * k.n);
+        k.seen[il * 12 + 0]++;
+        c.pend_norm = nullptr;
+    }
+    if (key == 3 || key == 6 || key == 8) {
+        const ggml_tensor * s1 = t->src[1];
+        c.mm_src1_ln = c.mm_src1_ln && s1->op == GGML_OP_ADD && c.w.count(s1->src[1]) && c.w.at(s1->src[1]) == std::make_pair(il, 1);
+        c.weights_f16 = c.weights_f16 && t->src[0]->type == GGML_TYPE_F16;
+    }
+    if (key == 4) c.q_add_inplace += t->data == t->src[0]->data;
+    if (key == 5 || key == 7) {
+        float sb[2];
+        std::memcpy(sb, t->op_params, sizeof sb);
+        if (c.scale_bits == 0) c.scale_bits = f32_bits(sb[0]);
+        c.scale_same = c.scale_same && f32_bits(sb[0]) == c.scale_bits;
+        c.scale_b_zero = c.scale_b_zero && sb[1] == 0.0f;
+        c.scale_inplace += t->data == t->src[0]->data;
+    }
+    if (key == 10 || key == 11) {
+        const ggml_tensor * cache = state_kv_self(c.st, key == 11);
+        c.kv_f16 = c.kv_f16 && cache->type == GGML_TYPE_F16 && ggml_nelements(cache) == (int64_t)c.n_layer * k.size * c.n_state;
+        c.cpy_into_cache = c.cpy_into_cache && t->type == GGML_TYPE_F16 && t->view_src == cache &&
+                           t->view_offs == (size_t)2 * c.n_state * ((size_t)il * k.size + k.head) && ggml_nelements(t) == (int64_t)k.n * c.n_state;
+    }
+    std::vector<uint64_t> d = row_digests(t, c.n_state);
+    check(d.size() == (size_t)k.n, "selfkv: a node is not n_tokens rows of n_state");
+    std::copy(d.begin(), d.end(), k.nodes.begin() + ((size_t)il * 12 + key) * k.n);
+    k.seen[il * 12 + key]++;
+    selfkv_finish(c, k);
+    return true;
+}
+static int record_selfkv(const char * model_path, const std::string & outdir, int nwav, char ** wavs) {
+    if (mkdir(outdir.c_str(), 0755) != 0 && errno != EEXIST) die("cannot create outdir (its parent must exist)");
+    whisper_context * ctx = load_quiet(model_path);
+    auto & tensors = model_tensors(ctx);
+    const int n_state = whisper_model_n_text_state(ctx), n_layer = whisper_model_n_text_layer(ctx);
+    check(n_layer * 12 <= 255, "selfkv: too many layers");
+    const char * kinds[7] = {"attn_ln.weight", "attn_ln.bias", "attn.query.weight", "attn.query.bias", "attn.key.weight", "attn.value.weight", "attn.value.bias"};
+    std::map<const ggml_tensor *, std::pair<int, int>> wmap;
+    bool no_key_bias = true;
+    for (int il = 0; il < n_layer; il++) {
+        for (int j = 0; j < 7; j++) wmap[tensors.at("decoder.blocks." + std::to_string(il) + "." + kinds[j])] = {il, j};
+        no_key_bias = no_key_bias && !tensors.count("decoder.blocks." + std::to_string(il) + ".attn.key.bias");
+    }
+    const auto yn = [](bool b) { return b ? "yes" : "NO"; };
+    for (int a = 0; a < nwav; a++) {
+        std::string path = wavs[a];
+        std::string stem = path.substr(path.find_last_of('/') + 1);
+        stem = stem.substr(0, stem.find_last_of('.'));
+        const std::string dir = outdir + "/" + stem;
+        mkdir(dir.c_str(), 0755);
+        std::vector<float> pcm = read_wav(path.c_str());
+        const std::vector<whisper_token> prompt = decin_prompt();
+        selfkv_capture caps[2][2];
+        std::vector<std::string> res[2][4];
+        const int threads[4] = {1, 4, 1, 4};
+        for (int cfg = 0; cfg < 2; cfg++)
+            for (int r = 0; r < 4; r++) {   // r = 0, 1: observed at 1 and 4 threads; r = 2, 3: not observed
+                whisper_state * st = whisper_init_state(ctx);
+                check(st != nullptr, "whisper_init_state failed");
+                ggml_backend_sched_t sd = state_sched(st, VOAICE_OFF_STATE_SCHED_DECODE);
+                if (r < 2) {
+                    selfkv_capture & c = caps[cfg][r];
+                    c.st = st; c.n_state = n_state; c.n_layer = n_layer; c.w = wmap;
+                    ggml_backend_sched_set_eval_callback(sd, selfkv_cb, &c);
+                }
+                check(whisper_full_with_state(ctx, st, decin_params(threads[r], cfg == 1, prompt), pcm.data(), (int)pcm.size()) == 0, "whisper_full failed");
+                res[cfg][r] = result_lines(ctx, st);
+                if (r < 2) caps[cfg][r].st = nullptr;
+                whisper_free_state(st);
+            }
+        std::vector<uint64_t> d64;
+        std::vector<float> fin;
+        FILE * cf = std::fopen((dir + "/selfkv_calls.tsv").c_str(), "w");
+        int prompts[2] = {0, 0}, steps[2] = {0, 0}, rows = 0, max_n = 0, max_pos = 0, max_kv = 0, size = 0;
+        long mzero = 0, mninf = 0, mother = 0;
+        bool complete = true, seq_ok = true, head_rule = true;
+        for (int cfg = 0; cfg < 2; cfg++)
+            for (int r = 0; r < 2; r++) {
+                const selfkv_capture & c = caps[cfg][r];
+                for (size_t k = 0; k < c.calls.size(); k++) {
+                    const selfkv_call & x = c.calls[k];
+                    complete = complete && x.done && x.kv.size() == (size_t)2 * n_layer * x.size && x.m32.size() == (size_t)x.n && x.m16.size() == (size_t)x.n;
+                    seq_ok = seq_ok && x.seq_ok;
+                    // greedy, one sequence: the prompt at cell 0, every step at the cell after the last
+                    head_rule = head_rule && x.head == (x.pos[0] == 0 ? 0 : x.pos[0]) && x.n_kv == x.head + x.n;
+                    size = x.size;
+                    if (r == 0) {
+                        (x.pos[0] == 0 ? prompts[cfg] : steps[cfg])++;
+                        rows += x.n; max_n = std::max(max_n, x.n); max_pos = std::max(max_pos, x.pos[x.n - 1]); max_kv = std::max(max_kv, x.n_kv);
+                        mzero += x.mask_zero; mninf += x.mask_ninf; mother += x.mask_other;
+                    }
+                    std::fprintf(cf, "call\t%c\t%d\t%zu\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%d\t%zu\t%zu\n", "AB"[cfg], threads[r], k, x.n, x.head, x.n_kv, x.size,
+                                 csv(x.tok).c_str(), csv(x.pos).c_str(), csv(x.cell_pos).c_str(), (int)x.seq_ok, d64.size(), fin.size());
+                    d64.insert(d64.end(), x.nodes.begin(), x.nodes.end());
+                    d64.insert(d64.end(), x.m32.begin(), x.m32.end());
+                    d64.insert(d64.end(), x.m16.begin(), x.m16.end());
+                    d64.insert(d64.end(), x.kv.begin(), x.kv.end());
+                    fin.insert(fin.end(), x.in.begin(), x.in.end());
+                }
+            }
+        std::fclose(cf);
+        write_bin(dir + "/selfkv.d64", d64.data(), d64.size());
+        write_bin(dir + "/selfkv_in.f32", fin.data(), fin.size());
+        FILE * rf = std::fopen((dir + "/selfkv_result.tsv").c_str(), "w");
+        for (int cfg = 0; cfg < 2; cfg++) for (auto & l : res[cfg][0]) std::fprintf(rf, "%c\t%s\n", "AB"[cfg], l.c_str());
+        std::fclose(rf);
+        // 1 vs 4 threads, call by call while the two runs fed the same batch: per layer, the calls whose input was the
+        // same at both counts, and per node the calls where that same input gave different rows
+        FILE * m = std::fopen((dir + "/selfkv.tsv").c_str(), "w");
+        bool checks = true;
+        for (int cfg = 0; cfg < 2; cfg++)
+            for (int r = 0; r < 2; r++) {
+                const selfkv_capture & c = caps[cfg][r];
+                checks = checks && c.scale_b_zero && c.scale_same && c.cpy_into_cache && c.mm_src1_ln && c.weights_f16 && c.k_unbiased &&
+                         c.mask_shape && c.mask_f16 && c.mask_once && c.kv_f16;
+            }
+        std::fprintf(m, "n_state\t%d\nn_layer\t%d\nkv_self_size\t%d\nmodel_has_no_key_bias\t%s\nA_calls_1t\t%zu\nA_calls_4t\t%zu\nA_prompts\t%d\nA_steps\t%d\n"
+                        "B_calls_1t\t%zu\nB_calls_4t\t%zu\nB_prompts\t%d\nB_steps\t%d\nrows_1t\t%d\nmax_n_tokens\t%d\nmax_pos\t%d\nmax_n_kv\t%d\n"
+                        "every_call_every_node_mask_and_cache\t%s\nchecks_scale_b0_same_cpy_at_il_size_head_mm_src1_attn_ln_f16_weights_k_unbiased_mask_f32_to_f16_once\t%s\n"
+                        "cells_seq_id_0_used_empty_unused_none_past_n_kv\t%s\nhead_at_pos_n_kv_eq_head_plus_n\t%s\nkqscale_bits\t%08x\n"
+                        "scale_in_place_1t\t%d\nq_add_in_place_1t\t%d\nmask_values_zero_ninf_other_1t\t%ld\t%ld\t%ld\n",
+                     n_state, n_layer, size, yn(no_key_bias), caps[0][0].calls.size(), caps[0][1].calls.size(), prompts[0], steps[0],
+                     caps[1][0].calls.size(), caps[1][1].calls.size(), prompts[1], steps[1], rows, max_n, max_pos, max_kv, yn(complete), yn(checks),
+                     yn(seq_ok), yn(head_rule), caps[0][0].scale_bits, caps[0][0].scale_inplace + caps[1][0].scale_inplace,
+                     caps[0][0].q_add_inplace + caps[1][0].q_add_inplace, mzero, mninf, mother);
+        std::string keys;
+        for (const char * k : SELF_KEYS) keys += (keys.empty() ? "" : ",") + std::string(k);
+        std::fprintf(m, "node_keys\t%s\n", keys.c_str());
+        std::string thr_line;
+        for (int cfg = 0; cfg < 2; cfg++) {
+            const auto & x1 = caps[cfg][0].calls, & x4 = caps[cfg][1].calls;
+            size_t same_batch = 0, kv_differ = 0, mask_differ = 0;
+            std::vector<size_t> in_same(n_layer, 0), in_differ(n_layer, 0);
+            std::vector<std::vector<size_t>> out_differ(n_layer, std::vector<size_t>(12, 0));
+            for (size_t k = 0; k < std::min(x1.size(), x4.size()); k++) {
+                if (x1[k].tok != x4[k].tok || x1[k].pos != x4[k].pos) break;
+                same_batch++;
+                mask_differ += x1[k].m32 != x4[k].m32 || x1[k].m16 != x4[k].m16;
+                const size_t n = x1[k].n;
+                bool all_in_same = true;
+                for (int il = 0; il < n_layer; il++) {
+                    const float * a = &x1[k].in[(size_t)il * n * n_state], * b = &x4[k].in[(size_t)il * n * n_state];
+                    const bool same = std::memcmp(a, b, n * n_state * 4) == 0;
+                    all_in_same = all_in_same && same;
+                    (same ? in_same : in_differ)[il]++;
+                    if (!same) continue;
+                    for (int key = 0; key < 12; key++)
+                        out_differ[il][key] += !std::equal(x1[k].nodes.begin() + (il * 12 + key) * n, x1[k].nodes.begin() + (il * 12 + key + 1) * n,
+                                                           x4[k].nodes.begin() + (il * 12 + key) * n);
+                }
+                if (all_in_same) kv_differ += x1[k].kv != x4[k].kv;
+            }
+            std::fprintf(m, "%c_threads_1_vs_4_calls_same_batch\t%zu\n%c_threads_1_vs_4_mask_differ\t%zu\n%c_threads_1_vs_4_kv_differ_all_inputs_same\t%zu\n",
+                         "AB"[cfg], same_batch, "AB"[cfg], mask_differ, "AB"[cfg], kv_differ);
+            thr_line += std::string(cfg ? "; B" : "A") + " " + std::to_string(same_batch) + " calls same batch:";
+            for (int il = 0; il < n_layer; il++) {
+                std::string od;
+                size_t tot = 0;
+                for (int key = 0; key < 12; key++) { od += (key ? "," : "") + std::to_string(out_differ[il][key]); tot += out_differ[il][key]; }
+                std::fprintf(m, "%c_threads_1_vs_4_layer%d_input_same_differ_nodes_differ\t%zu\t%zu\t%s\n", "AB"[cfg], il, in_same[il], in_differ[il], od.c_str());
+                thr_line += " L" + std::to_string(il) + " in same " + std::to_string(in_same[il]) + "/differ " + std::to_string(in_differ[il]) + ", nodes differ " + std::to_string(tot);
+            }
+        }
+        std::fprintf(m, "A_result_observed_eq_unobserved_1t\t%s\nA_result_observed_eq_unobserved_4t\t%s\nB_result_observed_eq_unobserved_1t\t%s\n"
+                        "B_result_observed_eq_unobserved_4t\t%s\nA_result_1t_eq_4t\t%s\nB_result_1t_eq_4t\t%s\nA_result_tokens\t%zu\nB_result_tokens\t%zu\n"
+                        "d64_words\t%zu\nin_f32_values\t%zu\n",
+                     yn(res[0][0] == res[0][2]), yn(res[0][1] == res[0][3]), yn(res[1][0] == res[1][2]), yn(res[1][1] == res[1][3]),
+                     yn(res[0][2] == res[0][3]), yn(res[1][2] == res[1][3]), res[0][0].size(), res[1][0].size(), d64.size(), fin.size());
+        std::fclose(m);
+        std::fprintf(stderr, "whisper_oracle: %s: A %zu calls (%d prompts, %d steps), B %zu (%d, %d); %d rows, longest batch %d, last position %d, "
+                             "largest n_kv %d of %d cells; complete: %s; checks: %s; cells: %s; head/n rule: %s; KQscale %08x; mask 0/-inf/other %ld/%ld/%ld; "
+                             "observed = unobserved: A %s %s, B %s %s; results 1 = 4 threads: A %s, B %s; 1 vs 4 threads: %s\n",
+                     stem.c_str(), caps[0][0].calls.size(), prompts[0], steps[0], caps[1][0].calls.size(), prompts[1], steps[1], rows, max_n, max_pos,
+                     max_kv, size, yn(complete), yn(checks), yn(seq_ok), yn(head_rule), caps[0][0].scale_bits, mzero, mninf, mother,
+                     yn(res[0][0] == res[0][2]), yn(res[0][1] == res[0][3]), yn(res[1][0] == res[1][2]), yn(res[1][1] == res[1][3]),
+                     yn(res[0][2] == res[0][3]), yn(res[1][2] == res[1][3]), thr_line.c_str());
+    }
+    whisper_free(ctx);
+    return 0;
+}
+
+// --bench-selfkv <model.bin> <threads> <n_tokens> <block|call> (0.1.3): the nodes whisper_build_graph_decoder builds before
+// self-attention, as a standalone graph on the shipped CPU backend, for n_tokens rows: block = decoder layer 0's twelve
+// (norm, · w, + b; Q + b, × KQscale; K, × KQscale; V + b; the two CPYs into an f16 cache of [n_layer][512][n_state] at
+// row head) — call = every layer's twelve (each reading the same input: in whisper layer il > 0 reads the previous
+// layer's output, which is not this increment's) and the KQ_mask's cast to f16. head = 0 for a prompt (n > 1), 226 for
+// a step (n = 1: config B's first step); n_kv = head + n_tokens. The input x[i] = ((i·7919) mod 2001 − 1000) / 256
+// (exact in f32), the mask the causal one for positions head..head+n−1 over cells 0..n_kv−1. One call = set the inputs
+// (x, and for call the f32 mask, which whisper builds outside the graph), plan, compute; wall = the mean over >= 1 s of
+// calls, cpu = CPU per call over the same loop. out_digest: digest32 over the last layer's Q (scaled), then digest16
+// over the k and v cache rows written, then (call) the f16 mask.
+static int bench_selfkv(const char * model_path, int threads, int n, const char * what) {
+    const bool call = std::strcmp(what, "call") == 0;
+    check(call || std::strcmp(what, "block") == 0, "bench-selfkv: block or call");
+    whisper_context * ctx = load_quiet(model_path);
+    auto & m = model_tensors(ctx);
+    const int n_state = whisper_model_n_text_state(ctx), n_layer = call ? whisper_model_n_text_layer(ctx) : 1;
+    const int size = (whisper_model_n_text_ctx(ctx) + 255) / 256 * 256, head = n == 1 ? 226 : 0, n_kv = head + n;
+    const float KQscale = pow(float(n_state / (n_state / 64)), -0.25);   // whisper.cpp:2506, the same expression
+    ggml_init_params p = { (size_t)64 << 20, nullptr, false };
+    ggml_context * g = ggml_init(p);
+    check(g != nullptr, "ggml_init failed");
+    ggml_tensor * x = ggml_new_tensor_2d(g, GGML_TYPE_F32, n_state, n);
+    ggml_tensor * kc = ggml_new_tensor_1d(g, GGML_TYPE_F16, (int64_t)n_state * n_layer * size), * vc = ggml_new_tensor_1d(g, GGML_TYPE_F16, (int64_t)n_state * n_layer * size);
+    std::memset(kc->data, 0, ggml_nbytes(kc));
+    std::memset(vc->data, 0, ggml_nbytes(vc));
+    ggml_cgraph * gf = ggml_new_graph(g);
+    ggml_tensor * q = nullptr, * mask = nullptr, * mask16 = nullptr;
+    for (int il = 0; il < n_layer; il++) {
+        const std::string pre = "decoder.blocks." + std::to_string(il) + ".";
+        auto W = [&](const char * s) { return conv2_graph::copy(g, m.at(pre + s)); };
+        ggml_tensor * cur = ggml_add(g, ggml_mul(g, ggml_norm(g, x, 1e-5f), W("attn_ln.weight")), W("attn_ln.bias"));
+        q = ggml_scale(g, ggml_add(g, ggml_mul_mat(g, W("attn.query.weight"), cur), W("attn.query.bias")), KQscale);
+        ggml_tensor * k = ggml_scale(g, ggml_mul_mat(g, W("attn.key.weight"), cur), KQscale);
+        ggml_tensor * v = ggml_add(g, ggml_mul_mat(g, W("attn.value.weight"), cur), W("attn.value.bias"));
+        ggml_build_forward_expand(gf, ggml_cpy(g, k, ggml_view_1d(g, kc, (int64_t)n * n_state, (size_t)2 * n_state * ((size_t)il * size + head))));
+        ggml_build_forward_expand(gf, ggml_cpy(g, v, ggml_view_1d(g, vc, (int64_t)n * n_state, (size_t)2 * n_state * ((size_t)il * size + head))));
+        ggml_build_forward_expand(gf, q);
+    }
+    std::vector<float> mk;
+    if (call) {
+        mask = ggml_new_tensor_3d(g, GGML_TYPE_F32, n_kv, n, 1);
+        mask16 = ggml_cast(g, mask, GGML_TYPE_F16);
+        ggml_build_forward_expand(gf, mask16);
+        mk.assign((size_t)n_kv * n, 0.0f);
+        for (int j = 0; j < n; j++) for (int i = 0; i < n_kv; i++) if (i > head + j) mk[(size_t)j * n_kv + i] = -INFINITY;
+    }
+    std::vector<float> xs((size_t)n * n_state);
+    for (size_t i = 0; i < xs.size(); i++) xs[i] = (float)((int)((i * 7919) % 2001) - 1000) / 256.0f;
+    std::vector<uint8_t> work;
+    auto run = [&]() {
+        std::memcpy(x->data, xs.data(), xs.size() * 4);
+        if (call) std::memcpy(mask->data, mk.data(), mk.size() * 4);
+        ggml_cplan cp = ggml_graph_plan(gf, threads, nullptr);
+        if (work.size() < cp.work_size) work.resize(cp.work_size);
+        cp.work_data = work.data();
+        check(ggml_graph_compute(gf, &cp) == GGML_STATUS_SUCCESS, "graph compute failed");
+    };
+    run();
+    const double c0 = cpu_seconds(), w0 = now_ms();
+    long reps = 0;
+    while (reps < 20 || now_ms() - w0 < 1000.0) { run(); reps++; }
+    const double w1 = now_ms(), c1 = cpu_seconds();
+    uint64_t h = digest32((const float *)q->data, (size_t)n * n_state);
+    for (ggml_tensor * c : {kc, vc})
+        for (int il = 0; il < n_layer; il++)
+            for (int r = 0; r < n; r++) h = (h ^ digest16((const uint16_t *)c->data + ((size_t)il * size + head + r) * n_state, n_state)) * 0x100000001b3ULL;
+    if (call) for (int j = 0; j < n; j++) h = (h ^ mask_digest((const uint8_t *)mask16->data + (size_t)j * n_kv * 2, n_kv, 2)) * 0x100000001b3ULL;
+    std::printf("bench-selfkv-reference threads %d n_tokens %d what %s wall_us_per_call %.3f cpu_us_per_call %.3f reps %ld work_kb %zu out_digest %016llx\n",
+                threads, n, what, (w1 - w0) * 1000.0 / reps, (c1 - c0) * 1e6 / reps, reps, (work.size() + 1023) / 1024, (unsigned long long)h);
+    ggml_free(g);
+    whisper_free(ctx);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    if (argc >= 4 && std::strcmp(argv[1], "--selfkv") == 0) return record_selfkv(argv[2], argv[3], argc - 4, argv + 4);
+    if (argc == 6 && std::strcmp(argv[1], "--bench-selfkv") == 0) return bench_selfkv(argv[2], std::atoi(argv[3]), std::atoi(argv[4]), argv[5]);
     if (argc >= 4 && std::strcmp(argv[1], "--decin") == 0) return record_decin(argv[2], argv[3], argc - 4, argv + 4);
     if (argc == 5 && std::strcmp(argv[1], "--bench-decin") == 0) return bench_decin(argv[2], std::atoi(argv[3]), std::atoi(argv[4]));
     if (argc >= 4 && std::strcmp(argv[1], "--cross") == 0) return record_cross(argv[2], argv[3], argc - 4, argv + 4);
