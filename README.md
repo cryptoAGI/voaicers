@@ -117,3 +117,11 @@ upstream/PIN                         the reference (commit, ggml version, build,
 ```
 
 Licence: MIT OR Apache-2.0. whisper.cpp (MIT) is used only as the oracle and is not redistributed.
+
+## Where it lives
+
+- **This repository:** [cryptoAGI/voaicers](https://github.com/cryptoAGI/voaicers) — voaice.rs, the speech-to-text half of voaice in Rust.
+- **[cryptoAGI/voaice](https://github.com/cryptoAGI/voaice):** what a voice is, written down — `.voaice` identities, the 18-decimal vprint, the pronunciation table every engine speaks through.
+- **[cryptoAGI/bankml](https://github.com/cryptoAGI/bankml):** the method this follows — a zero-dependency Rust runtime bit-exact against llama.cpp's compiled library, then faster. Its [thesis](https://github.com/cryptoAGI/bankml/blob/main/docs/thesis.md) is the argument for exactness first.
+- **[PYTHAI/voaice](https://huggingface.co/PYTHAI/voaice) on Hugging Face:** the voice library — 70 open-licensed Piper voices, for anyone to use.
+- **The reference:** [ggml-org/whisper.cpp](https://github.com/ggml-org/whisper.cpp) (MIT), pinned in [`upstream/PIN`](upstream/PIN) at the commit mindX production runs. voaice.rs reproduces its compiled output; credit for the model and its design belongs to OpenAI Whisper and to whisper.cpp's authors.
