@@ -14,7 +14,7 @@ Built the way [bankml](https://github.com/cryptoAGI/bankml) was built against ll
   <img src="https://img.shields.io/badge/dependencies-0-56D364?style=flat-square" alt="zero dependencies">
   <img src="https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-2563EB?style=flat-square" alt="MIT OR Apache-2.0">
   <img src="https://img.shields.io/badge/log--mel-bit--exact%20vs%20whisper.cpp%20(ggml%200.16.0)-39D3C7?style=flat-square" alt="log-mel bit-exact">
-  <img src="https://img.shields.io/badge/status-0.0.6%20%C2%B7%20loader%2C%20front%20end%2C%20f16%20%2B%20GELU%2C%20resampler%2C%20encoder%20conv1%20bit--exact%2C%20Ogg%2FOpus%20reader%3B%20no%20transcript%20yet-F59E0B?style=flat-square" alt="status">
+  <img src="https://img.shields.io/badge/status-0.0.7%20%C2%B7%20loader%2C%20front%20end%2C%20f16%20%2B%20GELU%2C%20resampler%2C%20encoder%20conv1%20%2B%20conv2%20%2B%20positions%20bit--exact%2C%20Ogg%2FOpus%20reader%3B%20no%20transcript%20yet-F59E0B?style=flat-square" alt="status">
   <a href="https://github.com/cryptoAGI/voaicers/releases/latest"><img src="https://img.shields.io/github/v/release/cryptoAGI/voaicers?style=flat-square&label=release&color=0ECB81" alt="latest release"></a>
 </p>
 
@@ -27,12 +27,13 @@ mindX's production speech-to-text is whisper.cpp built against ggml 0.16.0, runn
 *a result counts only when an oracle has checked it, and the oracle is the reference's own compiled library run on
 the same input, compared by bit pattern.* Speed is measured only after that.
 
-**0.0.6 does not transcribe yet.** It is the first three stages, the front end optimized (0.0.2) with its bits unchanged,
+**0.0.7 does not transcribe yet.** It is the first three stages, the front end optimized (0.0.2) with its bits unchanged,
 the first two encoder kernels (0.0.3): the f32 ↔ f16 conversions and GELU, (0.0.4) the streaming Ogg/Opus reader
 that will bring `.opus` input to them without a WAV on disk, (0.0.5) the audio reader whisper-cli itself runs:
 any WAV to 16 kHz mono f32 through miniaudio's conversions, mixdown and resampler, bit for bit, and (0.0.6) the
 encoder's first layer: ggml's f16 dot product in its AVX float order and conv1 with its bias and GELU, checked node by
-node against the reference's own scheduler.
+node against the reference's own scheduler, and (0.0.7) the rest of the conv stage: conv2, its bias and GELU
+(`embd_conv`), and the positional embedding the encoder adds first — voaice now computes the encoder's input bit for bit.
 
 | stage | what | oracle result (this machine, 2026-10-07) |
 |---|---|---|
@@ -44,6 +45,7 @@ node against the reference's own scheduler.
 | 4 | the streaming Ogg/Opus reader (0.0.4): pages, Ogg's CRC-32, lacing and continuation, `OpusHead` / `OpusTags`, granules and pre-skip → the exact duration, one page in memory | against **opus-tools 0.2, libopus 1.4 and libogg 1.3.5 on production**: **35 / 35** files on 18 checks each — the duration equals **opusdec's sample count** on every file, every page's granule and every packet's samples equal libogg's and libopus's; **21 / 21** corrupted files refused by name; pre-skip added, no end trim, and zlib's CRC (0 / 427 pages) all caught |
 | 5 | any WAV → 16 kHz mono f32 as whisper-cli reads it (0.0.5): dr_wav's u8 / s16 / s24 / s32 / f32 conversions, miniaudio's mono average, its linear resampler with the order-4 low-pass, the length rule and its zero tail — streamed, any chunking | against **whisper-cli's own `libcommon.a`** (`read_audio_data`, miniaudio 0.11.24): **55 / 55** files, **1,955,875** samples bit-identical across 8–48 kHz, 1 / 2 / 6 channels, every format; random chunking identical; low-pass order 2 / 6, mixdown `L + R` / `L`, and the length without its extra frame all caught |
 | 6 | `ggml_vec_dot_f16` and encoder conv1 + bias + GELU (0.0.6): im2col to f16, every output one f16 dot in the AVX build's order (4 × 8 lanes, pairwise reduce, a double tail) — then faster, no im2col held | the conv graph's **own nodes**, read through ggml's scheduler eval callback: im2col **5,760,000 / 5,760,000** f16 values; the product, + bias and GELU **0 differ** on all 8 inputs at 1 and 4 threads (55,296,000 values); the kernel **1,436 / 1,436** dots on real rows of all 70 f16 tensors; one accumulator, a tail in f32, a sequential reduce, im2col without its f16 rounding — all caught |
+| 7 | encoder conv2 + bias + GELU (`embd_conv`) and the positional embedding (0.0.7): stride-2 im2col to f16, 1,152-long f16 dots, then `e_pe + cont(transpose(·))` — the encoder's input; then faster: no im2col held, a 4 × 3 register block over a permuted column layout, conv1 → conv2 through an f16 buffer, the transpose and the add fused into the epilogue | both schedulers' **own nodes** (the conv graph's, and the encoder graph's first four through its eval callback): im2col **13,824,000 / 13,824,000** f16 values; the product, + bias and GELU **0 differ** at 1 and 4 threads (27,648,000 values); CONT **0 differ**; the positional ADD **0 differ** from voaice's own mel at 1, 2 and 4 threads (27,648,000); stride 1, one accumulator, positions before the transpose, positions a frame late, GELU before the bias — all caught; im2col in f32 caught on the 4 inputs where it can be (below) |
 
 Efficiency, measured only after the oracles passed in the same gate run (0.0.2, this laptop, 4 CPUs at load ≈ 7.6,
 so ±20 % is noise): the mel is **6.1× faster than 0.0.1** (rebuilt from its tag in the same run) and **6.8× faster
@@ -73,6 +75,13 @@ against the reference's 86–89** at one thread (about **4×**; 3–4× at two a
 in **4,508 KiB of heap against the 14,907 KiB** the reference's graph holds — no im2col is kept, the add and GELU
 are applied in place. The gate's own run of that step was noisy (2.6× at one thread); the CHANGELOG lists it with
 three reruns. Record: [`testing/results/0.0.6.txt`](testing/results/0.0.6.txt).
+
+0.0.7, after its oracles (same laptop, load 4.7–7.8 from interactive use, so the ratios swing): conv2 + bias + GELU
+takes **45–63 ms against the reference's 230–292** at one thread (**4.2–6.3×**; 37 against 191–213 at a lighter load),
+and the whole conv stage — mel to the encoder's input — **97–119 ms against 383–423** (3.4–4.0×), in **4,693 KiB of heap
+against the 29,532 KiB** the reference's graph holds (no im2col; conv1's output kept as f16, which is exact because
+conv2 reads only its f16 conversion). Record: [`testing/results/0.0.7.txt`](testing/results/0.0.7.txt); the CHANGELOG
+lists the gate run with three reruns.
 
 **A determinism note on the reference itself:** whisper.cpp's transcript depends on its thread count. At 1 thread it
 is identical run to run; at 4 threads the token ids and text stay the same but every token's probability differs in
@@ -154,6 +163,8 @@ target/release/voaice resample in.wav [out.f32]   # (0.0.5) any WAV -> 16 kHz mo
 target/release/voaice bench-resample in.wav       # the whole read: wall, CPU per call, heap, RSS
 target/release/voaice conv1 models/ggml-tiny.en.bin in.wav [out.f32] [--threads N]   # (0.0.6) conv1 + bias + GELU, 384 x 3000
 target/release/voaice bench-conv1 models/ggml-tiny.en.bin in.wav conv1|gelu [--threads N]   # its wall, CPU, heap, RSS
+target/release/voaice conv models/ggml-tiny.en.bin in.wav [out.f32] [--threads N]   # (0.0.7) mel -> conv1 -> conv2 -> + positions, 1500 x 384
+target/release/voaice bench-conv models/ggml-tiny.en.bin in.wav conv2|stage [--threads N]   # conv2 (+ bias + GELU), or the whole stage
 ```
 
 Input: `voaice mel` still takes 16-bit PCM, mono, 16 kHz WAV; `voaice resample` (0.0.5) takes any PCM 8/16/24/32-bit
@@ -173,6 +184,8 @@ testing/make_resample_audio.py       (0.0.5) the 55-file resampler corpus, pinne
 testing/resample/NOTES.md            (0.0.5) what read_audio_data does, read from the pinned source line by line
 tests/conv1.rs                       (0.0.6) conv1 and ggml_vec_dot_f16 against the conv graph's nodes (#[ignore])
 testing/conv1/NOTES.md               (0.0.6) the order decision, the disassembly, the oracle's findings as they came
+tests/conv2.rs                       (0.0.7) conv2, embd_conv and the positional add against both schedulers' nodes (#[ignore])
+testing/conv2/NOTES.md               (0.0.7) the graph read from the pin, the oracle's findings, the speed steps
 tests/opus.rs                        (0.0.4) the Ogg/Opus oracle comparisons, offline against the recorded reference
 testing/make_audio.py                the 8 test WAVs, pinned in testing/pins/audio.sha256
 testing/opus/                        oracle.sh record|check, reference.py, mutate.py; 35 pinned .opus files + answers
@@ -218,12 +231,15 @@ go up 0.0.1 at a time, with a milestone at every tenth step. The order of work:
 - [x] **0.0.6:** `ggml_vec_dot_f16` (brought forward: conv1 is nothing but that dot) and encoder conv1 + bias + GELU,
   bit-exact against the conv graph's own nodes through the scheduler's eval callback, at 1 and 4 threads; then
   faster with no im2col held ([record](testing/results/0.0.6.txt)).
-- [ ] **0.0.7–0.0.9:** conv2 + positions, layer norm, the matrix products on activations (f32 → f16 rows, then the
-  0.0.6 dot) — one per step, each bit-exact ([plan](docs/ROADMAP.md)).
+- [x] **0.0.7:** encoder conv2 + bias + GELU (`embd_conv`) and the positional embedding — the encoder's input,
+  bit-exact against both schedulers' nodes at 1, 2 and 4 threads; then faster, with an f16 buffer between the two
+  convolutions ([record](testing/results/0.0.7.txt)).
+- [ ] **0.0.8–0.0.9:** layer norm, the matrix products on activations (f32 → f16 rows, then the 0.0.6 dot) — one per
+  step, each bit-exact ([plan](docs/ROADMAP.md)).
 - [ ] **Stage 0b:** pin `ggml-base.en.bin` (production's default model). Record the VPS's ISA so the oracle
   reproduces production's native ggml-cpu kernels (Zen 3, AVX2 + FMA).
 - [ ] **Stage 3, the encoder (0.1.0):** ~~the GELU f16 table, f32↔f16 conversion~~ (0.0.3), ~~`vec_dot_f16` in AVX2
-  lane order, conv1~~ (0.0.6), conv2 through im2col, layer norm, flash attention, four blocks, then `embd_enc` bit-exact. Each intermediate is observed through ggml's scheduler callback.
+  lane order, conv1~~ (0.0.6), ~~conv2 through im2col, the positions~~ (0.0.7), layer norm, flash attention, four blocks, then `embd_enc` bit-exact. Each intermediate is observed through ggml's scheduler callback.
 - [ ] **Stage 4, the decoder (0.2.0):** cross-attention, the f16 KV cache, and all 51,864 logits bit-exact per
   step through `whisper_get_logits_from_state`.
 - [ ] **Stage 5, the transcript (0.3.0):** the greedy loop, logit filters, timestamp rules, 30-second seek.

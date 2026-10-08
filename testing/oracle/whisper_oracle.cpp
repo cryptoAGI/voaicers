@@ -10,6 +10,8 @@
 //   whisper_oracle --bench-f16 <what>             (0.0.3) one measurement of them, see bench_f16
 //   whisper_oracle --conv1 <model.bin> <outdir> <wav ...>   (0.0.6) the conv graph's nodes and ggml_vec_dot_f16, see record_conv1
 //   whisper_oracle --bench-conv1 <model.bin> <wav> <threads> conv1|gelu   (0.0.6) conv1's time, see bench_conv1
+//   whisper_oracle --conv2 <model.bin> <outdir> <wav ...>   (0.0.7) conv2's nodes and the positional add, see record_conv2
+//   whisper_oracle --bench-conv2 <model.bin> <wav> <threads> conv2|stage   (0.0.7) their time, see bench_conv2
 //
 // --bench-mel measures the reference's whisper_pcm_to_mel_with_state the way `voaice bench-mel` measures voaice's,
 // in a fresh process each: the heap bytes live at the first call's peak (operator new counted, below), peak RSS of
@@ -753,7 +755,255 @@ static int bench_conv1(const char * model_path, const char * wav, int threads, c
     return 0;
 }
 
+// ---- 0.0.7: encoder conv2 and the positional embedding, observed in the shipped library ----------------------------
+// --conv2 <model.bin> <outdir> <wav ...> writes, per wav, <outdir>/<stem>/:
+//   nodes.tsv        every node of the conv graph, then the encoder graph's nodes up to its first ADD (the eval
+//                    callback stops observing there: the rest of the encoder runs unobserved)
+//   conv1_gelu.f32   conv1's GELU node (conv2's input: f32, ne0 = 3000 frames, ne1 = 384)
+//   im2col2.u16      the second IM2COL node (conv2's: f16 [1152, 1500], row t = the 1152 inputs of output frame t)
+//   conv2.f32        the MUL_MAT after it (f32, ne0 = 1500 frames, ne1 = 384 channels), conv2_bias.f32 the ADD,
+//   conv2_gelu.f32   the GELU (the graph's last node: embd_conv)
+//   cont.f32         the encoder graph's CONT of TRANSPOSE(embd_conv) (f32, ne0 = 384 channels, ne1 = 1500 frames)
+//   pe_add.f32       the ADD after it: e_pe view + cont, the encoder's input (inpL)
+//   conv2.tsv        threads compared (1 and 4: every node above bit-identical?), the scheduler's last conv node ==
+//                    whisper_state::embd_conv read after an unobserved run, embd_enc (the whole encoder's output)
+//                    with the observation vs without, the standalone graphs (what --bench-conv2 times) vs the nodes
+struct conv2_capture {
+    std::vector<std::string> lines;
+    std::vector<uint8_t> gelu1, im2col, mm, add, gelu, cont, pe_add;
+    int stage = 0;          // conv graph: 0 want GELU (conv1's), 1 IM2COL, 2 MUL_MAT, 3 ADD, 4 GELU, 5 done
+    int enc = 0;            // encoder graph: 0 want CONT, 1 ADD, 2 done (stop observing)
+    std::vector<uint8_t> last;
+};
+static bool is_gelu(const ggml_tensor * t) { return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_GELU; }
+static void cap_line(std::vector<std::string> & lines, const char * graph, ggml_tensor * t) {
+    char line[256];
+    std::snprintf(line, sizeof line, "%s\t%zu\t%s\t%s\t%s\t%lld\t%lld\t%lld\t%lld", graph, lines.size(), t->name, ggml_op_desc(t),
+                  ggml_type_name(t->type), (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3]);
+    lines.push_back(line);
+}
+static bool conv2_cb(ggml_tensor * t, bool ask, void * ud) {
+    auto & c = *static_cast<conv2_capture *>(ud);
+    if (ask) return true;
+    cap_line(c.lines, "conv", t);
+    std::vector<uint8_t> b(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, b.data(), 0, b.size());
+    std::vector<uint8_t> * dst = nullptr;
+    if (c.stage == 0 && is_gelu(t)) dst = &c.gelu1;
+    else if (c.stage == 1 && t->op == GGML_OP_IM2COL) dst = &c.im2col;
+    else if (c.stage == 2 && t->op == GGML_OP_MUL_MAT) dst = &c.mm;
+    else if (c.stage == 3 && t->op == GGML_OP_ADD) dst = &c.add;
+    else if (c.stage == 4 && is_gelu(t)) dst = &c.gelu;
+    if (dst) { *dst = b; c.stage++; }
+    c.last.swap(b);
+    return true;
+}
+static bool enc_cb(ggml_tensor * t, bool ask, void * ud) {
+    auto & c = *static_cast<conv2_capture *>(ud);
+    if (ask) return c.enc < 2;                    // observe up to the first ADD, then let the encoder run whole
+    if (c.enc >= 2) return true;
+    cap_line(c.lines, "encode", t);
+    if ((c.enc == 0 && t->op == GGML_OP_CONT) || (c.enc == 1 && t->op == GGML_OP_ADD)) {
+        std::vector<uint8_t> & d = c.enc == 0 ? c.cont : c.pe_add;
+        d.resize(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, d.data(), 0, d.size());
+        c.enc++;
+    }
+    return true;
+}
+
+// conv2, or the whole conv stage, as a standalone ggml graph on the shipped CPU backend (what --bench-conv2 times):
+//   conv2: ggml_conv_1d_ph(w2, x, 2, 1) + b2, GELU, on a copy of conv1's GELU output x [3000, 384]
+//   stage: mel [3000, 80] -> conv1 + b1, GELU -> conv2 + b2, GELU -> add(e_pe view, cont(transpose(.))), as
+//          whisper_build_graph_conv then whisper_build_graph_encoder's first op
+struct conv2_graph {
+    ggml_context * ctx; ggml_tensor * in; ggml_tensor * out; ggml_tensor * conv; ggml_cgraph * gf;
+    static ggml_tensor * copy(ggml_context * ctx, ggml_tensor * s) {
+        ggml_tensor * t = ggml_new_tensor(ctx, s->type, ggml_n_dims(s), s->ne);
+        ggml_backend_tensor_get(s, t->data, 0, ggml_nbytes(t));
+        return t;
+    }
+    conv2_graph(std::map<std::string, ggml_tensor *> & m, int n_frames, int n_mel, bool stage) {
+        ggml_init_params p = { (size_t)96 << 20, nullptr, false };
+        ctx = ggml_init(p);
+        check(ctx != nullptr, "ggml_init failed");
+        ggml_tensor * w2 = copy(ctx, m.at("encoder.conv2.weight")), * b2 = copy(ctx, m.at("encoder.conv2.bias"));
+        ggml_tensor * cur;
+        if (stage) {
+            ggml_tensor * w1 = copy(ctx, m.at("encoder.conv1.weight")), * b1 = copy(ctx, m.at("encoder.conv1.bias"));
+            in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_frames, n_mel);
+            cur = ggml_gelu(ctx, ggml_add(ctx, ggml_conv_1d_ph(ctx, w1, in, 1, 1), b1));
+        } else {
+            in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_frames, w2->ne[1]);
+            cur = in;
+        }
+        conv = ggml_gelu(ctx, ggml_add(ctx, ggml_conv_1d_ph(ctx, w2, cur, 2, 1), b2));
+        out = conv;
+        if (stage) {
+            ggml_tensor * pe = copy(ctx, m.at("encoder.positional_embedding"));
+            const int n_ctx = (int)conv->ne[0];
+            ggml_tensor * e_pe = ggml_view_2d(ctx, pe, pe->ne[0], n_ctx, pe->ne[0] * ggml_element_size(pe), 0);
+            out = ggml_add(ctx, e_pe, ggml_cont(ctx, ggml_transpose(ctx, conv)));
+        }
+        gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, out);
+    }
+    void set(const std::vector<float> & x, int n_len) {   // [rows][n_len] into [rows][ne0], zero past n_len (whisper's slice)
+        float * d = (float *)in->data;
+        const int64_t nf = in->ne[0];
+        std::memset(d, 0, ggml_nbytes(in));
+        for (int64_t j = 0; j < in->ne[1]; j++)
+            for (int64_t i = 0; i < std::min<int64_t>(nf, n_len); i++) d[j*nf + i] = x[j*n_len + i];
+    }
+    void run(int threads) { check(ggml_graph_compute_with_ctx(ctx, gf, threads) == GGML_STATUS_SUCCESS, "graph compute failed"); }
+    ~conv2_graph() { ggml_free(ctx); }
+};
+static bool same(const ggml_tensor * t, const std::vector<uint8_t> & want) {
+    return ggml_nbytes(t) == want.size() && std::memcmp(t->data, want.data(), want.size()) == 0;
+}
+
+static int record_conv2(const char * model_path, const std::string & outdir, int nwav, char ** wavs) {
+    if (mkdir(outdir.c_str(), 0755) != 0 && errno != EEXIST) die("cannot create outdir (its parent must exist)");
+    whisper_context * ctx = load_quiet(model_path);
+    auto & tensors = model_tensors(ctx);
+    const int n_ctx = whisper_model_n_audio_ctx(ctx), n_mel = whisper_model_n_mels(ctx), n_state = whisper_model_n_audio_state(ctx);
+    for (int a = 0; a < nwav; a++) {
+        std::string path = wavs[a];
+        std::string stem = path.substr(path.find_last_of('/') + 1);
+        stem = stem.substr(0, stem.find_last_of('.'));
+        const std::string dir = outdir + "/" + stem;
+        mkdir(dir.c_str(), 0755);
+        std::vector<float> pcm = read_wav(path.c_str());
+        conv2_capture caps[2];
+        std::vector<uint8_t> unobs_conv, unobs_enc, obs_enc;
+        std::vector<float> mel_copy;
+        int n_len = 0;
+        const int threads[2] = {1, 4};
+        for (int k = 0; k < 3; k++) {              // k = 0, 1: observed at 1 and 4 threads; k = 2: not observed, 1 thread
+            whisper_state * st = whisper_init_state(ctx);
+            check(st != nullptr, "whisper_init_state failed");
+            check(whisper_pcm_to_mel_with_state(ctx, st, pcm.data(), (int)pcm.size(), 1) == 0, "pcm_to_mel failed");
+            if (k == 0) {
+                auto & mel = *reinterpret_cast<mel_mirror *>((char *)st + VOAICE_OFF_STATE_MEL);
+                check(mel.n_len_org == whisper_n_len_from_state(st), "layout check failed: mel.n_len_org");
+                mel_copy = mel.data; n_len = mel.n_len;
+            }
+            ggml_backend_sched_t sc = state_sched(st, VOAICE_OFF_STATE_SCHED_CONV);
+            ggml_backend_sched_t se = state_sched(st, VOAICE_OFF_STATE_SCHED_ENCODE);
+            if (k < 2) {
+                ggml_backend_sched_set_eval_callback(sc, conv2_cb, &caps[k]);
+                ggml_backend_sched_set_eval_callback(se, enc_cb, &caps[k]);
+            }
+            check(whisper_encode_with_state(ctx, st, 0, k < 2 ? threads[k] : 1) == 0, "whisper_encode failed");
+            if (k < 2) check(caps[k].stage == 5 && caps[k].enc == 2, "the graphs did not show conv2's IM2COL, MUL_MAT, ADD, GELU, then CONT, ADD");
+            ggml_tensor * ec = *reinterpret_cast<ggml_tensor **>((char *)st + VOAICE_OFF_STATE_EMBD_CONV);
+            ggml_tensor * ee = *reinterpret_cast<ggml_tensor **>((char *)st + VOAICE_OFF_STATE_EMBD_ENC);
+            check(ec != nullptr && std::strcmp(ec->name, "embd_conv") == 0, "layout check failed: embd_conv");
+            check(ee != nullptr && ee->type == GGML_TYPE_F32 && ee->ne[0] == n_state, "layout check failed: embd_enc");
+            std::vector<uint8_t> enc(ggml_nbytes(ee));
+            ggml_backend_tensor_get(ee, enc.data(), 0, enc.size());
+            if (k == 0) obs_enc = enc;
+            if (k == 2) {                          // read after the encoder ran: both are graph outputs, kept
+                unobs_enc = enc;
+                unobs_conv.resize(ggml_nbytes(ec));
+                ggml_backend_tensor_get(ec, unobs_conv.data(), 0, unobs_conv.size());
+            }
+            whisper_free_state(st);
+        }
+        conv2_capture & c = caps[0];
+        check(c.im2col.size() == (size_t)3 * n_state * n_ctx * 2 && c.mm.size() == (size_t)n_ctx * n_state * 4 &&
+              c.pe_add.size() == (size_t)n_ctx * n_state * 4, "unexpected conv2 shapes");
+        write_bin(dir + "/conv1_gelu.f32", (const float *)c.gelu1.data(), c.gelu1.size() / 4);
+        write_bin(dir + "/im2col2.u16", (const uint16_t *)c.im2col.data(), c.im2col.size() / 2);
+        write_bin(dir + "/conv2.f32", (const float *)c.mm.data(), c.mm.size() / 4);
+        write_bin(dir + "/conv2_bias.f32", (const float *)c.add.data(), c.add.size() / 4);
+        write_bin(dir + "/conv2_gelu.f32", (const float *)c.gelu.data(), c.gelu.size() / 4);
+        write_bin(dir + "/cont.f32", (const float *)c.cont.data(), c.cont.size() / 4);
+        write_bin(dir + "/pe_add.f32", (const float *)c.pe_add.data(), c.pe_add.size() / 4);
+        FILE * nf = std::fopen((dir + "/nodes.tsv").c_str(), "w");
+        for (auto & l : c.lines) std::fprintf(nf, "%s\n", l.c_str());
+        std::fclose(nf);
+        const conv2_capture & d = caps[1];
+        const bool thr = c.gelu1 == d.gelu1 && c.im2col == d.im2col && c.mm == d.mm && c.add == d.add && c.gelu == d.gelu &&
+                         c.cont == d.cont && c.pe_add == d.pe_add;
+        const bool last = c.gelu == c.last && unobs_conv == c.last;
+        const bool enc_eq = obs_enc == unobs_enc;
+        bool alone_conv2 = true, alone_stage = true;
+        {
+            conv2_graph g(tensors, 2 * n_ctx, n_mel, false);
+            std::vector<float> x(c.gelu1.size() / 4);
+            std::memcpy(x.data(), c.gelu1.data(), c.gelu1.size());
+            g.set(x, 2 * n_ctx);
+            for (int th : {1, 4}) { g.run(th); alone_conv2 = alone_conv2 && same(g.out, c.gelu); }
+        }
+        {
+            conv2_graph g(tensors, 2 * n_ctx, n_mel, true);
+            g.set(mel_copy, n_len);
+            for (int th : {1, 4}) { g.run(th); alone_stage = alone_stage && same(g.conv, c.gelu) && same(g.out, c.pe_add); }
+        }
+        FILE * m = std::fopen((dir + "/conv2.tsv").c_str(), "w");
+        std::fprintf(m, "n_len\t%d\noffset\t0\nn_ctx\t%d\nnodes\t%zu\nthreads_1_vs_4_bit_identical\t%s\n"
+                        "last_conv_node_eq_embd_conv_unobserved\t%s\nembd_enc_observed_eq_unobserved\t%s\n"
+                        "standalone_conv2_eq_sched\t%s\nstandalone_stage_eq_sched\t%s\n", n_len, n_ctx, c.lines.size(),
+                     thr ? "yes" : "NO", last ? "yes" : "NO", enc_eq ? "yes" : "NO", alone_conv2 ? "yes" : "NO", alone_stage ? "yes" : "NO");
+        std::fclose(m);
+        std::fprintf(stderr, "whisper_oracle: %s: %zu nodes observed; conv2 im2col + mul_mat + add + gelu, cont + pe add recorded; 1 vs 4 "
+                             "threads identical: %s; embd_conv = last node, unobserved: %s; embd_enc observed = unobserved: %s; "
+                             "standalone conv2 / stage = scheduler: %s / %s\n", stem.c_str(), c.lines.size(), thr ? "yes" : "NO",
+                     last ? "yes" : "NO", enc_eq ? "yes" : "NO", alone_conv2 ? "yes" : "NO", alone_stage ? "yes" : "NO");
+    }
+    whisper_free(ctx);
+    return 0;
+}
+
+// --bench-conv2 <model.bin> <wav> <threads> <what>: what = conv2 (conv1's GELU output -> conv2 + bias + GELU: embd_conv)
+// or stage (the mel -> conv1 -> conv2 -> + positions: the encoder's input), through the standalone graph above, in a
+// fresh process. wall = best of 10, cpu = CPU ms per compute over >= 1 s, mem = the bytes of the graph's own tensors
+// (everything but the copied weights, the embedding and the input), rss = VmHWM delta of the first compute.
+static int bench_conv2(const char * model_path, const char * wav, int threads, const char * what) {
+    whisper_context * ctx = load_quiet(model_path);
+    auto & tensors = model_tensors(ctx);
+    whisper_state * st = whisper_init_state(ctx);
+    std::vector<float> pcm = read_wav(wav);
+    check(whisper_pcm_to_mel_with_state(ctx, st, pcm.data(), (int)pcm.size(), 1) == 0, "pcm_to_mel failed");
+    auto & mel = *reinterpret_cast<mel_mirror *>((char *)st + VOAICE_OFF_STATE_MEL);
+    const bool stage = std::strcmp(what, "stage") == 0;
+    check(stage || std::strcmp(what, "conv2") == 0, "--bench-conv2 ... conv2|stage");
+    const int n_frames = 2 * whisper_model_n_audio_ctx(ctx), n_mel = whisper_model_n_mels(ctx);
+    std::vector<float> x;
+    if (!stage) {                                  // conv2's input: conv1's GELU, computed by the shipped backend
+        conv1_graph g1(tensors.at("encoder.conv1.weight"), tensors.at("encoder.conv1.bias"), n_frames, n_mel, true);
+        g1.set_mel(mel.data, mel.n_len);
+        g1.run(threads);
+        x.assign((const float *)g1.out->data, (const float *)g1.out->data + ggml_nelements(g1.out));
+    }
+    conv2_graph g(tensors, n_frames, n_mel, stage);
+    if (stage) g.set(mel.data, mel.n_len); else g.set(x, n_frames);
+    size_t op_bytes = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(g.gf); i++) {
+        ggml_tensor * t = ggml_graph_node(g.gf, i);
+        if (t->view_src == nullptr) op_bytes += ggml_nbytes(t);
+    }
+    const long before = status_kb("VmRSS:");
+    const bool reset = reset_peak_rss();
+    g.run(threads);
+    const long peak = reset ? status_kb("VmHWM:") : -1;
+    double best = 1e30;
+    for (int r = 0; r < 10; r++) { const double t = now_ms(); g.run(threads); best = std::min(best, now_ms() - t); }
+    const double c0 = cpu_seconds(), w0 = now_ms();
+    int reps = 0;
+    while (reps < 10 || now_ms() - w0 < 1000.0) { g.run(threads); reps++; }
+    const double c1 = cpu_seconds();
+    std::printf("bench-conv2-reference what %s threads %d wall_best_ms %.3f cpu_ms_per_call %.3f cpu_reps %d op_mem_kb %zu rss_peak_delta_kb %ld\n",
+                what, threads, best, (c1 - c0) * 1000.0 / reps, reps, (op_bytes + 1023) / 1024, peak >= 0 ? peak - before : -1);
+    whisper_free_state(st);
+    whisper_free(ctx);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    if (argc >= 4 && std::strcmp(argv[1], "--conv2") == 0) return record_conv2(argv[2], argv[3], argc - 4, argv + 4);
+    if (argc == 6 && std::strcmp(argv[1], "--bench-conv2") == 0) return bench_conv2(argv[2], argv[3], std::atoi(argv[4]), argv[5]);
     if (argc >= 4 && std::strcmp(argv[1], "--conv1") == 0) return record_conv1(argv[2], argv[3], argc - 4, argv + 4);
     if (argc == 6 && std::strcmp(argv[1], "--bench-conv1") == 0) return bench_conv1(argv[2], argv[3], std::atoi(argv[4]), argv[5]);
     if (argc == 3 && std::strcmp(argv[1], "--f16") == 0) return record_f16(argv[2]);

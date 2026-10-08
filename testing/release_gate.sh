@@ -30,6 +30,14 @@
 #   8. (0.0.6) its efficiency, only after 4d passed: conv1, and conv1 + bias + GELU, each side in a fresh process
 #      (`voaice bench-conv1`, `whisper_oracle --bench-conv1`: the same ops as a ggml graph on the shipped CPU backend,
 #      which the record shows equal to the scheduler's nodes), at 1, 2 and nproc threads
+#   4e. (0.0.7) encoder conv2 and the positional embedding: the conv graph's second IM2COL, MUL_MAT, ADD and GELU
+#      (embd_conv) and the encoder graph's CONT(TRANSPOSE) and ADD(e_pe, ·), read through both schedulers' eval callbacks
+#      (`whisper_oracle --conv2`), compared bit for bit from voaice's own mel (tests/conv2.rs); discriminators (stride 1,
+#      one accumulator, im2col in f32 where an input can tell, positions before the transpose / one frame late, GELU
+#      before the bias)
+#   9. (0.0.7) its efficiency, only after 4e passed: conv2 (+ bias + GELU) from conv1's output, and the whole conv stage
+#      mel -> encoder input, each side in a fresh process (`voaice bench-conv`, `whisper_oracle --bench-conv2`: the same
+#      ops as a ggml graph, which the record shows equal to the schedulers' nodes), at 1, 2 and nproc threads
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
@@ -82,6 +90,10 @@ lib=upstream/whisper.cpp/build/bin/libggml-cpu.so
 a=$(nm -D --defined-only "$lib" | awk '$3=="ggml_vec_dot_f16"{print "0x"$1}')
 dis=$(objdump -d --no-show-raw-insn "$lib" --start-address="$a" --stop-address=$(printf '0x%x' $((a + 0x100))) | sed '/ret/q')
 log "libggml-cpu's ggml_vec_dot_f16 ($a): $(echo "$dis" | grep -c vcvtph2ps) vcvtph2ps, $(echo "$dis" | grep -c 'vfmadd231ps.*ymm') ymm vfmadd231ps, $(echo "$dis" | grep -c vhaddps) vhaddps, $(echo "$dis" | grep -c vaddsd) vaddsd (the double tail); GGML_LLAMAFILE $(awk -F= '/^GGML_LLAMAFILE:/{print $2}' upstream/whisper.cpp/build/CMakeCache.txt) in the build"
+rm -rf .oracle/conv2
+t0=$(date +%s)
+testing/oracle/bin/whisper_oracle --conv2 "$model" .oracle/conv2 .audio/*.wav 2>&1 | tee -a "$out"
+log "(the conv2 record took $(( $(date +%s) - t0 )) s: each input encoded three times, observed at 1 and 4 threads and not observed)"
 log "this CPU: $(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -xE 'avx|avx2|fma|f16c|avx512f' | paste -sd' ') (production: Zen 3, the same extensions; its library is not the one checked here)"
 
 log "## 4. voaice.rs"
@@ -127,6 +139,13 @@ cargo test --release --test conv1 -- --ignored --nocapture --test-threads=1 2>&1
   | grep -vE "^\s*(Compiling|Finished|Running)|^$|^running" > "$step" || true
 tee -a "$out" < "$step"
 grep -q "test result: ok. 5 passed" "$step" || { log "FAIL: the conv1 oracle comparisons did not all pass"; exit 1; }
+
+log "## 4e. encoder conv2 and the positional embedding (0.0.7): both schedulers' nodes through their eval callbacks"
+step=.oracle/conv2_step.log
+cargo test --release --test conv2 -- --ignored --nocapture --test-threads=1 2>&1 \
+  | grep -vE "^\s*(Compiling|Finished|Running)|^$|^running" > "$step" || true
+tee -a "$out" < "$step"
+grep -q "test result: ok. 4 passed" "$step" || { log "FAIL: the conv2 oracle comparisons did not all pass"; exit 1; }
 
 nt=$(nproc)
 log "## 5. efficiency (only now): log-mel; wall = best of 10 calls, cpu = CPU ms per call (utime+stime, all threads,"
@@ -228,6 +247,24 @@ for what in conv1 gelu; do
     v=$(target/release/voaice bench-conv1 "$model" .audio/jfk.wav "$what" --threads "$th")
     rw=$(echo "$r" | field wall_best_ms); vw=$(echo "$v" | field wall_best_ms)
     log "$(printf '%-12s %3s | %8.3f %8.3f %5.2fx | %8s %8s | %7s %7s | %6s %6s' "$( [ "$what" = gelu ] && echo conv1+b+gelu || echo conv1)" "$th" \
+      "$rw" "$vw" "$(awk -v a="$rw" -v b="$vw" 'BEGIN{print a/b}')" \
+      "$(echo "$r" | field cpu_ms_per_call)" "$(echo "$v" | field cpu_ms_per_call)" \
+      "$(echo "$r" | field op_mem_kb)" "$(echo "$v" | field heap_peak_kb)" \
+      "$(echo "$r" | field rss_peak_delta_kb)" "$(echo "$v" | field rss_peak_delta_kb)")"
+  done
+done
+log "## 9. efficiency (only now): encoder conv2 and the conv stage (0.0.7), jfk's first 30-s window. conv2 = conv1's GELU"
+log "##    output -> conv2 + bias + GELU (embd_conv); stage = the mel -> conv1 -> conv2 -> + positions (the encoder's"
+log "##    input). wall = best of 10, cpu = CPU ms per call over >= 1 s; heap: voaice = bytes live at the first call's peak"
+log "##    (its buffers allocated by that call, then reused); the reference = the bytes of the graph's own tensors (every"
+log "##    node that is not a view: im2cols, products, adds, GELUs, the cont), from ggml_nbytes; rss = VmHWM delta"
+log "$(printf '%-6s %3s | %8s %8s %6s | %8s %8s | %7s %7s | %6s %6s' op thr ref_ms vo_ms x cpu_ref cpu_vo mem_ref heap_vo rss_r rss_v)"
+for what in conv2 stage; do
+  for th in 1 2 "$nt"; do
+    r=$(testing/oracle/bin/whisper_oracle --bench-conv2 "$model" .audio/jfk.wav "$th" "$what")
+    v=$(target/release/voaice bench-conv "$model" .audio/jfk.wav "$what" --threads "$th")
+    rw=$(echo "$r" | field wall_best_ms); vw=$(echo "$v" | field wall_best_ms)
+    log "$(printf '%-6s %3s | %8.3f %8.3f %5.2fx | %8s %8s | %7s %7s | %6s %6s' "$what" "$th" \
       "$rw" "$vw" "$(awk -v a="$rw" -v b="$vw" 'BEGIN{print a/b}')" \
       "$(echo "$r" | field cpu_ms_per_call)" "$(echo "$v" | field cpu_ms_per_call)" \
       "$(echo "$r" | field op_mem_kb)" "$(echo "$v" | field heap_peak_kb)" \

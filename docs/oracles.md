@@ -96,6 +96,38 @@ and because every product of two halves is exact in f32, the FMA and a separate 
 this kernel — but production's own library was not run by this oracle. An AVX-512 host would take a 16-lane path
 with another reduction order; voaice does not model it.
 
+### Encoder conv2, `embd_conv` and the positional embedding (0.0.7) — `tests/conv2.rs` against both schedulers' nodes
+
+`whisper_build_graph_conv` ends at conv2's GELU, named `embd_conv`; the positional embedding is the **encoder
+graph's** first op: `ggml_add(view_2d(e_pe, 384, n_ctx, offset 384·4·n_ctx·iter), ggml_cont(ggml_transpose(view of
+embd_conv)))`, with `static int iter = 0` (offset 0; the view covers e_pe whole when n_ctx = 1500). The mel input is
+always 2·n_ctx frames, zero past the mel (whisper_encode_internal), so a short input takes no other path; only a
+non-zero `audio_ctx` would change n_ctx, and that is not checked. `whisper_oracle --conv2` sets one eval callback on
+`sched_conv` (every node) and one on `sched_encode` that observes up to the first ADD and then answers `ask` with
+false, so the rest of the encoder runs unobserved. It records conv1's GELU (conv2's input), conv2's IM2COL, MUL_MAT,
+ADD, GELU, the encoder graph's CONT and ADD; the 18 nodes it saw are identical on all 8 inputs (VIEW of e_pe,
+TRANSPOSE, CONT, ADD — nothing else before the first norm). Self-checks, all yes on all 8: the reference's nodes at 1
+and 4 threads identical; the conv graph's last node equals `whisper_state::embd_conv` read after an unobserved run;
+`embd_enc` (the encoder's whole output) is the same observed and not; the standalone graphs `--bench-conv2` times
+(conv2 from conv1's GELU, and the whole stage from the mel) equal the scheduler's nodes at 1 and 4 threads.
+
+| oracle | compares | result (0.0.7) |
+|---|---|---|
+| `oracle_conv2_im2col_bit_exact` | conv2's IM2COL node (f16 [1152, 1500], stride 2, pad 1) against voaice's, from voaice's own conv1 (itself checked equal to the record's conv1 GELU node) | **13,824,000 / 13,824,000** f16 values, 8 inputs |
+| `oracle_conv2_bit_exact` | the MUL_MAT node (f32 [1500, 384]), the ADD (+ bias) and the GELU (`embd_conv`), against voaice's fast path at 1 and 4 threads | **0 values differ** in any node, any input, either thread count (27,648,000 compared) |
+| `oracle_positions_bit_exact` | the encoder graph's CONT (embd_conv transposed: frame-major) and its ADD (the encoder's input), against conv2 with the positions fused into its epilogue (from voaice's conv1) and against the whole fused stage from voaice's mel (conv1 → f16 buffer → conv2 → + positions), at 1, 2 and 4 threads | CONT **0 differ**; ADD **0 differ** on both paths at every thread count, 8 inputs (27,648,000 compared) |
+| `oracle_conv2_discriminators` | on JFK: conv2 with stride 1 (its first 1,500 frames), a one-accumulator dot, positions added before the transpose (to embd_conv's channel-major layout), positions one frame late (another view offset), GELU before the bias; on every input: im2col kept in f32 | **423,936**, **544,848** of 576,000 MUL_MAT values; **575,247**, **510,942**, **575,992** of 576,000 encoder-input values — each rejected. im2col in f32: rejected on min_len (384 values differ), noise_loud (767), odd_len (384), silence (383); **not discriminable** on jfk, jfk_x3, chirp, short (below) |
+
+**What the f16 rounding of conv2's im2col can be told from.** conv2 reads conv1's GELU output, and GELU returns the
+f16 table's value (an f16, widened) for every x < 10, 0 for x ≤ −10 and x itself for x ≥ 10. So the rounding changes
+only GELU outputs ≥ 10 that f16 cannot hold: 3 such values in min_len, 2 in noise_loud and odd_len, 1 in silence, none
+in the other four inputs, where rounding and not rounding are the same function and no oracle could separate them.
+The test counts them on every input and checks the discriminator wherever the count is not zero. The same fact lets
+voaice keep conv1's output as f16 (half the bytes) with no change to any bit conv2 sees.
+
+What this holds for: the same as 0.0.6 — this laptop's native libggml-cpu on the AVX path; production's own library
+was not run. The f32 add (bias, positions) and the CONT copy are one rounding or none, so their order cannot vary.
+
 ## Efficiency — measured only after the oracles pass
 
 (0.0.4) Step 6 of the gate measures the Ogg/Opus reader after 4b passed: Ogg's CRC on 16 MiB sliced-by-8 against the
@@ -138,6 +170,12 @@ threads), voaice through `Conv1::run_into` with its output kept between calls (`
 nproc threads. The reference's memory is the bytes of the graph's own tensors (ggml_nbytes: im2col and the product,
 plus the add and GELU outputs), voaice's the heap live at the first call's peak, its output included.
 
+Step 9 (0.0.7) times conv2 (+ bias + GELU, from conv1's GELU output, which each side computes beforehand) and the whole
+conv stage (the mel → the encoder's input) the same way: the reference as the standalone graphs above
+(`whisper_oracle --bench-conv2`), voaice through `Conv2::run_into` and `ConvStage::run_into` with their buffers kept
+between calls (`voaice bench-conv`), at 1, 2 and nproc threads. The reference's memory is every non-view node of its
+graph (im2cols, products, adds, GELUs, the CONT, the positional ADD), from ggml_nbytes.
+
 ## The test inputs
 
 Eight WAVs, generated by `testing/make_audio.py` and pinned by sha256 in `testing/pins/audio.sha256`: JFK (11 s,
@@ -159,7 +197,8 @@ result (`embd_conv` is bit-identical with and without the callback, on all 8 inp
 
 - The mel is bit-identical at 1 and 4 threads (each frame is computed whole by one thread).
 - conv1's four nodes (im2col, the product, + bias, GELU) are bit-identical at 1 and 4 threads: mul_mat splits rows,
-  never a dot (each output is one `ggml_vec_dot_f16` call in one thread).
+  never a dot (each output is one `ggml_vec_dot_f16` call in one thread). So are conv2's four, the CONT and the
+  positional ADD (0.0.7).
 - `whisper_full` at 1 thread is identical run to run.
 - At 4 threads against 1, token ids and text are the same, but every token's probability differs in its bits, and
   on JFK the token timestamps move. The transcript oracle is therefore pinned at **1 thread**; a bit-exact transcript

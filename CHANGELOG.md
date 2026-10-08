@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.0.7 — 2026-10-08 — encoder conv2, `embd_conv` and the positional embedding: the encoder's input, bit-exact
+
+**conv2 (stride-2 im2col to f16, 1,152-long f16 dots), its bias and GELU (`embd_conv`), and the positional embedding
+the encoder graph adds first — bit for bit as the shipped ggml-cpu computes them inside whisper's own two schedulers,
+at 1, 2 and 4 threads, from voaice's own mel; then 3.4–6× faster (the whole stage 3.4–4×) in one sixth of the memory.** Record:
+`testing/results/0.0.7.txt`; how it was read and found: `testing/conv2/NOTES.md`.
+
+### The graph, read from the pin
+- `whisper_build_graph_conv` ends at conv2's GELU, named **`embd_conv`** ([1500, 384], ne0 = frames). The positional
+  embedding is **not** in the conv graph: it is the encoder graph's first op, `ggml_add(view_2d(e_pe, 384, n_ctx,
+  offset 384·4·n_ctx·iter), ggml_cont(ggml_transpose(view of embd_conv)))`, with `static int iter = 0` — offset 0,
+  and the view covers e_pe whole at n_ctx = 1500. The result ([384, 1500], frame-major) is the first block's input.
+- conv2 = `im2col(w2, ·, s0 = 2, p0 = 1)` → f16 [1152, 1500] (element `3·ic + kw` of row t = input frame
+  `2t + kw − 1`), `mul_mat(im2col, w2)`: each output one `ggml_vec_dot_f16(1152)` (36 × 32: no tail).
+- The mel input is always 2·n_ctx frames, zero-filled past the mel, so a short input takes no other path. Only a
+  non-zero `audio_ctx` changes n_ctx; that was **not** compared.
+
+### The oracle
+- `whisper_oracle --conv2`: an eval callback on `sched_conv` (every node) and one on `sched_encode` that observes up
+  to the first ADD, then lets the encoder run unobserved. The 18 nodes seen are the same on all 8 inputs (…, IM2COL
+  f16 [1152,1500], MUL_MAT, ADD, GELU `embd_conv`; VIEW of e_pe, TRANSPOSE, CONT, ADD). Self-checks, yes on 8 / 8:
+  the reference's nodes identical at 1 and 4 threads; the last conv node = `whisper_state::embd_conv` read after an
+  unobserved run; `embd_enc` (the encoder's whole output) the same observed and not; the standalone graphs the bench
+  times (conv2 alone, the whole stage) = the scheduler's nodes at 1 and 4 threads.
+- `oracle_conv2_im2col_bit_exact`: **13,824,000 / 13,824,000** f16 values (from voaice's conv1, itself checked equal to
+  the record's conv1 GELU node).
+- `oracle_conv2_bit_exact`: MUL_MAT, + bias, GELU (`embd_conv`) — **0 differ** on 8 inputs at 1 and 4 threads
+  (27,648,000 values).
+- `oracle_positions_bit_exact`: CONT **0 differ**; the positional ADD **0 differ** both from conv2-with-positions
+  (voaice's conv1 in) and from the whole fused stage (voaice's mel in), at 1, 2 and 4 threads (27,648,000 values).
+- Discriminators on JFK, all caught: stride 1 (**423,936** / 576,000 MUL_MAT values), one f32 accumulator
+  (**544,848**), positions added before the transpose (**575,247** / 576,000 encoder-input values), positions one
+  frame late (**510,942**), GELU before the bias (**575,992**).
+- **Found:** "im2col kept in f32" cannot be caught on JFK. conv1's GELU returns the f16 table's value for x < 10 (an
+  f16 already), 0 for x ≤ −10 and x itself for x ≥ 10, so conv2's f16 rounding changes only GELU outputs ≥ 10 that
+  f16 cannot hold: 3 in min_len, 2 in noise_loud and odd_len, 1 in silence, none in jfk, jfk_x3, chirp, short. The
+  test counts them on every input and checks the discriminator where it can: **384, 767, 384, 383** of 576,000
+  MUL_MAT values differ on those four; on the other four the two readings are the same function.
+- **What this holds for:** this laptop's native libggml-cpu (Zen+, AVX2 + FMA + F16C, the AVX path). Production's
+  Zen 3 library was not run; an AVX-512 host, `base.en`, and `audio_ctx` ≠ 0 were not compared.
+
+### Measured (gate step 9, only after 4e passed; 2 cores / 4 threads, load 4.7–7.8 from the operator's browser)
+jfk's first 30-s window; the reference = the same ops as a standalone ggml graph on the shipped CPU backend (the
+record shows it equals the scheduler's nodes); wall = best of 10. The machine was loaded, so three reruns follow:
+
+| | reference | voaice | gate run | three reruns |
+|---|---|---|---|---|
+| conv2 + bias + GELU, 1 thread | 230–292 ms | 45–63 ms | 4.15× | 6.31× · 5.09× · 4.20× |
+| conv2 + bias + GELU, 2 threads | 141–224 ms | 39–48 ms | 3.30× | 4.30× · 5.14× · 3.62× |
+| conv2 + bias + GELU, 4 threads | 132–148 ms | 36–63 ms | 2.62× | 2.31× · 4.09× · 3.48× |
+| the stage (mel → encoder input), 1 thread | 383–423 ms | 97–119 ms | 3.60× | 3.37× · 4.02× · 4.02× |
+| the stage, 2 threads | 211–234 ms | 56–83 ms | 3.13× | 2.81× · 3.23× · 3.76× |
+| the stage, 4 threads | 200–281 ms | 61–78 ms | 4.62× | 3.22× · 3.28× · 2.55× |
+
+- At a lighter load earlier the same day (≈ 4): conv2 37 ms against 191–213 at one thread (5–5.7×), 22 ms at two.
+- **CPU:** a third to a fifth of the reference's (gate: conv2 89 against 266 CPU-ms at 1 thread; the stage 106 against
+  528 at 1, 248 against 711 at 4).
+- **Memory:** conv2 holds **2,443 KiB** (its output, 2,250, + one block) against the reference graph's **10,125**; the
+  whole stage **4,693 KiB** against **29,532** — no im2col, no separate add / GELU / cont outputs, and conv1's output
+  kept as f16.
+- What changed, bits fixed: blocks of 32 frames per thread built from conv1's output (the input span rounded once per
+  channel, then spread through a column table); a **4-frame × 3-channel AVX2 register block** (7 loads per 12 FMAs);
+  each row's columns **permuted so accumulator j's blocks are contiguous** (both operands, so no product and no chain
+  changes; 76 → 51 ms alone); the transpose and the positional add written by the epilogue; **conv1 → conv2 through
+  f16** (exact by the finding above: conv2 reads nothing of conv1's output but its f16 conversion; 6,943 → 4,693 KiB).
+- 4 threads gain little over 2 (2 physical cores, FMA-bound), as in 0.0.6.
+
+### Added
+- `src/conv.rs`: `Conv2` (`new`, `from_parts`, `frames_out`, `run`, `run_into`, `run_into_f16`), `Epilogue` (`Raw`,
+  `BiasGelu`, `Positions`), `ConvStage` (`new`, `run`, `run_into`), `Conv1::run_into_f16`, `im2col_strided_f16`; unit
+  tests (conv2 against im2col + the model dot for every epilogue, odd lengths, padded channel blocks, a non-multiple-of-32
+  k, f16 and f32 input, 1 and 3 threads; the AVX2 block and the layout's model against the model; conv1's f16 output).
+- `voaice conv`, `voaice bench-conv conv2|stage`; `tests/conv2.rs` (4 oracle tests).
+- `whisper_oracle --conv2`, `--bench-conv2`; gate steps 4e and 9 (every earlier check kept: 13 oracle, 4 opus, 3
+  streamair, 3 resample, 5 conv1). The production Opus re-ask (4b) was skipped on purpose (production not touched).
+
 ## 0.0.6 — 2026-10-08 — `ggml_vec_dot_f16` and encoder conv1, bit-exact against the conv graph's own nodes
 
 **The encoder's first layer — im2col to f16, the f16 · f16 dot product in the AVX build's float order, + bias and

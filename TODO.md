@@ -90,9 +90,31 @@ whisper.cpp (upstream/PIN) in the same run; only then is its speed measured.
       4-frame × 2-channel tile would issue 6, at the cost of a second epilogue shape. At 4 threads on this 2-core /
       4-thread laptop voaice gains nothing over 2 (the FMA pipes are shared by SMT siblings).
 
-## Next: 0.0.7 — conv2 (see docs/ROADMAP.md)
-- [ ] conv2 (stride 2, 1500 frames; n = 1,152 = 36 × 32: no tail) on conv1's GELU output, its bias and GELU nodes,
-      then the positional embedding add; oracle: the conv graph's remaining nodes and `embd_conv`.
+## Done: 0.0.7 — conv2 and the positional embedding (CHANGELOG.md, testing/conv2/NOTES.md)
+- [x] Read from the pin: `embd_conv` is conv2's GELU (the conv graph's last node); the positions are the encoder
+      graph's first op, `add(view_2d(e_pe, …, offset 0: static iter = 0), cont(transpose(embd_conv)))`; the mel input is
+      always 2·n_ctx frames zero-padded, so short inputs take no other path.
+- [x] Oracle through both schedulers' eval callbacks (`sched_conv` every node; `sched_encode` up to the first ADD,
+      then unobserved): conv2's IM2COL 13,824,000 / 13,824,000, MUL_MAT / ADD / GELU 0 differ at 1 and 4 threads, CONT
+      0 differ, the positional ADD 0 differ from voaice's mel at 1, 2, 4 threads, 8 inputs; `embd_conv` = the state's;
+      `embd_enc` unchanged by observing; standalone graphs = the nodes. Discriminators: stride 1, one accumulator,
+      positions before the transpose, positions a frame late, GELU before the bias — all caught.
+- [x] Found: conv2's f16 rounding of its input changes only conv1-GELU outputs ≥ 10 (GELU's table already returns
+      f16 values below that), so "im2col in f32" is caught on 4 inputs (min_len, noise_loud, odd_len, silence) and
+      cannot be told apart on the other 4. The same fact makes an f16 buffer between conv1 and conv2 exact.
+- [x] Faster, bits unchanged: blocks of 32 frames per thread (no im2col), a 4 × 3 register block (7 loads per 12 FMAs)
+      over a column layout where each accumulator's blocks are contiguous, the transpose + positions in the epilogue,
+      conv1 → conv2 through f16, caller-owned buffers (`Conv2::run_into`, `ConvStage::run_into`).
+- [ ] Not covered: `audio_ctx` ≠ 0 (n_ctx < 1500: a shorter e_pe view and conv window) — voaice takes n_frames, but it
+      was not compared; production's own libggml-cpu (Zen 3) was not run; an AVX-512 host; `base.en` (n_state 512,
+      k = 1,536; 512 channels = 170 × 3 + 2, which the padded weight rows handle, unit-tested on small shapes only).
+- [ ] Efficiency left: conv1 still uses 0.0.6's 8 × 1 tile (9 loads per 8 FMAs) on a strided layout; the 4 × 3 block
+      with the permuted layout would need its 16-wide double tail handled (k = 240 = 7 × 32 + 16). 4 threads = 2 here.
+
+## Next: 0.0.8 — layer norm (see docs/ROADMAP.md)
+- [ ] `ggml_norm` (eps 1e-5) on the encoder's input, then `* ln_0_w + ln_0_b`: read
+      `ggml_compute_forward_norm_f32`'s mean/variance order and precision; oracle: block 0's norm, mul, add nodes
+      through `sched_encode`'s callback (the 0.0.7 callback already stops right before them).
 
 ## Then, in order
 
@@ -114,7 +136,7 @@ Graph (`whisper_build_graph_conv` + `whisper_build_graph_encoder`, src/whisper.c
 | conv1 | `ggml_conv_1d_ph(w1 f16 [3,80,384], mel, s=1, p=1)` = `im2col` (to **f16**) + `mul_mat` | the f32→f16 rounding of im2col; the f16·f16 dot's accumulation order |
 | + bias, GELU | `ggml_add`, `ggml_gelu` | GELU is a **lookup table** (`GGML_GELU_FP16`): x→f16, `ggml_table_gelu_f16[bits]`; x ≤ −10 → 0, x ≥ 10 → x |
 | conv2 | same, stride 2 → [384, 1500] | as conv1 |
-| + positional | `ggml_add(e_pe view, cont(transpose(cur)))` | exact (one add) |
+| + positional | `ggml_add(e_pe view, cont(transpose(cur)))` | exact (one add) — done in 0.0.7 |
 | ×4 blocks | `ggml_norm` (eps 1e-5) → `*w + b` → Q,K,V `mul_mat` (f16 weights) + biases | norm's mean/variance summation order (ggml_vec_* in f64 or f32? read `ggml_compute_forward_norm_f32`) |
 | attention | **flash_attn = true** (whisper-cli default): K,V copied to the f16 `kv_pad` cache, `ggml_flash_attn_ext(Q, K, V, scale 1/√64)` | online softmax order, Q→f16 conversion, `expf` vs ggml's own exp, V accumulation in f16 or f32 — read `ggml_compute_forward_flash_attn_ext_f16` |
 | out proj, residual, MLP | `mul_mat` + bias, add, norm, `mul_mat` (384→1536), GELU, `mul_mat`, add | as above |
@@ -138,7 +160,7 @@ still does all the arithmetic, the oracle only observes. Kernel-level oracles, a
 `ggml_table_gelu_f16` is an **exported symbol** of `libggml-cpu.so` (dump all 65,536 entries and compare to the port's
 table), `ggml_cpu_fp32_to_fp16` / `ggml_vec_dot_f16` are reachable through `ggml_get_type_traits_cpu`.
 
-Order of work: GELU table → f32↔f16 conversions (both done in 0.0.3) → `vec_dot_f16` on sampled real rows → conv1 (both done in 0.0.6) → conv2 → one block
+Order of work: GELU table → f32↔f16 conversions (both done in 0.0.3) → `vec_dot_f16` on sampled real rows → conv1 (both done in 0.0.6) → conv2 + positions (0.0.7) → one block
 (norm, attention, MLP) → all four → `embd_enc` bit-exact on the 8 test inputs.
 
 ### Stage 4 — decoder (plan)

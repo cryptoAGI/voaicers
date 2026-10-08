@@ -11,6 +11,8 @@
 //!   voaice bench-resample <in.wav>                          (0.0.5) that read's heap peak, wall (best of 10), CPU per call, peak RSS
 //!   voaice conv1 <model.bin> <in.wav> [out.f32] [--threads N]   (0.0.6) encoder conv1 + bias + GELU of the first 30-s window
 //!   voaice bench-conv1 <model.bin> <in.wav> conv1|gelu [--threads N]   (0.0.6) its heap peak, wall (best of 10), CPU per call, RSS
+//!   voaice conv <model.bin> <in.wav> [out.f32] [--threads N]    (0.0.7) the conv stage: mel -> conv1 -> conv2 -> + positions (the encoder's input)
+//!   voaice bench-conv <model.bin> <in.wav> conv2|stage [--threads N]   (0.0.7) conv2 (+ bias + GELU), or the whole stage: heap, wall, CPU, RSS
 //!   voaice vclone check <file.voaice>...                   recompute each identity's vprint and compare every field
 //!   voaice vclone print <8 metrics>                         the dvscope/1 print of eight values (vprint.py's twin)
 //!   voaice vclone log <events.jsonl>                        verify a forge log's chain and say whether it is mintable
@@ -202,6 +204,75 @@ fn run(args: &[String]) -> Result<(), String> {
             );
             Ok(())
         }
+        Some("conv") if args.len() == 3 || args.len() == 4 => {
+            let m = Model::load_pinned(Path::new(&args[1]))?;
+            let pcm = wav::read(Path::new(&args[2]))?;
+            let t = mel::Tables::new();
+            let mel = mel::MelPlan::new(&t, &m.filters, m.filters_n_mel as usize, m.filters_n_fft as usize)?.run(&pcm, threads)?;
+            let st = conv::ConvStage::new(&m)?;
+            let n_frames = 2 * m.hparams.n_audio_ctx as usize;
+            let start = std::time::Instant::now();
+            let y = st.run(&mel.data, mel.n_len, 0, n_frames, threads);
+            let took = start.elapsed();
+            let bytes: Vec<u8> = y.iter().flat_map(|v| v.to_le_bytes()).collect();
+            println!(
+                "encoder input (conv1, conv2, + positions) {} x {} frame-major, sha256 {}, {:.1} ms",
+                st.conv2.frames_out(n_frames),
+                st.conv2.n_out,
+                sha256::hex(&sha256::digest(&bytes)),
+                took.as_secs_f64() * 1e3
+            );
+            if let Some(out) = args.get(3) {
+                std::fs::write(out, &bytes).map_err(|e| format!("{out}: {e}"))?;
+            }
+            Ok(())
+        }
+        Some("bench-conv") if args.len() == 4 && (args[3] == "conv2" || args[3] == "stage") => {
+            let m = Model::load_pinned(Path::new(&args[1]))?;
+            let pcm = wav::read(Path::new(&args[2]))?;
+            let t = mel::Tables::new();
+            let mel = mel::MelPlan::new(&t, &m.filters, m.filters_n_mel as usize, m.filters_n_fft as usize)?.run(&pcm, 1)?;
+            let n_frames = 2 * m.hparams.n_audio_ctx as usize;
+            let st = conv::ConvStage::new(&m)?;
+            drop(m); // the model goes before the peak is reset; the plan keeps the widened weights and the positions
+            let stage = args[3] == "stage";
+            // conv2 alone reads conv1's GELU output, computed here, outside the measurement (the reference's bench
+            // computes it with its own conv1 graph beforehand too)
+            let x = if stage { Vec::new() } else { st.conv1.run_gelu(&mel.data, mel.n_len, 0, n_frames, threads) };
+            let n_out = st.conv2.n_out * st.conv2.frames_out(n_frames);
+            let mut heap_peak = None;
+            // the buffers are allocated by the first call and kept, as a caller keeps them: conv2 = its output
+            // (embd_conv, [n_state][n_ctx]); stage = conv1's output as f16 (scratch) and the encoder input
+            let (mut out, mut scratch): (Vec<f32>, Vec<u16>) = (Vec::new(), Vec::new());
+            let b = measure::bench(
+                || {
+                    let live = LIVE.load(Relaxed);
+                    PEAK.store(live, Relaxed);
+                    if out.is_empty() {
+                        out = vec![0.0; n_out];
+                    }
+                    if stage {
+                        st.run_into(&mel.data, mel.n_len, 0, n_frames, threads, &mut scratch, &mut out);
+                    } else {
+                        st.conv2.run_into(&x, n_frames, threads, conv::Epilogue::BiasGelu, &mut out);
+                    }
+                    heap_peak.get_or_insert(PEAK.load(Relaxed) - live);
+                },
+                10,
+                1.0,
+            );
+            let opt = |v: Option<String>| v.unwrap_or_else(|| "n/a".into());
+            println!(
+                "bench-conv what {} threads {threads} wall_best_ms {:.3} cpu_ms_per_call {} cpu_reps {} heap_peak_kb {} rss_peak_delta_kb {}",
+                args[3],
+                b.wall_best_ms,
+                opt(b.cpu_ms_per_call.map(|c| format!("{c:.3}"))),
+                b.cpu_reps,
+                heap_peak.unwrap_or(0).div_ceil(1024),
+                opt(b.rss_peak_delta_kb.map(|v| v.to_string()))
+            );
+            Ok(())
+        }
         Some("opus") if args.len() == 3 && args[1] == "info" => opus_info(&args[2]),
         Some("bench-opus") if args.len() == 2 => bench_opus(&args[1]),
         Some("resample") if args.len() == 2 || args.len() == 3 => {
@@ -265,7 +336,7 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("voaice {} (reference: whisper.cpp 080bbbe8, ggml 0.16.0)", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        _ => Err("usage: voaice info <model.bin> | voaice mel <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-mel <model.bin> <in.wav> [--threads N] | voaice bench-f16 init|rows | voaice conv1 <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-conv1 <model.bin> <in.wav> conv1|gelu [--threads N] | voaice opus info <file.opus> | voaice bench-opus <file.opus> | voaice resample <in.wav> [out.f32] | voaice bench-resample <in.wav> | voaice vclone check <file.voaice>... | voaice vclone print <8 metrics> | voaice vclone log <events.jsonl> | voaice version".into()),
+        _ => Err("usage: voaice info <model.bin> | voaice mel <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-mel <model.bin> <in.wav> [--threads N] | voaice bench-f16 init|rows | voaice conv1 <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-conv1 <model.bin> <in.wav> conv1|gelu [--threads N] | voaice conv <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-conv <model.bin> <in.wav> conv2|stage [--threads N] | voaice opus info <file.opus> | voaice bench-opus <file.opus> | voaice resample <in.wav> [out.f32] | voaice bench-resample <in.wav> | voaice vclone check <file.voaice>... | voaice vclone print <8 metrics> | voaice vclone log <events.jsonl> | voaice version".into()),
     }
 }
 
