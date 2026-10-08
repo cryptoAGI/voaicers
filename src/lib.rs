@@ -3,7 +3,7 @@
 //! exact first, fast second. Every stage reproduces the compiled output of the pinned whisper.cpp (upstream/PIN)
 //! bit for bit, checked by an oracle that runs the shipped library on the same input (testing/oracle).
 //!
-//! 0.0.7 holds the first stages: the model loader with its sha256 guard ([`model`]), the WAV input ([`wav`]) and the
+//! 0.0.8 holds the first stages: the model loader with its sha256 guard ([`model`]), the WAV input ([`wav`]) and the
 //! log-mel front end ([`mel`], allocation-free and threaded since 0.0.2, still 0 ULP); the first encoder kernels
 //! (0.0.3): f32 ↔ f16 as ggml-cpu converts ([`f16`]) and GELU with ggml's f16 table ([`gelu`]), bit-exact on every
 //! input; the streaming Ogg/Opus reader (0.0.4, [`ogg`]): pages, CRC, packets, headers and the exact duration, one page
@@ -12,10 +12,12 @@
 //! whisper-cli's `read_audio_data` reads the file, streamed; the encoder's first convolution (0.0.6, [`conv`]): im2col to
 //! f16, `ggml_vec_dot_f16` in the AVX build's float order, + bias and GELU, bit-exact against the conv graph's own
 //! nodes and faster; conv2, its bias and GELU (`embd_conv`) and the positional embedding (0.0.7, [`conv`]) — the
-//! encoder's input, bit-exact against both schedulers' nodes; plus [`measure`] (CPU time and peak RSS from `/proc`,
+//! encoder's input, bit-exact against both schedulers' nodes; the encoder's layer norms (0.0.8, [`norm`]): `ggml_norm`'s
+//! in-order double sum, cvar's 8-lane pairing and `1/sqrtf(var + eps)`, then `· w + b` as two nodes — all nine
+//! (each block's attn_ln and mlp_ln, ln_post) bit-exact against the encoder graph's own nodes; plus [`measure`] (CPU time and peak RSS from `/proc`,
 //! for the gate). [`vclone`] holds voaice's voice identities: the vprint, byte-identical to cryptoAGI/voaice's
-//! vprint.py, and the hash-chained forge log (docs/VCLONE.md). The rest of the encoder (the blocks from the first
-//! layer norm on), and the decoder, are not here yet (TODO.md).
+//! vprint.py, and the hash-chained forge log (docs/VCLONE.md). The rest of the encoder (the matrix products,
+//! attention and the MLP), and the decoder, are not here yet (TODO.md).
 
 pub mod conv;
 pub mod f16;
@@ -23,6 +25,7 @@ pub mod gelu;
 pub mod json;
 pub mod measure;
 pub mod mel;
+pub mod norm;
 pub mod model;
 pub mod ogg;
 pub mod resample;

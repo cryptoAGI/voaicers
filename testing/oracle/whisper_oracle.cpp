@@ -12,6 +12,8 @@
 //   whisper_oracle --bench-conv1 <model.bin> <wav> <threads> conv1|gelu   (0.0.6) conv1's time, see bench_conv1
 //   whisper_oracle --conv2 <model.bin> <outdir> <wav ...>   (0.0.7) conv2's nodes and the positional add, see record_conv2
 //   whisper_oracle --bench-conv2 <model.bin> <wav> <threads> conv2|stage   (0.0.7) their time, see bench_conv2
+//   whisper_oracle --norm <model.bin> <outdir> <wav ...>    (0.0.8) the encoder's nine norm -> mul -> add chains, see record_norm
+//   whisper_oracle --bench-norm <model.bin> <wav> <threads> norm|chain   (0.0.8) their time, see bench_norm
 //
 // --bench-mel measures the reference's whisper_pcm_to_mel_with_state the way `voaice bench-mel` measures voaice's,
 // in a fresh process each: the heap bytes live at the first call's peak (operator new counted, below), peak RSS of
@@ -1001,7 +1003,224 @@ static int bench_conv2(const char * model_path, const char * wav, int threads, c
     return 0;
 }
 
+// ---- 0.0.8: the encoder's layer norms, observed in the shipped library ------------------------------------------------
+// --norm <model.bin> <outdir> <wav ...> writes, per wav, <outdir>/<stem>/:
+//   nodes.tsv        every node of the encoder graph (the eval callback on sched_encode observes them all, one at a time)
+//   <chain>.in.f32   the NORM node's input (src[0]), read when the scheduler asks about the NORM node, i.e. after every
+//                    node before it was computed and before the NORM ran (so an in-place NORM cannot have overwritten it)
+//   <chain>.norm.f32 the NORM node; <chain>.mul.f32 the MUL after it (src[0] = the NORM, src[1] = the weight);
+//   <chain>.add.f32  the ADD after that (src[0] = the MUL, src[1] = the bias). All f32 [384, 1500] (ne0 = channels).
+//   chains: attn_ln_0, mlp_ln_0, ..., attn_ln_3, mlp_ln_3, ln_post (the encoder's nine norms, in graph order)
+//   norm.tsv         eps (from the node's op_params), each chain's weight / bias tensor (by pointer identity with the
+//                    model's tensor map), and the self-checks: 1 vs 4 threads bit-identical; embd_enc observed ==
+//                    unobserved; ln_post's ADD == embd_enc; the standalone graphs (what --bench-norm times) == the nodes
+struct norm_chain {
+    std::string name, w, b;
+    std::vector<uint8_t> in, norm, mul, add;
+    const ggml_tensor * nt = nullptr, * mt = nullptr;
+    float eps = -1.0f;
+    bool contiguous = false;
+};
+struct norm_capture {
+    std::vector<std::string> lines;
+    std::vector<norm_chain> ch;
+    int state = 0;          // 0: want NORM, 1: its MUL, 2: that MUL's ADD
+    std::map<const ggml_tensor *, std::string> names;   // the model's tensors, by pointer
+    int n_layer = 0;
+};
+static std::vector<uint8_t> tensor_bytes(const ggml_tensor * t) {
+    std::vector<uint8_t> b(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, b.data(), 0, b.size());
+    return b;
+}
+static bool norm_cb(ggml_tensor * t, bool ask, void * ud) {
+    auto & c = *static_cast<norm_capture *>(ud);
+    if (ask) {
+        if (t->op == GGML_OP_NORM) {                // the input, before the NORM runs
+            norm_chain n;
+            const int k = (int)c.ch.size();
+            n.name = k == 2 * c.n_layer ? "ln_post" : std::string(k % 2 ? "mlp_ln_" : "attn_ln_") + std::to_string(k / 2);
+            n.in = tensor_bytes(t->src[0]);
+            n.contiguous = ggml_is_contiguous(t->src[0]) && t->src[0]->type == GGML_TYPE_F32;
+            std::memcpy(&n.eps, t->op_params, sizeof(float));
+            c.ch.push_back(std::move(n));
+        }
+        return true;                                // observe every node
+    }
+    cap_line(c.lines, "encode", t);
+    if (t->op == GGML_OP_NORM) {
+        check(c.state == 0 && !c.ch.empty(), "a NORM before the last one's MUL and ADD");
+        c.ch.back().norm = tensor_bytes(t); c.ch.back().nt = t; c.state = 1;
+    } else if (c.state == 1 && t->op == GGML_OP_MUL) {
+        check(t->src[0] == c.ch.back().nt, "the MUL after a NORM does not read it");
+        auto it = c.names.find(t->src[1]);
+        c.ch.back().w = it == c.names.end() ? "?" : it->second;
+        c.ch.back().mul = tensor_bytes(t); c.ch.back().mt = t; c.state = 2;
+    } else if (c.state == 2 && t->op == GGML_OP_ADD) {
+        check(t->src[0] == c.ch.back().mt, "the ADD after a NORM's MUL does not read it");
+        auto it = c.names.find(t->src[1]);
+        c.ch.back().b = it == c.names.end() ? "?" : it->second;
+        c.ch.back().add = tensor_bytes(t); c.state = 0;
+    } else {
+        check(c.state == 0, "a NORM not followed by its MUL then its ADD");
+    }
+    return true;
+}
+
+// norm alone, or norm -> mul(w) -> add(b), as a standalone ggml graph on the shipped CPU backend (what --bench-norm times)
+struct norm_graph {
+    ggml_context * ctx; ggml_tensor * in; ggml_tensor * nrm; ggml_tensor * out; ggml_cgraph * gf;
+    norm_graph(ggml_tensor * w_src, ggml_tensor * b_src, int n_state, int n_ctx, float eps, bool chain) {
+        ggml_init_params p = { (size_t)32 << 20, nullptr, false };
+        ctx = ggml_init(p);
+        check(ctx != nullptr, "ggml_init failed");
+        in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state, n_ctx);
+        nrm = ggml_norm(ctx, in, eps);
+        out = nrm;
+        if (chain) {
+            ggml_tensor * w = conv2_graph::copy(ctx, w_src), * b = conv2_graph::copy(ctx, b_src);
+            out = ggml_add(ctx, ggml_mul(ctx, nrm, w), b);
+        }
+        gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, out);
+    }
+    void set(const std::vector<uint8_t> & x) { check(x.size() == ggml_nbytes(in), "norm input size"); std::memcpy(in->data, x.data(), x.size()); }
+    void run(int threads) { check(ggml_graph_compute_with_ctx(ctx, gf, threads) == GGML_STATUS_SUCCESS, "graph compute failed"); }
+    ~norm_graph() { ggml_free(ctx); }
+};
+static std::string chain_prefix(const std::string & name) {   // attn_ln_2 -> encoder.blocks.2.attn_ln
+    if (name == "ln_post") return "encoder.ln_post";
+    const size_t u = name.find_last_of('_');
+    return "encoder.blocks." + name.substr(u + 1) + "." + name.substr(0, u);
+}
+
+static int record_norm(const char * model_path, const std::string & outdir, int nwav, char ** wavs) {
+    if (mkdir(outdir.c_str(), 0755) != 0 && errno != EEXIST) die("cannot create outdir (its parent must exist)");
+    whisper_context * ctx = load_quiet(model_path);
+    auto & tensors = model_tensors(ctx);
+    const int n_ctx = whisper_model_n_audio_ctx(ctx), n_state = whisper_model_n_audio_state(ctx), n_layer = whisper_model_n_audio_layer(ctx);
+    for (int a = 0; a < nwav; a++) {
+        std::string path = wavs[a];
+        std::string stem = path.substr(path.find_last_of('/') + 1);
+        stem = stem.substr(0, stem.find_last_of('.'));
+        const std::string dir = outdir + "/" + stem;
+        mkdir(dir.c_str(), 0755);
+        std::vector<float> pcm = read_wav(path.c_str());
+        norm_capture caps[2];
+        std::vector<uint8_t> obs_enc, unobs_enc;
+        const int threads[2] = {1, 4};
+        for (int k = 0; k < 3; k++) {              // k = 0, 1: observed at 1 and 4 threads; k = 2: not observed, 1 thread
+            whisper_state * st = whisper_init_state(ctx);
+            check(st != nullptr, "whisper_init_state failed");
+            check(whisper_pcm_to_mel_with_state(ctx, st, pcm.data(), (int)pcm.size(), 1) == 0, "pcm_to_mel failed");
+            state_sched(st, VOAICE_OFF_STATE_SCHED_CONV);
+            ggml_backend_sched_t se = state_sched(st, VOAICE_OFF_STATE_SCHED_ENCODE);
+            if (k < 2) {
+                for (auto & kv : tensors) caps[k].names[kv.second] = kv.first;
+                caps[k].n_layer = n_layer;
+                ggml_backend_sched_set_eval_callback(se, norm_cb, &caps[k]);
+            }
+            check(whisper_encode_with_state(ctx, st, 0, k < 2 ? threads[k] : 1) == 0, "whisper_encode failed");
+            if (k < 2) check((int)caps[k].ch.size() == 2 * n_layer + 1 && caps[k].state == 0, "the encoder graph did not show 2 x n_layer + 1 NORM -> MUL -> ADD chains");
+            ggml_tensor * ee = *reinterpret_cast<ggml_tensor **>((char *)st + VOAICE_OFF_STATE_EMBD_ENC);
+            check(ee != nullptr && ee->type == GGML_TYPE_F32 && ee->ne[0] == n_state, "layout check failed: embd_enc");
+            if (k != 1) (k == 0 ? obs_enc : unobs_enc) = tensor_bytes(ee);
+            whisper_free_state(st);
+        }
+        norm_capture & c = caps[0];
+        const norm_capture & d = caps[1];
+        bool thr = true, names_ok = true, eps_ok = true, contig = true;
+        for (size_t i = 0; i < c.ch.size(); i++) {
+            const norm_chain & x = c.ch[i], & y = d.ch[i];
+            check(x.in.size() == (size_t)n_state * n_ctx * 4 && x.add.size() == x.in.size(), "unexpected norm shapes");
+            thr = thr && x.in == y.in && x.norm == y.norm && x.mul == y.mul && x.add == y.add;
+            names_ok = names_ok && x.w == chain_prefix(x.name) + ".weight" && x.b == chain_prefix(x.name) + ".bias";
+            eps_ok = eps_ok && x.eps == 1e-5f;
+            contig = contig && x.contiguous;
+            write_bin(dir + "/" + x.name + ".in.f32", (const float *)x.in.data(), x.in.size() / 4);
+            write_bin(dir + "/" + x.name + ".norm.f32", (const float *)x.norm.data(), x.norm.size() / 4);
+            write_bin(dir + "/" + x.name + ".mul.f32", (const float *)x.mul.data(), x.mul.size() / 4);
+            write_bin(dir + "/" + x.name + ".add.f32", (const float *)x.add.data(), x.add.size() / 4);
+        }
+        FILE * nf = std::fopen((dir + "/nodes.tsv").c_str(), "w");
+        for (auto & l : c.lines) std::fprintf(nf, "%s\n", l.c_str());
+        std::fclose(nf);
+        const bool enc_eq = obs_enc == unobs_enc;
+        const bool post_eq = c.ch.back().add == obs_enc;
+        bool alone = true;
+        for (const norm_chain & x : c.ch) {        // the standalone graphs --bench-norm times, against the scheduler's nodes
+            const std::string p = chain_prefix(x.name);
+            for (int ch = 0; ch < 2; ch++) {
+                norm_graph g(tensors.at(p + ".weight"), tensors.at(p + ".bias"), n_state, n_ctx, 1e-5f, ch == 1);
+                g.set(x.in);
+                for (int th : {1, 4}) { g.run(th); alone = alone && same(g.nrm, x.norm) && (ch == 0 || same(g.out, x.add)); }
+            }
+        }
+        FILE * m = std::fopen((dir + "/norm.tsv").c_str(), "w");
+        std::fprintf(m, "n_ctx\t%d\nn_state\t%d\nchains\t%zu\neps\t%a\nnodes\t%zu\neps_is_1e-5f\t%s\ninputs_contiguous_f32\t%s\n"
+                        "weights_are_the_named_tensors\t%s\nthreads_1_vs_4_bit_identical\t%s\nembd_enc_observed_eq_unobserved\t%s\n"
+                        "ln_post_add_eq_embd_enc\t%s\nstandalone_eq_sched\t%s\n", n_ctx, n_state, c.ch.size(), (double)c.ch[0].eps,
+                     c.lines.size(), eps_ok ? "yes" : "NO", contig ? "yes" : "NO", names_ok ? "yes" : "NO", thr ? "yes" : "NO",
+                     enc_eq ? "yes" : "NO", post_eq ? "yes" : "NO", alone ? "yes" : "NO");
+        for (const norm_chain & x : c.ch) std::fprintf(m, "chain\t%s\t%s\t%s\n", x.name.c_str(), x.w.c_str(), x.b.c_str());
+        std::fclose(m);
+        std::fprintf(stderr, "whisper_oracle: %s: %zu encoder nodes observed; %zu norm -> mul -> add chains recorded; eps 1e-5f: %s; "
+                             "the named weights: %s; 1 vs 4 threads identical: %s; embd_enc observed = unobserved: %s; ln_post = embd_enc: %s; "
+                             "standalone = scheduler: %s\n", stem.c_str(), c.lines.size(), c.ch.size(), eps_ok ? "yes" : "NO",
+                     names_ok ? "yes" : "NO", thr ? "yes" : "NO", enc_eq ? "yes" : "NO", post_eq ? "yes" : "NO", alone ? "yes" : "NO");
+    }
+    whisper_free(ctx);
+    return 0;
+}
+
+// --bench-norm <model.bin> <wav> <threads> <what>: what = norm (the NORM node alone) or chain (norm -> * w + b, block 0's
+// attn_ln weights), on the encoder's input of <wav> (the conv stage computed beforehand by the standalone graph above),
+// through the standalone graph, in a fresh process. wall = best of 10, cpu = CPU ms per compute over >= 1 s, mem = the
+// bytes of the graph's own non-view nodes (the norm, mul and add outputs), rss = VmHWM delta of the first compute.
+static int bench_norm(const char * model_path, const char * wav, int threads, const char * what) {
+    whisper_context * ctx = load_quiet(model_path);
+    auto & tensors = model_tensors(ctx);
+    whisper_state * st = whisper_init_state(ctx);
+    std::vector<float> pcm = read_wav(wav);
+    check(whisper_pcm_to_mel_with_state(ctx, st, pcm.data(), (int)pcm.size(), 1) == 0, "pcm_to_mel failed");
+    auto & mel = *reinterpret_cast<mel_mirror *>((char *)st + VOAICE_OFF_STATE_MEL);
+    const bool chain = std::strcmp(what, "chain") == 0;
+    check(chain || std::strcmp(what, "norm") == 0, "--bench-norm ... norm|chain");
+    const int n_ctx = whisper_model_n_audio_ctx(ctx), n_state = whisper_model_n_audio_state(ctx);
+    std::vector<uint8_t> x;
+    {
+        conv2_graph s(tensors, 2 * n_ctx, whisper_model_n_mels(ctx), true);
+        s.set(mel.data, mel.n_len);
+        s.run(threads);
+        x.assign((const uint8_t *)s.out->data, (const uint8_t *)s.out->data + ggml_nbytes(s.out));
+    }
+    norm_graph g(tensors.at("encoder.blocks.0.attn_ln.weight"), tensors.at("encoder.blocks.0.attn_ln.bias"), n_state, n_ctx, 1e-5f, chain);
+    g.set(x);
+    size_t op_bytes = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(g.gf); i++) {
+        ggml_tensor * t = ggml_graph_node(g.gf, i);
+        if (t->view_src == nullptr) op_bytes += ggml_nbytes(t);
+    }
+    const long before = status_kb("VmRSS:");
+    const bool reset = reset_peak_rss();
+    g.run(threads);
+    const long peak = reset ? status_kb("VmHWM:") : -1;
+    double best = 1e30;
+    for (int r = 0; r < 10; r++) { const double t = now_ms(); g.run(threads); best = std::min(best, now_ms() - t); }
+    const double c0 = cpu_seconds(), w0 = now_ms();
+    int reps = 0;
+    while (reps < 10 || now_ms() - w0 < 1000.0) { g.run(threads); reps++; }
+    const double c1 = cpu_seconds();
+    std::printf("bench-norm-reference what %s threads %d wall_best_ms %.4f cpu_ms_per_call %.4f cpu_reps %d op_mem_kb %zu rss_peak_delta_kb %ld\n",
+                what, threads, best, (c1 - c0) * 1000.0 / reps, reps, (op_bytes + 1023) / 1024, peak >= 0 ? peak - before : -1);
+    whisper_free_state(st);
+    whisper_free(ctx);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    if (argc >= 4 && std::strcmp(argv[1], "--norm") == 0) return record_norm(argv[2], argv[3], argc - 4, argv + 4);
+    if (argc == 6 && std::strcmp(argv[1], "--bench-norm") == 0) return bench_norm(argv[2], argv[3], std::atoi(argv[4]), argv[5]);
     if (argc >= 4 && std::strcmp(argv[1], "--conv2") == 0) return record_conv2(argv[2], argv[3], argc - 4, argv + 4);
     if (argc == 6 && std::strcmp(argv[1], "--bench-conv2") == 0) return bench_conv2(argv[2], argv[3], std::atoi(argv[4]), argv[5]);
     if (argc >= 4 && std::strcmp(argv[1], "--conv1") == 0) return record_conv1(argv[2], argv[3], argc - 4, argv + 4);

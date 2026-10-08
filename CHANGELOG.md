@@ -1,5 +1,96 @@
 # Changelog
 
+## 0.0.8 — 2026-10-08 — the encoder's layer norms, bit-exact: all nine `norm → · w → + b` chains
+
+**`ggml_norm` and the MUL and ADD whisper puts after it — each block's `attn_ln` and `mlp_ln`, and `ln_post` — bit for
+bit as the shipped ggml-cpu computes them inside whisper's encoder scheduler, on 8 inputs at 1 and 4 threads; then
+the three nodes in one pass per row: 2–3× the reference's NORM node and 4–5× its three-node chain at one thread, in a
+third of its memory.** Record: `testing/results/0.0.8.txt`; how it was read and found: `testing/norm/NOTES.md`.
+
+### The op, read from the pin and the binary
+- whisper's encoder has **nine** norms, each `ggml_add(ggml_mul(ggml_norm(x, hparams.eps = 1e-5f), w), b)`: per block
+  `attn_ln` (on the block input) and `mlp_ln` (on the residual after attention), then `ln_post` (whose ADD is
+  `embd_enc`). MUL and ADD are separate nodes; the CPU backend's graph fusion covers only RMS_NORM + MUL.
+- `ggml_compute_forward_norm_f32`, one row (frame, 384 values) whole per thread: `ggml_vec_sum_f32` adds the row to a
+  **double in index order** (`vcvtss2sd` + `vaddsd`, not vectorised) and rounds it to f32; `mean = sum / (float)n` in
+  f32; `ggml_vec_cvar_f32`'s **AVX2 + FMA branch, with no FMA in it** (`objdump`): per 8 values `d = x − mean`,
+  `d·d` (`vmulps`), `h = p[4..8] + p[0..4]`, `(h0 + h2) + (h1 + h3)` in f32, widened and added to a double; `sum / n`
+  in double, rounded to f32; `scale = 1.0f / sqrtf(var + eps)` (`vsqrtss`, `vdivss`); `y = d · scale`. Then `y · w`,
+  `+ b`: two roundings.
+
+### The oracle
+- `whisper_oracle --norm`: an eval callback on `sched_encode` observing **every** encoder node (127), one at a time.
+  Each NORM's input is read when the scheduler asks about the NORM (every earlier node computed, the NORM not yet);
+  the NORM, its MUL and that MUL's ADD when computed. Self-checks, yes on 8 / 8: MUL reads the NORM, ADD the MUL; the
+  weights are the model's own tensors by pointer; eps = 1e-5f in `op_params`; inputs contiguous f32; the reference's
+  nodes identical at 1 and 4 threads; `embd_enc` the same observed and not; `ln_post`'s ADD = `embd_enc`; the
+  standalone graphs the bench times = the nodes.
+- Blocks 1–3 and `ln_post` read attention's and the MLP's output, which voaice.rs does not compute yet: those norms
+  are fed **the reference's recorded input to that node**. Block 0's `attn_ln` is also run end to end from voaice's
+  own mel.
+- `oracle_norm_nodes_bit_exact`: NORM, MUL and ADD of all nine chains, by the portable model and by the fast path at 1
+  and 4 threads — **0 differ** in **373,248,000** values (8 inputs).
+- `oracle_attn_ln_0_from_mel`: voaice's mel → conv stage → block 0's chain at 1, 2 and 4 threads: the NORM's input and
+  the three nodes **0 differ** (41,472,000 values).
+- `oracle_norm_discriminators`, each caught on **every** input (ADD values that differ, of 5,184,000 per input): the
+  sum in f32 **3.76–3.87 M**; the mean from the double sum, unrounded **1.17–1.22 M**; a one-pass variance
+  **0.72–1.01 M**; cvar's squares added one by one in double (no 8-lane f32 reduce) **121–196 k**; eps outside the
+  sqrt **5.09–5.15 M**; the scale in double **0.94–1.00 M**; dividing by the root **1.00–1.02 M**; MUL and ADD fused
+  into an FMA **1.48–1.64 M**.
+- **Found:** "the lane sum on every row, without its proof" changes **no** value on the 8 inputs (the 155 rows that
+  cannot prove their order free still round to the same mean). The inputs could not have caught that shortcut; a
+  unit test builds a row where it does change the mean and checks that the fast path refuses the lanes there.
+- **What this holds for:** this laptop's native libggml-cpu (Zen+, AVX2 + FMA). Production's Zen 3 library was not
+  run; an AVX-512 build takes cvar's 16-lane branch (another pairing) — not compared; `base.en` (n = 512) not compared;
+  blocks 1–3 and `ln_post` only on the reference's own inputs to them.
+
+### Faster, bits unchanged
+- The three nodes are **one pass per row**: no NORM or MUL tensor, the output owned by the caller
+  (`LayerNorm::run_into`).
+- The reference's double sum is a chain of 384 dependent adds per row. voaice adds in vector lanes **only when the row
+  proves no partial sum can round in any order** — every value a multiple of 2^q (q from the smallest non-zero |x|)
+  and n · max|x| < 2^(53 + q), checked in the same pass by integer max / min over the bit patterns; then every order
+  gives the exact sum, which is what the in-order sum gave. 107,845 of the 108,000 rows on the 8 inputs proved it; the
+  rest take the in-order loop. cvar's 8-block sums (each with the reference's own operand pairs) are formed four at a
+  time and their double sum gets the same proof.
+- Threads split rows, but `run_into` starts at most one per 2,048 rows: at 1,500 × 384 the op streams ~4.5 MB (more
+  than the 4 MB L3) and is bandwidth-bound here; 2 and 4 threads never beat one (also at 6,000 and 24,000 rows), and a
+  scoped spawn costs ~60 µs against ~0.4 ms. `run_into_split` keeps the exact split; the oracle checks it at 4 threads.
+
+### Measured (gate step 10, only after 4f passed; load 2.1–2.4)
+jfk's encoder input [1500, 384] (each side's own conv stage computes it beforehand), block 0's `attn_ln` weights; the
+reference = the same ops as a standalone ggml graph (equal to the scheduler's nodes); wall = best of 10.
+
+| | reference (all five runs) | voaice (this gate) | gate run | three reruns (first gate's code, load 3.2–3.7) |
+|---|---|---|---|---|
+| NORM node, 1 thread | 0.78–1.19 ms | 0.38 ms (0.37–0.77 in all runs) | 3.11× | 1.02× · 2.30× · 2.19× |
+| NORM node, 2 threads | 0.57–1.03 ms | 0.42 ms (one thread) | 2.47× | 1.22× · 1.31× · 2.08× (two threads) |
+| NORM node, 4 threads | 0.38–0.54 ms | 0.42 ms (one thread) | **0.91×** | 0.94× · 0.75× · 0.83× (four threads) |
+| norm → · w → + b, 1 thread | 1.87–2.51 ms | 0.40 ms (0.40–0.84 in all runs) | 4.93× | 2.60× · 3.94× · 4.39× |
+| norm → · w → + b, 2 threads | 1.90–2.27 ms | 0.44 ms | 4.68× | 3.94× · 4.27× · 4.82× |
+| norm → · w → + b, 4 threads | 1.67–1.86 ms | 0.45 ms | 4.11× | 3.35× · 3.44× · 3.61× |
+
+- **The NORM node alone at 4 threads is not faster**: the reference spreads it over its persistent OpenMP pool
+  (0.38 ms wall, **1.89 CPU-ms**); voaice runs it on one thread (0.42 ms wall, **0.42 CPU-ms** — 4.4× less CPU). The
+  reruns were of the first gate's code, which still spawned 2 and 4 threads (slower than one: see above); that is
+  why the thread cap was added and the gate run again.
+- **CPU:** the chain at 4 threads 0.48 against 6.31 CPU-ms (13×); at 1 thread 0.47 against 1.81.
+- **Memory:** **2,251 KiB** (the output) against the chain graph's **6,750** (NORM, MUL and ADD outputs).
+- The first gate run of this version (before the thread cap; `.oracle/0.0.8.first-gate.txt`, not kept in git):
+  NORM 2.10× / 1.50× / 1.13× and the chain 5.83× / 4.37× / 3.49× at 1 / 2 / 4 threads.
+
+### Added
+- `src/norm.rs`: `LayerNorm` (`new`, `from_parts`, `encoder`, `run`, `run_into`, `run_into_split`, `run_model`,
+  `row_model`), `Node`, `Variant` (the reference = default; eight discriminator flags and the lane sum), `row_stats`,
+  `cvar_model`, `norm_row`, `sum_lanes`, `sum_is_order_free`, `MIN_ROWS_PER_THREAD`, `EPS`; unit tests (the bound;
+  shuffled sums equal in-order ones whenever it holds; a row where the proof is needed; the fast path = the model on
+  n = 1, 8, 13, 384, 512, 1031 with zeros, −0, wide exponent ranges, a zero row and an infinity, 1 and 3 threads).
+- `voaice norm`, `voaice bench-norm norm|chain`; `tests/norm.rs` (3 oracle tests).
+- `whisper_oracle --norm`, `--bench-norm`; gate steps 4f and 10, and step 3 prints the disassembly counts of
+  `ggml_vec_cvar_f32` and `ggml_compute_forward_norm` (0 FMA in either). Every earlier check kept (13 oracle, 4 opus,
+  3 streamair, 3 resample, 5 conv1, 4 conv2). The gate's 4b re-asked production's opus-tools as it does by default
+  (read-only, 57 / 57 answers identical).
+
 ## 0.0.7 — 2026-10-08 — encoder conv2, `embd_conv` and the positional embedding: the encoder's input, bit-exact
 
 **conv2 (stride-2 im2col to f16, 1,152-long f16 dots), its bias and GELU (`embd_conv`), and the positional embedding

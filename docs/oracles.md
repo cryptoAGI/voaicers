@@ -128,6 +128,41 @@ voaice keep conv1's output as f16 (half the bytes) with no change to any bit con
 What this holds for: the same as 0.0.6 — this laptop's native libggml-cpu on the AVX path; production's own library
 was not run. The f32 add (bias, positions) and the CONT copy are one rounding or none, so their order cannot vary.
 
+### The encoder's layer norms (0.0.8) — `tests/norm.rs` against every NORM, MUL and ADD node of the encoder graph
+
+whisper's encoder applies `ggml_add(ggml_mul(ggml_norm(x, 1e-5f), w), b)` nine times on tiny.en: each block's
+`attn_ln` (on the block input) and `mlp_ln` (on the residual after attention), then `ln_post` (whose ADD is
+`embd_enc`). `whisper_oracle --norm` sets an eval callback on `sched_encode` that observes **every** encoder node
+(127), one at a time. A NORM's input is read when the scheduler *asks* about the NORM — after every earlier node ran
+and before the NORM did, so an in-place norm could not have overwritten it; the NORM, the MUL that reads it and the
+ADD that reads the MUL are read when computed. The record self-checks, all yes on all 8 inputs: each MUL's `src[0]` is
+its NORM and each ADD's `src[0]` its MUL; their `src[1]` are the model's own tensors by pointer
+(`encoder.blocks.N.{attn_ln,mlp_ln}.{weight,bias}`, `encoder.ln_post.*`); `op_params` holds eps = 1e-5f; every input is
+contiguous f32; the reference's nodes are identical at 1 and 4 threads; `embd_enc` is the same observed and not; the
+last ADD equals `embd_enc`; the standalone graphs `--bench-norm` times equal the nodes at 1 and 4 threads.
+
+Blocks 1–3 and `ln_post` read the output of attention and the MLP, which voaice.rs does not compute yet (0.0.9,
+v0.1.0), so those norms are fed **the reference's recorded input to that node**; block 0's `attn_ln` is also run end
+to end from voaice's own mel.
+
+| oracle | compares | result (0.0.8) |
+|---|---|---|
+| `oracle_norm_nodes_bit_exact` | the NORM, MUL and ADD nodes of all nine chains, from each NORM's recorded input: voaice's fast path at 1 and 4 threads and the portable model | **0 values differ** on all 8 inputs (373,248,000 compared); of the 108,000 rows, 107,845 proved their sum order-free (lanes), 155 took the in-order loop |
+| `oracle_attn_ln_0_from_mel` | block 0's attn_ln from the WAV: voaice's mel → conv stage (0.0.7) → norm, · w, + b, at 1, 2 and 4 threads | the NORM's input **0 differ**, the three nodes **0 differ**, 8 inputs (41,472,000 compared) |
+| `oracle_norm_discriminators` | the model with one reading changed, on every chain of every input, against the ADD node | ADD values that differ, of 5,184,000 per input (range over the 8 inputs): the sum in f32 **3.76–3.87 M**; the mean from the double sum (no f32 rounding first) **1.17–1.22 M**; a one-pass variance **0.72–1.01 M**; cvar's squares added one by one in double (no 8-lane f32 reduce) **121–196 k**; eps outside the sqrt **5.09–5.15 M**; the scale in double **0.94–1.00 M**; dividing by the root **1.00–1.02 M**; the MUL and ADD fused into an FMA **1.48–1.64 M** — each rejected on every input |
+
+**What the lane sum's proof is for.** The reference adds a row's 384 values to a double one at a time. voaice adds
+them in vector lanes only when the row proves that no partial sum can round in any order (every value a multiple of
+2^q, q from the smallest non-zero |x|, and n · max|x| < 2^(53 + q)); otherwise it adds them in order. The
+discriminator "lane sum on every row, no proof" changes **no** ADD value on these 8 inputs — the 155 unproven rows'
+means round to the same f32 — so the inputs alone would not have caught its absence; a unit test builds a row where
+it does change the mean (2^30, seven 2^−25, −2^30: in order the small values vanish) and checks that the fast path
+refuses the lanes there.
+
+What this holds for: this laptop's native libggml-cpu (Zen+, AVX2 + FMA; the AVX2 branch of `ggml_vec_cvar_f32`,
+which the gate's disassembly shows has no FMA); production's own library was not run. An AVX-512 build takes cvar's
+16-lane branch (`_mm512_reduce_add_ps`), another pairing — not compared. `base.en` (n = 512) not compared.
+
 ## Efficiency — measured only after the oracles pass
 
 (0.0.4) Step 6 of the gate measures the Ogg/Opus reader after 4b passed: Ogg's CRC on 16 MiB sliced-by-8 against the
@@ -176,6 +211,12 @@ conv stage (the mel → the encoder's input) the same way: the reference as the 
 between calls (`voaice bench-conv`), at 1, 2 and nproc threads. The reference's memory is every non-view node of its
 graph (im2cols, products, adds, GELUs, the CONT, the positional ADD), from ggml_nbytes.
 
+Step 10 (0.0.8) times the NORM node alone and the chain norm → · w → + b (block 0's attn_ln weights) on jfk's encoder
+input ([1500, 384], computed beforehand by each side's own conv stage): the reference as a ggml graph of the same ops
+(`whisper_oracle --bench-norm`; the record shows its outputs equal the scheduler's nodes), voaice through
+`LayerNorm::run_into` with its output kept between calls (`voaice bench-norm`), at 1, 2 and nproc threads. The
+reference's memory is its graph's non-view nodes (the norm, mul and add outputs), from ggml_nbytes.
+
 ## The test inputs
 
 Eight WAVs, generated by `testing/make_audio.py` and pinned by sha256 in `testing/pins/audio.sha256`: JFK (11 s,
@@ -198,7 +239,8 @@ result (`embd_conv` is bit-identical with and without the callback, on all 8 inp
 - The mel is bit-identical at 1 and 4 threads (each frame is computed whole by one thread).
 - conv1's four nodes (im2col, the product, + bias, GELU) are bit-identical at 1 and 4 threads: mul_mat splits rows,
   never a dot (each output is one `ggml_vec_dot_f16` call in one thread). So are conv2's four, the CONT and the
-  positional ADD (0.0.7).
+  positional ADD (0.0.7), and all nine norm → mul → add chains of the encoder (0.0.8: each row of a NORM is whole in one
+  thread; MUL and ADD are elementwise).
 - `whisper_full` at 1 thread is identical run to run.
 - At 4 threads against 1, token ids and text are the same, but every token's probability differs in its bits, and
   on JFK the token timestamps move. The transcript oracle is therefore pinned at **1 thread**; a bit-exact transcript

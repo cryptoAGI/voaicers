@@ -38,6 +38,15 @@
 #   9. (0.0.7) its efficiency, only after 4e passed: conv2 (+ bias + GELU) from conv1's output, and the whole conv stage
 #      mel -> encoder input, each side in a fresh process (`voaice bench-conv`, `whisper_oracle --bench-conv2`: the same
 #      ops as a ggml graph, which the record shows equal to the schedulers' nodes), at 1, 2 and nproc threads
+#   4f. (0.0.8) the encoder's nine layer norms (attn_ln and mlp_ln of each block, ln_post): every NORM, MUL and ADD node
+#      read through the encoder scheduler's eval callback with every node observed (`whisper_oracle --norm`), each NORM's
+#      input read before it ran; voaice fed that recorded input (blocks 1-3 and ln_post follow attention and the MLP,
+#      not ported yet) and block 0's from its own mel, compared bit for bit (tests/norm.rs); discriminators (f32 sum,
+#      mean from the double, one-pass variance, cvar without its f32 reduce, eps outside the sqrt, scale in double,
+#      a division, mul + add fused)
+#   10. (0.0.8) its efficiency, only after 4f passed: the NORM node, and norm -> * w -> + b, on jfk's encoder input,
+#      each side in a fresh process (`voaice bench-norm`, `whisper_oracle --bench-norm`: the same ops as a ggml graph,
+#      which the record shows equal to the scheduler's nodes), at 1, 2 and nproc threads
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
@@ -94,6 +103,13 @@ rm -rf .oracle/conv2
 t0=$(date +%s)
 testing/oracle/bin/whisper_oracle --conv2 "$model" .oracle/conv2 .audio/*.wav 2>&1 | tee -a "$out"
 log "(the conv2 record took $(( $(date +%s) - t0 )) s: each input encoded three times, observed at 1 and 4 threads and not observed)"
+rm -rf .oracle/norm
+t0=$(date +%s)
+testing/oracle/bin/whisper_oracle --norm "$model" .oracle/norm .audio/*.wav 2>&1 | tee -a "$out"
+log "(the norm record took $(( $(date +%s) - t0 )) s: each input encoded three times, every encoder node observed at 1 and 4 threads, and not observed)"
+nfn() { local a; a=$(nm -D --defined-only "$lib" | awk -v f="$1" '$3==f{print "0x"$1}'); objdump -d --no-show-raw-insn "$lib" --start-address="$a" --stop-address=$(printf '0x%x' $((a + $2))) | sed '/ret *$/q'; }
+cv=$(nfn ggml_vec_cvar_f32 0x400); fn=$(objdump -d --no-show-raw-insn "$lib" | sed -n '/<ggml_compute_forward_norm>:/,/^$/p')
+log "libggml-cpu's ggml_vec_cvar_f32: $(echo "$cv" | grep -c 'vmulps') vmulps, $(echo "$cv" | grep -c 'vaddsd') vaddsd, $(echo "$cv" | grep -cE 'vfn?m(add|sub)') FMA; ggml_compute_forward_norm: $(echo "$fn" | grep -c vsqrtss) vsqrtss, $(echo "$fn" | grep -c vcvtsd2ss) vcvtsd2ss, $(echo "$fn" | grep -cE 'vfn?m(add|sub)') FMA, $(echo "$fn" | grep -c 'vaddsd') vaddsd (the in-order double sum)"
 log "this CPU: $(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -xE 'avx|avx2|fma|f16c|avx512f' | paste -sd' ') (production: Zen 3, the same extensions; its library is not the one checked here)"
 
 log "## 4. voaice.rs"
@@ -146,6 +162,13 @@ cargo test --release --test conv2 -- --ignored --nocapture --test-threads=1 2>&1
   | grep -vE "^\s*(Compiling|Finished|Running)|^$|^running" > "$step" || true
 tee -a "$out" < "$step"
 grep -q "test result: ok. 4 passed" "$step" || { log "FAIL: the conv2 oracle comparisons did not all pass"; exit 1; }
+
+log "## 4f. the encoder's layer norms (0.0.8): every NORM, MUL and ADD node through the encoder scheduler's eval callback"
+step=.oracle/norm_step.log
+cargo test --release --test norm -- --ignored --nocapture --test-threads=1 2>&1 \
+  | grep -vE "^\s*(Compiling|Finished|Running)|^$|^running" > "$step" || true
+tee -a "$out" < "$step"
+grep -q "test result: ok. 3 passed" "$step" || { log "FAIL: the layer norm oracle comparisons did not all pass"; exit 1; }
 
 nt=$(nproc)
 log "## 5. efficiency (only now): log-mel; wall = best of 10 calls, cpu = CPU ms per call (utime+stime, all threads,"
@@ -265,6 +288,23 @@ for what in conv2 stage; do
     v=$(target/release/voaice bench-conv "$model" .audio/jfk.wav "$what" --threads "$th")
     rw=$(echo "$r" | field wall_best_ms); vw=$(echo "$v" | field wall_best_ms)
     log "$(printf '%-6s %3s | %8.3f %8.3f %5.2fx | %8s %8s | %7s %7s | %6s %6s' "$what" "$th" \
+      "$rw" "$vw" "$(awk -v a="$rw" -v b="$vw" 'BEGIN{print a/b}')" \
+      "$(echo "$r" | field cpu_ms_per_call)" "$(echo "$v" | field cpu_ms_per_call)" \
+      "$(echo "$r" | field op_mem_kb)" "$(echo "$v" | field heap_peak_kb)" \
+      "$(echo "$r" | field rss_peak_delta_kb)" "$(echo "$v" | field rss_peak_delta_kb)")"
+  done
+done
+log "## 10. efficiency (only now): the encoder's layer norm (0.0.8) on jfk's encoder input ([1500, 384]; block 0's"
+log "##    attn_ln weights). norm = the NORM node alone; chain = norm -> * w -> + b (the three nodes). wall = best of 10,"
+log "##    cpu = CPU ms per call over >= 1 s; heap: voaice = bytes live at the first call's peak (its output, then reused);"
+log "##    the reference = the bytes of the graph's non-view nodes (ggml_nbytes); rss = VmHWM delta"
+log "$(printf '%-6s %3s | %8s %8s %6s | %8s %8s | %7s %7s | %6s %6s' op thr ref_ms vo_ms x cpu_ref cpu_vo mem_ref heap_vo rss_r rss_v)"
+for what in norm chain; do
+  for th in 1 2 "$nt"; do
+    r=$(testing/oracle/bin/whisper_oracle --bench-norm "$model" .audio/jfk.wav "$th" "$what")
+    v=$(target/release/voaice bench-norm "$model" .audio/jfk.wav "$what" --threads "$th")
+    rw=$(echo "$r" | field wall_best_ms); vw=$(echo "$v" | field wall_best_ms)
+    log "$(printf '%-6s %3s | %8.4f %8.4f %5.2fx | %8s %8s | %7s %7s | %6s %6s' "$what" "$th" \
       "$rw" "$vw" "$(awk -v a="$rw" -v b="$vw" 'BEGIN{print a/b}')" \
       "$(echo "$r" | field cpu_ms_per_call)" "$(echo "$v" | field cpu_ms_per_call)" \
       "$(echo "$r" | field op_mem_kb)" "$(echo "$v" | field heap_peak_kb)" \
