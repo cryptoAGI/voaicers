@@ -5,6 +5,13 @@
 // in-process; nothing here re-implements whisper.cpp arithmetic.
 //
 //   whisper_oracle <model.bin> <outdir> [wav ...]
+//   whisper_oracle --bench-mel <model.bin> <wav> <threads>
+//
+// --bench-mel measures the reference's whisper_pcm_to_mel_with_state the way `voaice bench-mel` measures voaice's,
+// in a fresh process each: the heap bytes live at the first call's peak (operator new counted, below), peak RSS of
+// the first call (VmHWM after resetting it through /proc/self/clear_refs, minus
+// VmRSS before), the best wall time of 10 calls, and CPU time per call (/proc/self/stat utime + stime, all threads)
+// over a loop of at least 1 s. One line, the same keys as voaice's.
 //
 // writes
 //   <outdir>/model.tsv     hparams (public getters), then one line per tensor the loader holds:
@@ -35,6 +42,9 @@
 #include <string>
 #include <vector>
 #include <sys/stat.h>
+#include <atomic>
+#include <malloc.h>
+#include <new>
 
 // ---- mirrors of the internal structs at the probed offsets (standard-layout prefixes) --------------------------
 struct mel_mirror     { int n_len; int n_len_org; int n_mel; std::vector<float> data; };
@@ -143,7 +153,104 @@ static std::vector<float> read_wav(const char * path) {
 
 static void check(bool ok, const char * what) { if (!ok) die(what); }
 
+// ---- heap accounting: operator new/delete replaced in this executable, which the shared libraries' std::vector
+// allocations bind to (ELF interposition), so the bytes a call holds live at its peak can be read as voaice's
+// counting allocator reads its own. malloc/calloc called directly (ggml's buffers) are not counted; the mel path
+// allocates through std::vector only. Thread stacks are mapped, not allocated, here as in voaice.
+static std::atomic<size_t> g_live{0}, g_peak{0};
+static void * counted(size_t n) {
+    void * p = std::malloc(n ? n : 1);
+    if (!p) throw std::bad_alloc();
+    size_t now = g_live.fetch_add(malloc_usable_size(p)) + malloc_usable_size(p);
+    size_t pk = g_peak.load();
+    while (now > pk && !g_peak.compare_exchange_weak(pk, now)) {}
+    return p;
+}
+static void uncounted(void * p) {
+    if (!p) return;
+    g_live.fetch_sub(malloc_usable_size(p));
+    std::free(p);
+}
+void * operator new(size_t n) { return counted(n); }
+void * operator new[](size_t n) { return counted(n); }
+void operator delete(void * p) noexcept { uncounted(p); }
+void operator delete[](void * p) noexcept { uncounted(p); }
+void operator delete(void * p, size_t) noexcept { uncounted(p); }
+void operator delete[](void * p, size_t) noexcept { uncounted(p); }
+
+// ---- efficiency, from /proc (as src/measure.rs) -------------------------------------------------------------------
+static double cpu_seconds() {
+    FILE * f = std::fopen("/proc/self/stat", "r");
+    if (!f) return -1;
+    char buf[4096];
+    size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+    std::fclose(f);
+    buf[n] = 0;
+    const char * p = std::strrchr(buf, ')');
+    if (!p) return -1;
+    p += 2;  // field 3 (state)
+    for (int field = 3; field < 14 && *p; field++) { p = std::strchr(p, ' '); if (!p) return -1; p++; }
+    unsigned long long ut = 0, st = 0;
+    if (std::sscanf(p, "%llu %llu", &ut, &st) != 2) return -1;
+    return (double)(ut + st) / 100.0;  // USER_HZ
+}
+static long status_kb(const char * key) {
+    FILE * f = std::fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[256];
+    long v = -1;
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::strncmp(line, key, std::strlen(key)) == 0) { v = std::atol(line + std::strlen(key)); break; }
+    }
+    std::fclose(f);
+    return v;
+}
+static bool reset_peak_rss() {
+    FILE * f = std::fopen("/proc/self/clear_refs", "w");
+    if (!f) return false;
+    bool ok = std::fputs("5", f) >= 0;
+    return std::fclose(f) == 0 && ok;
+}
+
+static int bench_mel(const char * model_path, const char * wav, int threads) {
+    whisper_log_set([](enum ggml_log_level, const char *, void *) {}, nullptr);
+    whisper_context_params cparams = whisper_context_default_params();
+    cparams.use_gpu = false;
+    whisper_context * ctx = whisper_init_from_file_with_params(model_path, cparams);
+    check(ctx != nullptr, "model failed to load");
+    std::vector<float> pcm = read_wav(wav);
+    whisper_state * st = whisper_init_state(ctx);
+    check(st != nullptr, "whisper_init_state failed");
+    auto call = [&] { check(whisper_pcm_to_mel_with_state(ctx, st, pcm.data(), (int)pcm.size(), threads) == 0, "pcm_to_mel failed"); };
+    const long before = status_kb("VmRSS:");
+    const bool reset = reset_peak_rss();
+    const size_t live0 = g_live.load();
+    g_peak.store(live0);
+    call();
+    const size_t heap_peak = g_peak.load() - live0;
+    const long peak = reset ? status_kb("VmHWM:") : -1;
+    double best = 1e30;
+    for (int r = 0; r < 10; r++) {
+        const int64_t t0 = ggml_time_us();
+        call();
+        const double ms = (ggml_time_us() - t0) / 1000.0;
+        if (ms < best) best = ms;
+    }
+    const double c0 = cpu_seconds();
+    const int64_t w0 = ggml_time_us();
+    int reps = 0;
+    while (reps < 10 || ggml_time_us() - w0 < 1000000) { call(); reps++; }
+    const double c1 = cpu_seconds();
+    std::printf("bench-mel-reference threads %d samples %zu heap_peak_kb %zu wall_best_ms %.3f cpu_ms_per_call %.3f cpu_reps %d "
+                "rss_peak_delta_kb %ld rss_peak_kb %ld\n",
+                threads, pcm.size(), (heap_peak + 1023) / 1024, best, (c1 - c0) * 1000.0 / reps, reps, peak >= 0 ? peak - before : -1, peak);
+    whisper_free_state(st);
+    whisper_free(ctx);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    if (argc == 5 && std::strcmp(argv[1], "--bench-mel") == 0) return bench_mel(argv[2], argv[3], std::atoi(argv[4]));
     if (argc < 3) die("usage: whisper_oracle <model.bin> <outdir> [wav ...]");
     const std::string outdir = argv[2];
     if (mkdir(outdir.c_str(), 0755) != 0 && errno != EEXIST) die("cannot create outdir (its parent must exist)");

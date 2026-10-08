@@ -5,16 +5,17 @@ has one job, a public surface small enough to read, and an oracle that compares 
 library. A new stage is added beside the old ones, never inside them, and it ships only when its own oracle passes
 in the release gate.
 
-## The modules (0.0.1)
+## The modules (0.0.2)
 
 | module | job | public surface | proven by |
 |---|---|---|---|
 | `src/sha256.rs` | FIPS 180-4 SHA-256, no crates | `Sha256`, `digest()`, `hex()` | FIPS test vectors |
 | `src/model.rs` | the ggml whisper model file: hparams, mel filterbank, vocab and special tokens, every tensor's name/type/shape/offset; the sha256 **pin** that refuses an unknown file | `Model`, `Hparams`, `Pin`, `Tensor`, `Dtype`, `Specials`, `expected_tensors()` | `oracle_model_hparams_tensors_vocab_filters`, `guard_refuses_a_modified_model` |
 | `src/wav.rs` | 16-bit PCM mono 16 kHz WAV → f32, refusing anything else (no silent resampling) | `read()`, `parse()` | `oracle_pcm_input_identical` |
-| `src/mel.rs` | whisper's log-mel front end, in whisper.cpp's own arithmetic order (its radix-2 FFT, mixed f32/f64 band sum, libm symbols) | `Tables`, `Mel`, `log_mel_spectrogram()` | `oracle_mel_bit_exact` (0 ULP), `oracle_mel_discriminates_fused_fft` |
+| `src/mel.rs` | whisper's log-mel front end, in whisper.cpp's own arithmetic order (its radix-2 FFT, mixed f32/f64 band sum, libm symbols); since 0.0.2 allocation-free per frame (a `MelPlan` holds the invariants), SIMD across independent lanes only, threaded by frames | `Tables`, `MelPlan`, `Mel`, `log_mel_spectrogram()`, `log_mel_spectrogram_threads()` | `oracle_mel_bit_exact` (0 ULP), `oracle_mel_threads_bit_identical`, `oracle_mel_discriminates_fused_fft` |
+| `src/measure.rs` | CPU seconds, RSS and its peak from `/proc` (no libc binding), and the `bench` loop the gate uses | `cpu_seconds()`, `rss_kb()`, `peak_rss_kb()`, `reset_peak_rss()`, `bench()` | unit test; its numbers are only read after the oracles pass |
 | `src/lib.rs` | the crate root, and `ulp_distance()` every oracle reports in | `ulp_distance()` | — |
-| `src/main.rs` | the CLI: `voaice info · mel · version` | — | the gate runs it |
+| `src/main.rs` | the CLI: `voaice info · mel · bench-mel · version`; a counting allocator for `bench-mel`'s heap peak | — | the gate runs it |
 
 The pattern each module follows is the one bankml uses: **a pure function of its inputs, the same float operations
 in the same order as the reference, and no hidden state.** That is what makes a module testable alone, and what
@@ -38,7 +39,14 @@ goes in the same way:
 5. **Wire it into `testing/release_gate.sh`.** The gate records the result in `testing/results/<version>.txt` and
    measures speed only after every oracle passes.
 6. **Only then optimise**, and keep the oracle green: integer sums may be reordered (exact in any order); float
-   order may not.
+   order may not. What 0.0.2's mel showed is allowed, each checked by the oracle afterwards:
+   - memory and index work, freely: preallocated scratch, gathered tables, strides instead of copies;
+   - SIMD **across independent accumulators only** — one lane per output, each lane's own sum in the reference's
+     order — never a horizontal reduction that reassociates one sum; mul and add, not FMA (Rust never contracts);
+   - skipping an operation that is an exact identity (adding +0 to a sum), with a guard for the values where it is
+     not (a non-finite operand makes `x * 0` NaN, so that case takes the full path);
+   - threads that split *outputs*, each output computed whole by one thread.
+   And one trap: a C++ `std::max(x, c)` is `x < c ? c : x`, which keeps a NaN `x`; Rust's `f64::max` drops it.
 
 ## Where voaice uses speech-to-text today — the integration points
 

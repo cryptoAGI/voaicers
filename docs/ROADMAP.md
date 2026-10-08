@@ -3,17 +3,52 @@
 voaice.rs grows in stages, each bit-exact against a pinned reference before it is fast. The detailed engineering
 plan for the next stage is in [TODO.md](../TODO.md); this page is the shape of the whole.
 
-## The listening half (whisper.cpp → voaice.rs)
+## The listening half (whisper.cpp → voaice.rs) — counting by ten
 
-| version | stage | oracle |
+voaice.rs moves **one 0.0.1 increment at a time**, and every tenth increment is a milestone: 0.0.1 … 0.0.9 build
+v0.1.0, 0.1.1 … 0.1.9 build v0.2.0, and so on to v1.0.0. Each increment is exact against its oracle before it is
+measured, and the gate measures **from processing to output**: wall time, CPU seconds, heap and RSS against the
+reference in the same run (testing/results/<version>.txt). The operator's focus is efficiency end to end — the least
+CPU and memory from an `.opus` file in to text out, and later from text in to the smallest `.opus` out.
+
+### The first decade: 0.0.1 → v0.1.0 (the encoder, bit-exact)
+
+| version | increment | oracle (all bit patterns) |
 |---|---|---|
-| **0.0.1** ✓ | the model loader, the sha256 pin, the log-mel front end | 167/167 tensors, 51,864/51,864 tokens, mel 0 ULP |
-| 0.1 | the encoder: two convolutions (f16 im2col), GELU (ggml's f16 table, an exported symbol), layer norm, f16 matrix products in AVX2 lane order, flash attention | every intermediate through ggml's scheduler callback; the final output via `whisper_encode_with_state` |
-| 0.2 | the decoder and greedy sampling | `whisper_get_logits_from_state`, logits bit for bit |
-| 0.3 | the full transcript: tokens, timestamps, probabilities, at a stated thread count | `whisper_full`'s token ids, `t0`/`t1` and `p` bits |
-| 0.4 | `voaice transcribe --json` in whisper-cli's JSON shape, and a library entry point — the seam the call sites in [ARCHITECTURE.md](ARCHITECTURE.md) switch on | the same as 0.3, through the CLI |
-| 0.5 | speed: SIMD kernels, threads, the KV cache — always with the oracle green | unchanged bits, then timing against whisper.cpp |
-| 1.0 | production parity: whisper.cpp needed only as the oracle; `base.en` pinned; matched against production's own native ggml-cpu build | all of the above, on production's library |
+| **0.0.1** ✓ | the oracle harness, the model loader + sha256 pin, the log-mel front end | 167/167 tensors, 51,864/51,864 tokens, mel 2,316,640/2,316,640 at 0 ULP |
+| **0.0.2** ✓ | **the mel, optimized, still 0 ULP**: allocation-free per frame (a `MelPlan` of the invariants, the FFT recursion unrolled in place, no 30-s padded copy), SIMD across independent lanes only, threads by frames; efficiency measured (wall, CPU, heap, RSS) | mel 0 ULP; 2/3/4/8 threads = 1 thread on all 8 inputs; fused FFT still rejected; **6.1× faster than 0.0.1, 6.8× the reference at 1 thread, one third of its heap** |
+| 0.0.3 | **a streaming Ogg/Opus container reader**: pages, the Ogg CRC-32, lacing and continuation, `OpusHead` / `OpusTags`, granule positions and pre-skip → the exact duration in samples, without holding the file; shares its page format with [streamair](../streamair/)'s writer (0.0.1, proven against libopus 1.4) | `opusinfo` / `opusdec` (opus-tools) on the same files: duration, pre-skip, packet count, sample count. opus-tools is **not installed on the dev laptop** (`which opusinfo opusdec` finds nothing); production has opus-tools 0.2, as streamair's oracle uses — the oracle runs where the reference is, or opus-tools is pinned and built under `upstream/` like whisper.cpp |
+| 0.0.4 | **the resampler whisper-cli uses**: miniaudio's (`examples/miniaudio.h` as compiled in the pinned whisper.cpp: `ma_decoder_config_init(ma_format_f32, 1, 16000)`, the linear resampler with its low-pass filter of order `MA_DEFAULT_RESAMPLER_LPF_ORDER`), 48 kHz → 16 kHz and the other rates, mono mixdown | the samples whisper-cli's `read_audio_data` produces from the same WAV, bit for bit |
+| 0.0.5 | encoder **conv1**: `im2col` to **f16** (the f32→f16 rounding), then `mul_mat` against the f16 weights | the conv1 node's output through ggml's scheduler callback |
+| 0.0.6 | **GELU** as ggml computes it: the f16 lookup table (`ggml_table_gelu_f16`, an exported symbol: all 65,536 entries), x→f16 indexing, the ±10 clamps | the table entry for entry, then the GELU node |
+| 0.0.7 | **conv2** (stride 2 → 1500 frames) + the positional embedding add | the `embd_conv` tensor |
+| 0.0.8 | **layer norm**: `ggml_compute_forward_norm_f32`'s mean and variance, in its summation order and precision, eps 1e-5, then `* w + b` | each block's norm node |
+| 0.0.9 | **the f16 dot product in ggml's AVX2 lane order**: 4 accumulators × 8 lanes with FMA, `GGML_F32x8_REDUCE`'s pairwise order, the scalar tail — the kernel every matrix product stands on | `ggml_vec_dot_f16` through `ggml_get_type_traits_cpu` on sampled real rows, then every `mul_mat` node |
+| **v0.1.0** | **MILESTONE — the whole encoder bit-exact**: 4 blocks of norm → Q, K, V → **flash attention** (`ggml_flash_attn_ext`: the f16 KV cache, the online softmax and its exp, V accumulation) → out proj → MLP, then `ln_post` | `embd_enc` via `whisper_encode_with_state`, all 8 inputs, at a stated thread count |
+
+### The next milestones (sketch; each built by its own ten increments)
+
+| milestone | what it delivers | oracle |
+|---|---|---|
+| v0.2.0 | the decoder: cross-attention K/V, the f16 self-attention cache, token + positional embeddings, logits | `whisper_get_logits_from_state`: all 51,864 logits per step, bit for bit |
+| v0.3.0 | the full transcript: greedy loop and logit filters, timestamp rules, 30-s windowing and seek, token timestamps, `p` — **at a stated thread count** (the reference's own transcript depends on it) | `whisper_full`'s token ids, `t0`/`t1` and the bits of `p` |
+| v0.4.0 | `voaice transcribe --json` in whisper-cli's shape, a library entry point, and **`.opus` in, end to end**: 0.0.3's reader, a decoder, 0.0.4's resampler, the mel, encoder, decoder — streamed, without a WAV on disk | the same as v0.3.0, through the CLI, from `.opus` files |
+| v0.5.0 | speed: SIMD kernels chosen at run time, threads where they pay, the KV cache without per-step copies, fused conv + GELU — bits unchanged | the oracles green, then CPU-seconds per audio-second against whisper-cli |
+| v0.6.0 – v0.9.0 | `base.en` pinned and proven; the ggml quantized formats production may switch to (q5_0, q8_0); production's own native Zen 3 ggml-cpu build as the oracle; portability (glibc's `sincosf` / `cosf` / `log10` ported in-crate, proven over every input the mel can give them) | each on production's library |
+| **v1.0.0** | **production parity**: voaice's speech-to-text runs on voaice.rs; whisper.cpp is needed only as the oracle | all of the above, on production |
+
+### The Opus efficiency thread
+
+Efficiency is measured, never assumed, at both ends of the voice:
+
+- **In (listening):** an `.opus` file should reach the mel **streamed**, page by page, with memory bounded by a page
+  and a mel window, not by the file — 0.0.3's reader is built that way from the start, and v0.4.0 measures CPU and
+  peak memory per audio-second from `.opus` in to text out. miniaudio has no Opus decoder, so today an `.opus` input
+  reaches whisper-cli only after a decode step; that step is what voaice.rs folds in.
+- **Out (speaking):** rage stores **24 kb/s mono Opus**. The speaking half's output goes through
+  [streamair](../streamair/) (libopus 1.4 is its oracle), and the encoder's settings — frame size (2.5–60 ms),
+  complexity (0–10), VBR or CBR, the application mode — are chosen by **measured CPU-seconds per audio-second and
+  bytes per second at a stated quality**, per setting, on the production CPU, not by defaults or folklore.
 
 ## The speaking half — inspired by Kitten TTS
 

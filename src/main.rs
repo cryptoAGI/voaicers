@@ -1,14 +1,70 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! `voaice` — the command line of voaice.rs 0.0.1.
+//! `voaice` — the command line of voaice.rs.
 //!
-//!   voaice info  <model.bin>                  verify the pin, print the model summary
-//!   voaice mel   <model.bin> <in.wav> [out]   the log-mel spectrogram: shape and sha256 (and raw f32 to `out`)
+//!   voaice info  <model.bin>                                verify the pin, print the model summary
+//!   voaice mel   <model.bin> <in.wav> [out] [--threads N]   the log-mel spectrogram: shape and sha256 (and raw f32 to `out`)
+//!   voaice bench-mel <model.bin> <in.wav> [--threads N]     the mel's heap peak, wall (best of 10), CPU per call, peak RSS
 //!   voaice version
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::process::ExitCode;
-use voaice::{mel, model::Model, sha256, wav};
+use voaice::{measure, mel, model::Model, sha256, wav};
+
+/// The system allocator, counting live heap bytes and their peak, so `bench-mel` can report the heap a call needs
+/// (std only: a `GlobalAlloc` wrapper, no crate). Thread stacks are mapped, not allocated, and are not counted.
+struct Counting;
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        let p = unsafe { System.alloc(l) };
+        if !p.is_null() {
+            PEAK.fetch_max(LIVE.fetch_add(l.size(), Relaxed) + l.size(), Relaxed);
+        }
+        p
+    }
+    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+        let p = unsafe { System.alloc_zeroed(l) };
+        if !p.is_null() {
+            PEAK.fetch_max(LIVE.fetch_add(l.size(), Relaxed) + l.size(), Relaxed);
+        }
+        p
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        unsafe { System.dealloc(p, l) };
+        LIVE.fetch_sub(l.size(), Relaxed);
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+        let q = unsafe { System.realloc(p, l, new) };
+        if !q.is_null() {
+            if new >= l.size() {
+                PEAK.fetch_max(LIVE.fetch_add(new - l.size(), Relaxed) + new - l.size(), Relaxed);
+            } else {
+                LIVE.fetch_sub(l.size() - new, Relaxed);
+            }
+        }
+        q
+    }
+}
+#[global_allocator]
+static GLOBAL: Counting = Counting;
+
+/// Remove `--threads N` from the arguments; 1 when absent.
+fn take_threads(args: &mut Vec<String>) -> Result<usize, String> {
+    match args.iter().position(|a| a == "--threads") {
+        None => Ok(1),
+        Some(i) => {
+            let v = args.get(i + 1).ok_or("--threads needs a number")?.parse::<usize>().map_err(|e| format!("--threads: {e}"))?;
+            args.drain(i..i + 2);
+            Ok(v.max(1))
+        }
+    }
+}
 
 fn run(args: &[String]) -> Result<(), String> {
+    let mut args = args.to_vec();
+    let threads = take_threads(&mut args)?;
     match args.first().map(String::as_str) {
         Some("info") if args.len() == 2 => {
             let m = Model::load_pinned(Path::new(&args[1]))?;
@@ -19,8 +75,9 @@ fn run(args: &[String]) -> Result<(), String> {
             let m = Model::load_pinned(Path::new(&args[1]))?;
             let pcm = wav::read(Path::new(&args[2]))?;
             let t = mel::Tables::new();
+            let plan = mel::MelPlan::new(&t, &m.filters, m.filters_n_mel as usize, m.filters_n_fft as usize)?;
             let start = std::time::Instant::now();
-            let mel = mel::log_mel_spectrogram(&t, &pcm, &m.filters, m.filters_n_mel as usize, m.filters_n_fft as usize)?;
+            let mel = plan.run(&pcm, threads)?;
             let took = start.elapsed();
             let bytes: Vec<u8> = mel.data.iter().flat_map(|v| v.to_le_bytes()).collect();
             println!(
@@ -37,11 +94,53 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
+        Some("bench-mel") if args.len() == 3 => {
+            let (filters, n_mel, n_fft) = {
+                let m = Model::load_pinned(Path::new(&args[1]))?;
+                (m.filters.clone(), m.filters_n_mel as usize, m.filters_n_fft as usize)
+            }; // the model's 78 MB are dropped here, before the peak is reset: what is measured is the mel's
+            let pcm = wav::read(Path::new(&args[2]))?;
+            let t = mel::Tables::new();
+            let plan = mel::MelPlan::new(&t, &filters, n_mel, n_fft)?;
+            let mut err = None;
+            let mut heap_peak = None;
+            let b = measure::bench(
+                || {
+                    let live = LIVE.load(Relaxed);
+                    PEAK.store(live, Relaxed);
+                    match plan.run(&pcm, threads) {
+                        Err(e) => err = Some(e),
+                        Ok(mel) => {
+                            // the first call's: the bytes the call had live at its peak, its output included
+                            heap_peak.get_or_insert(PEAK.load(Relaxed) - live);
+                            drop(mel);
+                        }
+                    }
+                },
+                10,
+                1.0,
+            );
+            if let Some(e) = err {
+                return Err(e);
+            }
+            let opt = |v: Option<String>| v.unwrap_or_else(|| "n/a".into());
+            println!(
+                "bench-mel threads {threads} samples {} heap_peak_kb {} wall_best_ms {:.3} cpu_ms_per_call {} cpu_reps {} rss_peak_delta_kb {} rss_peak_kb {}",
+                pcm.len(),
+                heap_peak.unwrap_or(0).div_ceil(1024),
+                b.wall_best_ms,
+                opt(b.cpu_ms_per_call.map(|c| format!("{c:.3}"))),
+                b.cpu_reps,
+                opt(b.rss_peak_delta_kb.map(|v| v.to_string())),
+                opt(b.rss_peak_kb.map(|v| v.to_string()))
+            );
+            Ok(())
+        }
         Some("version") => {
             println!("voaice {} (reference: whisper.cpp 080bbbe8, ggml 0.16.0)", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        _ => Err("usage: voaice info <model.bin> | voaice mel <model.bin> <in.wav> [out.f32] | voaice version".into()),
+        _ => Err("usage: voaice info <model.bin> | voaice mel <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-mel <model.bin> <in.wav> [--threads N] | voaice version".into()),
     }
 }
 

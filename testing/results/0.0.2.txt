@@ -1,0 +1,67 @@
+# voaice.rs 0.0.2 release gate — 2026-10-08T02:24:56Z
+# host: x86_64, 4 cpus, AMD Ryzen 3 3200U with Radeon Vega Mobile Gfx; load 7.56 7.89 7.64
+# rustc: rustc 1.99.0 (b940084d7 2026-09-28); gcc: gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
+## 1. reference
+built testing/oracle/bin/whisper_oracle (reference 080bbbe85230f624f0b52127f1ae1218247989f9, ggml 0.16.0)
+## 2. inputs
+model models/ggml-tiny.en.bin sha256 921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f (pinned)
+audio ok: 8 files match testing/pins/audio.sha256
+## 3. record (the shipped libwhisper.so, in process)
+whisper_oracle: chirp: 40000 samples, mel 80x3250, threads agree: yes, 1 segments
+whisper_oracle: jfk: 176000 samples, mel 80x4100, threads agree: yes, 2 segments
+whisper_oracle: jfk_x3: 528000 samples, mel 80x6300, threads agree: yes, 6 segments
+whisper_oracle: min_len: 201 samples, mel 80x3001, threads agree: yes, 0 segments
+whisper_oracle: noise_loud: 16000 samples, mel 80x3100, threads agree: yes, 0 segments
+whisper_oracle: odd_len: 12345 samples, mel 80x3077, threads agree: yes, 1 segments
+whisper_oracle: short: 4800 samples, mel 80x3030, threads agree: yes, 0 segments
+whisper_oracle: silence: 16000 samples, mel 80x3100, threads agree: yes, 1 segments
+## 4. voaice.rs
+    Finished `release` profile [optimized] target(s) in 0.03s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test guard_refuses_a_modified_model ... guard: refused: modified tiny.en has the size of ggml-tiny.en.bin (77704715 bytes) but sha256 97fcb6d6c685525d1c12436fe4407284eef7477a9cbce735a09ba20eaf4bb1f8, not the pinned 921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f
+ok
+test oracle_mel_bit_exact ... oracle_mel (2316640 values):
+  chirp       80 x 3250 =  260000 values: 0 differ, max 0 ULP
+  jfk         80 x 4100 =  328000 values: 0 differ, max 0 ULP
+  jfk_x3      80 x 6300 =  504000 values: 0 differ, max 0 ULP
+  min_len     80 x 3001 =  240080 values: 0 differ, max 0 ULP
+  noise_loud  80 x 3100 =  248000 values: 0 differ, max 0 ULP
+  odd_len     80 x 3077 =  246160 values: 0 differ, max 0 ULP
+  short       80 x 3030 =  242400 values: 0 differ, max 0 ULP
+  silence     80 x 3100 =  248000 values: 0 differ, max 0 ULP
+ok
+test oracle_mel_discriminates_fused_fft ... oracle_mel_discriminates: fused-FFT variant on jfk: 25242 of 328000 values differ, max 32768 ULP
+ok
+test oracle_mel_threads_bit_identical ... oracle_mel_threads: 8 inputs x threads {2, 3, 4, 8}: 9266560 values, all identical to 1 thread and to the reference
+ok
+test oracle_model_hparams_tensors_vocab_filters ... oracle_model: 167 tensors (77110272 bytes) identical by sha256, filterbank 80x201 bit-exact, 51864 vocab strings identical (1 hold a NUL the C API cannot show past)
+ok
+test oracle_pcm_input_identical ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.21s
+## 5. efficiency (only now): log-mel; wall = best of 10 calls, cpu = CPU ms per call (utime+stime, all threads,
+##    loop >= 1 s), heap = bytes live at the first call's peak (KiB; voaice's counting allocator, the reference's
+##    operator new counted), rss = VmHWM of the first call minus VmRSS before it (KiB; heap reuse can hide growth)
+0.0.1 rebuilt from tag v0.0.1 (8ecf659): its `voaice mel` times the mel call alone, 1 thread, best of 10
+wav         samples |   ref_1t  v001_1t    vo_1t |   ref_4t    vo_4t |  x_v001 | cpu_ref1  cpu_vo1 | cpu_ref4  cpu_vo4 | heap_r heap_v |  rss_r  rss_v
+chirp         40000 |   13.204   14.100    2.142 |    8.865    1.645 |   6.58x |   13.731    2.230 |   15.366    2.672 |   3068   1016 |   2876    108
+jfk          176000 |   60.105   62.900    9.539 |   51.979    8.847 |   6.59x |   58.333    9.733 |   64.737   10.449 |   3868   1282 |   3796   1080
+jfk_x3       528000 |  198.807  167.800   24.932 |  116.683   15.792 |   6.73x |  162.000   25.789 |  178.000   29.362 |   5925   1969 |   5580   1804
+min_len         201 |    1.359    1.800    0.335 |    1.518    0.344 |   5.37x |    1.575    0.382 |    2.043    0.410 |   2836    938 |   2720     48
+noise_loud    16000 |    6.699    6.700    1.085 |    8.384    1.065 |   6.18x |    6.864    1.122 |    7.667    1.186 |   2928    969 |   2576      0
+odd_len       12345 |    4.940    5.500    0.901 |    4.710    0.928 |   6.10x |    5.427    0.960 |    5.967    0.934 |   2908    962 |   2740    104
+short          4800 |    5.686    3.200    0.580 |    3.591    0.551 |   5.52x |    3.543    0.722 |    3.791    0.614 |   2860    947 |   2852      0
+silence       16000 |   12.124    6.700    1.134 |    5.797    1.039 |   5.91x |    6.627    1.131 |    7.934    1.113 |   2928    969 |   2772     64
+geometric mean of wall-time ratios over 8 inputs: voaice at 1 thread is 6.10x faster than 0.0.1 and 6.78x faster than the reference at 1 thread; at 4 threads, 5.92x faster than the reference at 4
+## transcripts recorded (not yet reproduced by voaice.rs: encoder and decoder are later stages)
+chirp:  (whistling) 
+jfk:  And so my fellow Americans ask not what your country can do for you  ask what you can do for your country. 
+jfk_x3:  And so my fellow Americans ask not what your country can do for you  ask what you can do for your country  And so my fellow Americans ask not what your country can do for you  ask what you can do for your country  And so my fellow Americans ask not what your country can do for you  for you ask what you can do for your country. 
+min_len: 
+noise_loud: 
+odd_len:  [BLANK_AUDIO] 
+short: 
+silence:  [BLANK_AUDIO] 
+GATE PASSED

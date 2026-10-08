@@ -186,6 +186,31 @@ fn oracle_mel_bit_exact() {
     assert!(!failed, "the mel is not bit-exact against the reference");
 }
 
+/// Threads split frames, each frame computed whole by one thread: the mel at 2, 3, 4 and 8 threads must have the
+/// 1-thread bits on every input (and so the reference's, which `oracle_mel_bit_exact` checks for 1 thread).
+#[test]
+#[ignore]
+fn oracle_mel_threads_bit_identical() {
+    let m = model();
+    let t = mel::Tables::new();
+    let plan = mel::MelPlan::new(&t, &m.filters, m.filters_n_mel as usize, m.filters_n_fft as usize).unwrap();
+    let mut checked = 0usize;
+    for w in wavs() {
+        let pcm = read_f32(&oracle_dir().join(&w).join("pcm.f32"));
+        let theirs = read_f32(&oracle_dir().join(&w).join("mel.f32"));
+        let one = plan.run(&pcm, 1).unwrap();
+        for threads in [2, 3, 4, 8] {
+            let many = plan.run(&pcm, threads).unwrap();
+            let (n, ulp, _) = compare(&many.data, &one.data);
+            assert_eq!(n, 0, "{w}: {threads} threads differ from 1 thread in {n} values (max {ulp} ULP)");
+            let (n, ulp, _) = compare(&many.data, &theirs);
+            assert_eq!(n, 0, "{w}: {threads} threads differ from the reference in {n} values (max {ulp} ULP)");
+            checked += many.data.len();
+        }
+    }
+    eprintln!("oracle_mel_threads: 8 inputs x threads {{2, 3, 4, 8}}: {checked} values, all identical to 1 thread and to the reference");
+}
+
 /// The oracle must be able to fail: the same pipeline with the FFT's multiply-adds fused (what a build with FMA
 /// contraction computes) has to be caught on real audio.
 #[test]

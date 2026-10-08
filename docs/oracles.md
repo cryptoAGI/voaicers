@@ -9,13 +9,34 @@ Run them all with `testing/release_gate.sh`; the record is written to `testing/r
 `tests/oracle.rs` they are `#[ignore]`d for plain `cargo test`, because they need the pinned model and a recorded
 oracle run.
 
-| oracle | compares | result (0.0.1) |
+| oracle | compares | result (0.0.2) |
 |---|---|---|
 | `oracle_model_hparams_tensors_vocab_filters` | the 11 hparams; every tensor's name, type, shape, byte count and the sha256 of its bytes **as whisper's loader holds them in memory**; the 80×201 filterbank; every token string | 11/11 · **167/167** tensors (77,110,272 bytes) · filterbank bit-exact · **51,864/51,864** tokens |
 | `oracle_pcm_input_identical` | the f32 samples voaice reads from each WAV against the samples fed to whisper | identical on all 8 inputs |
 | `oracle_mel_bit_exact` | every value of the log-mel spectrogram | **2,316,640/2,316,640, max 0 ULP**, 8 inputs |
+| `oracle_mel_threads_bit_identical` | the mel at 2, 3, 4 and 8 threads against 1 thread and against the reference | **9,266,560** values identical, 8 inputs |
 | `oracle_mel_discriminates_fused_fft` | the discriminator: the FFT with fused multiply-adds | differs in 25,242 of 328,000 values on JFK — the oracle tells float orders apart |
 | `guard_refuses_a_modified_model` | a model with one flipped bit in `decoder.token_embedding.weight` | parses, and is refused by the pin with the reason |
+
+Below the oracles, `cargo test` carries a second witness for the mel that needs no model:
+`same_bits_as_the_0_0_1_port_at_every_thread_count` keeps 0.0.1's allocating port verbatim (test-only) and requires
+the optimized path, at 1, 2, 3, 4 and 7 threads and in its fused variant, to give the same bits on synthetic audio
+and a synthetic filterbank with zero runs.
+
+## Efficiency — measured only after the oracles pass
+
+Step 5 of the gate, in the same run, each row a fresh process for the reference (`whisper_oracle --bench-mel`) and
+for voaice (`voaice bench-mel`), measured the same way on both sides:
+
+| measure | how |
+|---|---|
+| wall | best of 10 calls (`ggml_time_us` / `Instant`), after one untimed call |
+| CPU | `/proc/self/stat` utime + stime (all threads, joined ones included) over a loop of ≥ 1 s, per call; ticks are 1/100 s, so the loop is what makes them small |
+| heap | bytes live at the first call's peak: voaice's counting `GlobalAlloc`; the reference's `operator new`/`delete` replaced in the oracle executable (libwhisper's `std::vector`s bind to it) |
+| RSS | `VmHWM` after resetting it through `/proc/self/clear_refs`, minus `VmRSS` before the call — reported, but heap reuse after the model load can hide growth, so heap is the comparable number |
+| 0.0.1 | rebuilt from tag `v0.0.1` in the same run (scratch under `.oracle/`, removed after); its `voaice mel` times the mel call alone |
+
+No crate and no libc binding is used for any of it: `/proc` is read as text.
 
 ## The test inputs
 

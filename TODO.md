@@ -9,7 +9,23 @@ whisper.cpp (upstream/PIN) in the same run; only then is its speed measured.
 - [x] Stage 1 — model loader (`src/model.rs`): ggml whisper format, sha256 guard, 167/167 tensors identical.
 - [x] Stage 2 — log-mel front end (`src/mel.rs`): 2,316,640 / 2,316,640 values bit-exact, 8 inputs.
 
-## Next, in order
+## Done in 0.0.2
+- [x] The mel, optimized with its bits unchanged: allocation-free per frame, SIMD across independent lanes, threads
+      by frames (`MelPlan::run(samples, threads)`); 0 ULP on all 8 inputs, 2/3/4/8 threads = 1 thread, the fused-FFT
+      discriminator still rejected. 6.1× faster than 0.0.1, 6.8× the reference at one thread, a third of its heap.
+- [x] The gate measures efficiency after the oracles: wall, CPU (`/proc/self/stat`), heap (counting allocators on
+      both sides), RSS (`VmHWM`), at 1 and nproc threads, and 0.0.1 rebuilt from its tag in the same run.
+
+## Next: 0.0.3 — the streaming Ogg/Opus reader (see docs/ROADMAP.md for the decade to v0.1.0)
+- [ ] Pages (capture pattern, version, header type, granule, serial, sequence, CRC-32 0x04C11DB7 unreflected, lacing),
+      packets across pages, `OpusHead` (version, channels, pre-skip, input rate, gain, mapping) and `OpusTags`; the
+      exact duration = last granule − pre-skip; bounded memory (one page at a time). Share the page format with
+      streamair's writer.
+- [ ] Oracle: opus-tools' `opusinfo` / `opusdec` on the same files — not installed on this laptop; pin and build it
+      under `upstream/` or run the oracle where production's opus-tools 0.2 is. Discriminator: a corrupted CRC and a
+      wrong pre-skip must be refused / caught.
+
+## Then, in order
 
 ### Stage 0b — close the reference gaps
 - [ ] Verify the pin against production itself: `strings` on the VPS's `libggml-base.so*` for `0.16.0`, the build's
@@ -70,10 +86,8 @@ f32 bits of `p` for every token: the whole file identical is the stage's gate. A
 
 ### Stage 6 — fast
 Only after stage 5 is bit-exact. Measured, never quoted: same input, same cores (bankml's `testing/pinned.sh`), the
-oracle passing in the same run. Candidates: the mel (0.0.1's port allocates per FFT level and per frame and runs one
-thread — see testing/results for its time against the reference's; a different FFT is not allowed, the float order
-is the reference's, but the allocations can go and frames can be threaded, each frame whole in one thread as
-whisper does); `vec_dot_f16`
+oracle passing in the same run. Candidates (the mel's allocations and threads were done in 0.0.2; what remains of its time is glibc's
+`log10`, about a fifth, and the 25-point DFTs); `vec_dot_f16`
 with AVX2/F16C in the reference's lane order; fused conv+GELU; a KV layout without per-step copies. Then
 `base.en`, then the ggml quantized formats (q5_0, q8_0) production may switch to.
 
@@ -82,7 +96,7 @@ with AVX2/F16C in the reference's lane order; fused conv+GELU; a KV layout witho
       so a host with another libm could differ in the last bit. Port the exact glibc 2.35 algorithms in-crate (as
       bankml carries its own f16), with an oracle over every f32 input the mel can produce for `sincosf`/`cosf`
       (400 + 400 arguments) and a sampled-plus-boundary oracle for `log10` on f64.
-- [ ] Threading of the mel (frame i to worker i % n), checked bit-identical to one thread.
+- [x] Threading of the mel (0.0.2: contiguous runs of frames per thread), checked bit-identical to one thread.
 
 ## Production parity (checked 2026-10-07)
 - The pin is production's commit (see upstream/PIN). libwhisper there has no FMA, so stages 1–2 are exact on production too.
