@@ -21,9 +21,11 @@
 //! triangles, and V − E + F = −2 (a disk with three holes: the outline, the two eyes, the mouth). Measured: 852
 //! triangles, 468 vertices, 1,322 edges, 88 on the boundary.
 //!
-//! Not ported yet, on purpose: pose normalisation, frame averaging and frontality. frontality calls `Math.atan2`,
-//! which V8 takes from fdlibm and Rust from the system libm, and those can differ in the last bit; it needs its own
-//! oracle before it is claimed (TODO in docs/FCLONE.md).
+//! **The capture pipeline.** pose normalisation, frame averaging, frontality and the whole `fclone(frames)` path are
+//! ported too. frontality calls `Math.atan2`, which V8 takes from fdlibm and Rust's `f64::atan2` from the system
+//! libm, so [`js_atan2`] is fdlibm's `atan2`/`atan`, step for step. `Math.max` keeps NaN where `f64::max` drops it,
+//! so [`js_max`] does too. The oracle regenerates the same inputs from an exact LCG and compares digests of raw f64
+//! bits (testing/fclone/make_pose_oracle.mjs).
 
 use voaice::json::{self, Value};
 use voaice::sha256;
@@ -271,6 +273,358 @@ pub fn check_faice(text: &str) -> Result<Check, String> {
     Ok(if fields.is_empty() { Check::Verified(r) } else { Check::Mismatch { recomputed: r, fields } })
 }
 
+// ── V8's Math.atan2: fdlibm (Sun, freely redistributable), as ported in V8's src/base/ieee754.cc ──────────────
+
+// the constants are fdlibm's, digit for digit (the doubles they parse to are what matter, and they are the same);
+// written verbatim so they can be checked against the source
+#[allow(clippy::excessive_precision, clippy::approx_constant)]
+const ATANHI: [f64; 4] = [4.63647609000806093515e-01, 7.85398163397448278999e-01, 9.82793723247329054082e-01, 1.57079632679489655800e+00];
+// the constants are fdlibm's, digit for digit (the doubles they parse to are what matter, and they are the same);
+// written verbatim so they can be checked against the source
+#[allow(clippy::excessive_precision, clippy::approx_constant)]
+const ATANLO: [f64; 4] = [2.26987774529616870924e-17, 3.06161699786838301793e-17, 1.39033110312309984516e-17, 6.12323399573676603587e-17];
+// the constants are fdlibm's, digit for digit (the doubles they parse to are what matter, and they are the same);
+// written verbatim so they can be checked against the source
+#[allow(clippy::excessive_precision, clippy::approx_constant)]
+const AT: [f64; 11] = [
+    3.33333333333329318027e-01, -1.99999999998764832476e-01, 1.42857142725034663711e-01, -1.11111104054623557880e-01,
+    9.09088713343650656196e-02, -7.69187620504482999495e-02, 6.66107313738753120669e-02, -5.83357013379057348645e-02,
+    4.97687799461593236017e-02, -3.65315727442169155270e-02, 1.62858201153657823623e-02,
+];
+
+fn words(x: f64) -> (i32, u32) {
+    let b = x.to_bits();
+    ((b >> 32) as u32 as i32, b as u32)
+}
+
+/// fdlibm `atan` (s_atan.c), step for step.
+pub fn fdlibm_atan(x0: f64) -> f64 {
+    let mut x = x0;
+    let (hx, lo) = words(x);
+    let ix = hx & 0x7fff_ffff;
+    let id: i32;
+    if ix >= 0x4410_0000 {
+        // |x| >= 2^66
+        if ix > 0x7ff0_0000 || (ix == 0x7ff0_0000 && lo != 0) {
+            return x + x; // NaN
+        }
+        return if hx > 0 { ATANHI[3] + ATANLO[3] } else { -ATANHI[3] - ATANLO[3] };
+    }
+    if ix < 0x3fdc_0000 {
+        // |x| < 0.4375
+        if ix < 0x3e40_0000 && 1.0e300 + x > 1.0 {
+            return x; // |x| < 2^-27
+        }
+        id = -1;
+    } else {
+        x = x.abs();
+        if ix < 0x3ff3_0000 {
+            if ix < 0x3fe6_0000 {
+                id = 0;
+                x = (2.0 * x - 1.0) / (2.0 + x);
+            } else {
+                id = 1;
+                x = (x - 1.0) / (x + 1.0);
+            }
+        } else if ix < 0x4003_8000 {
+            id = 2;
+            x = (x - 1.5) / (1.0 + 1.5 * x);
+        } else {
+            id = 3;
+            x = -1.0 / x;
+        }
+    }
+    let z = x * x;
+    let w = z * z;
+    let s1 = z * (AT[0] + w * (AT[2] + w * (AT[4] + w * (AT[6] + w * (AT[8] + w * AT[10])))));
+    let s2 = w * (AT[1] + w * (AT[3] + w * (AT[5] + w * (AT[7] + w * AT[9]))));
+    if id < 0 {
+        return x - x * (s1 + s2);
+    }
+    let i = id as usize;
+    let z = ATANHI[i] - ((x * (s1 + s2) - ATANLO[i]) - x);
+    if hx < 0 { -z } else { z }
+}
+
+// the constants are fdlibm's, digit for digit (the doubles they parse to are what matter, and they are the same);
+// written verbatim so they can be checked against the source
+#[allow(clippy::excessive_precision, clippy::approx_constant)]
+/// fdlibm `atan2` (e_atan2.c) as V8 runs it for `Math.atan2(y, x)`.
+pub fn js_atan2(y: f64, x: f64) -> f64 {
+    const TINY: f64 = 1.0e-300;
+    const PI_O_4: f64 = 7.8539816339744827900E-01;
+    const PI_O_2: f64 = 1.5707963267948965580E+00;
+    const PI: f64 = 3.1415926535897931160E+00;
+    const PI_LO: f64 = 1.2246467991473531772E-16;
+    let (hx, lx) = words(x);
+    let (hy, ly) = words(y);
+    let ix = hx & 0x7fff_ffff;
+    let iy = hy & 0x7fff_ffff;
+    let nz = |l: u32| (l | l.wrapping_neg()) >> 31;
+    if (ix as u32 | nz(lx)) > 0x7ff0_0000 || (iy as u32 | nz(ly)) > 0x7ff0_0000 {
+        return x + y; // NaN
+    }
+    if (hx.wrapping_sub(0x3ff0_0000) as u32 | lx) == 0 {
+        return fdlibm_atan(y); // x = 1.0
+    }
+    let mut m = ((hy >> 31) & 1) | ((hx >> 30) & 2);
+    if (iy as u32 | ly) == 0 {
+        return match m {
+            0 | 1 => y,
+            2 => PI + TINY,
+            _ => -PI - TINY,
+        };
+    }
+    if (ix as u32 | lx) == 0 {
+        return if hy < 0 { -PI_O_2 - TINY } else { PI_O_2 + TINY };
+    }
+    if ix == 0x7ff0_0000 {
+        return if iy == 0x7ff0_0000 {
+            match m {
+                0 => PI_O_4 + TINY,
+                1 => -PI_O_4 - TINY,
+                2 => 3.0 * PI_O_4 + TINY,
+                _ => -3.0 * PI_O_4 - TINY,
+            }
+        } else {
+            match m {
+                0 => 0.0,
+                1 => -0.0,
+                2 => PI + TINY,
+                _ => -PI - TINY,
+            }
+        };
+    }
+    if iy == 0x7ff0_0000 {
+        return if hy < 0 { -PI_O_2 - TINY } else { PI_O_2 + TINY };
+    }
+    let k = (iy - ix) >> 20;
+    let z = if k > 60 {
+        m &= 1;
+        PI_O_2 + 0.5 * PI_LO
+    } else if hx < 0 && k < -60 {
+        0.0
+    } else {
+        fdlibm_atan((y / x).abs())
+    };
+    match m {
+        0 => z,
+        1 => -z,
+        2 => PI - (z - PI_LO),
+        _ => (z - PI_LO) - PI,
+    }
+}
+
+/// `Math.max(a, b)` for two numbers: NaN if either is NaN (f64::max would return the other).
+fn js_max(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() { f64::NAN } else if a > b { a } else if b > a { b } else if a == 0.0 && b == 0.0 && (a.is_sign_negative() && b.is_sign_negative()) { -0.0 } else if a == 0.0 && b == 0.0 { 0.0 } else { a }
+}
+
+/// geometry.js `frontality(matrix)`: 1 for no matrix (or not 16 long), else
+/// `max(0, 1 − (|yaw| + |pitch|) / π)` with yaw = atan2(m8, m10), pitch = atan2(−m9, hypot(m8, m10)).
+pub fn frontality(m: Option<&[f64]>) -> f64 {
+    let Some(m) = m.filter(|m| m.len() == 16) else { return 1.0 };
+    let yaw = js_atan2(m[8], m[10]);
+    let pitch = js_atan2(-m[9], js_hypot(&[m[8], m[10]]));
+    js_max(0.0, 1.0 - (yaw.abs() + pitch.abs()) / std::f64::consts::PI)
+}
+
+fn mean(pts: &[Point], k: usize) -> f64 {
+    let mut s = 0.0;
+    for p in pts {
+        s += [p.x, p.y, p.z][k];
+    }
+    s / pts.len() as f64
+}
+
+/// geometry.js `poseNormalize(lms, matrix)`: the inverse rotation (the 3×3 block transposed, column-major) when a
+/// 16-entry matrix is given, then centred on the mean and scaled by the inner-eye distance (`|| 1e-6`).
+pub fn pose_normalize(lms: &[Point], m: Option<&[f64]>) -> Vec<Point> {
+    let mut pts: Vec<Point> = lms.to_vec();
+    if let Some(m) = m.filter(|m| m.len() == 16) {
+        for p in &mut pts {
+            let (x, y, z) = (p.x, p.y, p.z);
+            *p = Point {
+                x: m[0] * x + m[1] * y + m[2] * z,
+                y: m[4] * x + m[5] * y + m[6] * z,
+                z: m[8] * x + m[9] * y + m[10] * z,
+            };
+        }
+    }
+    let (cx, cy, cz) = (mean(&pts, 0), mean(&pts, 1), mean(&pts, 2));
+    let scale = or_tiny(d(&pts[lm::EYE_IN_R], &pts[lm::EYE_IN_L]));
+    pts.iter().map(|p| Point { x: (p.x - cx) / scale, y: (p.y - cy) / scale, z: (p.z - cz) / scale }).collect()
+}
+
+/// One captured frame: landmarks, and the facial transformation matrix when the landmarker gave one.
+#[derive(Clone, Debug)]
+pub struct Frame {
+    pub landmarks: Vec<Point>,
+    pub matrix: Option<Vec<f64>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Aggregate {
+    pub landmarks: Vec<Point>,
+    pub frontal_index: usize,
+    pub frames: usize,
+    pub mean_frontality: f64,
+}
+
+/// geometry.js `aggregate(frames)`: one frame is returned as it is; several are pose-normalised, weighted by
+/// `max(0.05, frontality)` and averaged per vertex. (Frames with no landmarks are dropped first, as there.)
+pub fn aggregate(frames: &[Frame]) -> Result<Aggregate, String> {
+    let valid: Vec<&Frame> = frames.iter().filter(|f| !f.landmarks.is_empty()).collect();
+    if valid.is_empty() {
+        return Err("face_clone: no valid frames to aggregate".into());
+    }
+    if valid.len() == 1 {
+        return Ok(Aggregate { landmarks: valid[0].landmarks.clone(), frontal_index: 0, frames: 1,
+                              mean_frontality: frontality(valid[0].matrix.as_deref()) });
+    }
+    let normed: Vec<(Vec<Point>, f64)> = valid
+        .iter()
+        .map(|f| (pose_normalize(&f.landmarks, f.matrix.as_deref()), js_max(0.05, frontality(f.matrix.as_deref()))))
+        .collect();
+    let (mut frontal_index, mut best, mut fsum) = (0, -1.0f64, 0.0f64);
+    for (i, (_, w)) in normed.iter().enumerate() {
+        if *w > best {
+            best = *w;
+            frontal_index = i;
+        }
+        fsum += *w;
+    }
+    let mut wsum = 0.0;
+    for (_, w) in &normed {
+        wsum += *w;
+    }
+    let n = normed[0].0.len();
+    let mut out = Vec::with_capacity(n);
+    for v in 0..n {
+        let (mut x, mut y, mut z) = (0.0, 0.0, 0.0);
+        for (pts, w) in &normed {
+            let p = pts[v];
+            x += p.x * w;
+            y += p.y * w;
+            z += p.z * w;
+        }
+        out.push(Point { x: x / wsum, y: y / wsum, z: z / wsum });
+    }
+    Ok(Aggregate { landmarks: out, frontal_index, frames: valid.len(), mean_frontality: fsum / normed.len() as f64 })
+}
+
+/// ollywoo fclone.js `fclone(frames)` up to the print: aggregate, the twelve proportions, symmetry, quality
+/// (`confidence = min(1, frames / 20)`, the frontality of the chosen frame), the faceprint. Refuses fewer than
+/// `min_frames` frames, as fclone.js does (it defaults to 5).
+pub fn fclone_frames(frames: &[Frame], min_frames: usize) -> Result<(Faceprint, Aggregate, Quality), String> {
+    if frames.len() < min_frames {
+        return Err(format!("only {} frames had a face; need {}", frames.len(), min_frames));
+    }
+    let agg = aggregate(frames)?;
+    let props = proportions(&agg.landmarks);
+    let sym = symmetry(&agg.landmarks);
+    let best = frames.get(agg.frontal_index).unwrap_or(&frames[0]);
+    let q = Quality { confidence: (frames.len() as f64 / 20.0).min(1.0), symmetry: sym,
+                      frontality: frontality(best.matrix.as_deref()) };
+    Ok((faceprint(&props, q)?, agg, q))
+}
+
+// ── the persona print: face and voice bound into one (faicey persona.js) ─────────────────────────────────────────
+
+/// A print as persona.js accepts it: a hash, its measures as decimal strings, and a precision score (persona.js reads
+/// `precisionScore ?? precision ?? "0"`, so a print without one, like a dvscope/1 vprint, counts as precision 0).
+#[derive(Clone, Debug)]
+pub struct PrintRef {
+    pub hash: String,
+    pub measures: Vec<String>,
+    pub precision_score: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PersonaPrint {
+    pub hash: String,
+    pub modalities: Vec<&'static str>,
+    pub measures: Vec<String>,
+    pub precision_score: String,
+    pub canonical: String,
+}
+
+/// persona.js `personaPrint({face, voice})`: the payload `{"v":1,"kind":"persona","modalities":[…],"faceHash":…,
+/// "voiceHash":…,"measures":[face…, voice…]}`, hashed `"0x" + sha256`; the precision is the product of the present
+/// modalities' precisions (each `Number(score) / 1e18`), clamped, kept to nine decimals. Neither modality is an error,
+/// so a persona print cannot exist without something measured.
+pub fn persona_print(face: Option<&PrintRef>, voice: Option<&PrintRef>) -> Result<PersonaPrint, String> {
+    if face.is_none() && voice.is_none() {
+        return Err("persona: need a faceprint and/or a voiceprint".into());
+    }
+    let modalities: Vec<&'static str> = [face.map(|_| "face"), voice.map(|_| "voice")].into_iter().flatten().collect();
+    let measures: Vec<String> = face.iter().chain(voice.iter()).flat_map(|p| p.measures.iter().cloned()).collect();
+    let canonical = Value::obj(vec![
+        ("v", Value::int(1)),
+        ("kind", Value::str("persona")),
+        ("modalities", Value::Arr(modalities.iter().map(|m| Value::str(*m)).collect())),
+        ("faceHash", Value::str(face.map(|p| p.hash.as_str()).unwrap_or(""))),
+        ("voiceHash", Value::str(voice.map(|p| p.hash.as_str()).unwrap_or(""))),
+        ("measures", Value::Arr(measures.iter().map(Value::str).collect())),
+    ])
+    .to_compact();
+    let prec = |p: Option<&PrintRef>| -> f64 {
+        match p {
+            None => 1.0,
+            Some(p) => p.precision_score.as_deref().unwrap_or("0").trim().parse::<f64>().unwrap_or(f64::NAN) / 1e18,
+        }
+    };
+    let precision = clamp01(prec(face) * prec(voice));
+    // BigInt(Math.round(precision * 1e9)) * 10n ** 9n; NaN would throw in JavaScript, so it is refused here
+    if precision.is_nan() {
+        return Err("persona: a precision score is not a number".into());
+    }
+    let precision_score = ((precision * 1e9).round() as u128 * 1_000_000_000).to_string();
+    let hash = format!("0x{}", sha256::hex(&sha256::digest(canonical.as_bytes())));
+    Ok(PersonaPrint { hash, modalities, measures, precision_score, canonical })
+}
+
+// ── the face mint rule ────────────────────────────────────────────────────────────────────────────────────────
+
+/// Whether the face a forge log describes may be minted, and every reason when it may not. The voice rule
+/// (`vclone::mintable`) asks for a measured voice, consent for the ref that was cloned and a cleared engine; a face
+/// asks for the analogue, against the faceprint the token would commit to:
+/// - a `measure` event with `modality: "face"` whose `hash` is that faceprint;
+/// - its capture recorded `image_kept: false` (fCLONE keeps landmarks, never a photograph);
+/// - the person's latest face consent (`consent` with `modality: "face"`) has scope `mint`, names that faceprint, and
+///   is not a revocation.
+pub fn mintable_face(log: &crate::vclone::Log, fprint: &str) -> Result<(), Vec<String>> {
+    use crate::vclone::Kind;
+    let modality = |e: &&crate::vclone::Event| e.body.get("modality").and_then(Value::as_str) == Some("face");
+    let mut why = Vec::new();
+    let measured = log.events.iter().filter(modality).any(|e| {
+        e.kind == Kind::Measure && e.body.get("hash").and_then(Value::as_str) == Some(fprint)
+    });
+    if !measured {
+        why.push("no face measurement with this faceprint".to_string());
+    }
+    let capture = log.events.iter().filter(modality).rev().find(|e| e.kind == Kind::Capture);
+    match capture.and_then(|c| c.body.get("image_kept")) {
+        Some(Value::Bool(false)) => {}
+        Some(_) => why.push("the face capture kept an image".into()),
+        None => why.push("the face capture does not record that no image was kept".into()),
+    }
+    match log.events.iter().filter(modality).rev().find(|e| e.kind == Kind::Consent) {
+        None => why.push("no face consent from the person".into()),
+        Some(c) => {
+            if c.body.get("revoked") == Some(&Value::Bool(true)) {
+                why.push("the face consent was revoked".into());
+            } else if c.body.get("scope").and_then(Value::as_str) != Some("mint") {
+                why.push("the latest face consent is not for `mint`".into());
+            }
+            if c.body.get("fprint").and_then(Value::as_str) != Some(fprint) {
+                why.push("the face consent names a different faceprint".into());
+            }
+        }
+    }
+    if why.is_empty() { Ok(()) } else { Err(why) }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct MeshCheck {
     pub vertices: usize,
@@ -339,6 +693,31 @@ mod tests {
         assert_eq!(js_hypot(&[0.0, -0.0, 0.0]), 0.0);
         assert!(js_hypot(&[f64::NAN, 1.0, 1.0]).is_nan());
         assert_eq!(js_hypot(&[f64::NAN, f64::NEG_INFINITY, 1.0]), f64::INFINITY);
+    }
+
+    #[test]
+    fn the_face_mint_rule() {
+        use crate::vclone::{Kind, Log};
+        let fp = format!("0x{}", "ab".repeat(32));
+        let face = |extra: Vec<(&str, Value)>| {
+            let mut kv = vec![("modality", Value::str("face"))];
+            kv.extend(extra);
+            Value::obj(kv)
+        };
+        let mut log = Log::default();
+        assert_eq!(mintable_face(&log, &fp).unwrap_err().len(), 3);
+        log.append(Kind::Capture, "t", "p", face(vec![("image_kept", Value::Bool(false))]));
+        log.append(Kind::Measure, "t", "p", face(vec![("hash", Value::str(&fp))]));
+        assert_eq!(mintable_face(&log, &fp).unwrap_err(), vec!["no face consent from the person"]);
+        // a voice consent does not cover the face
+        log.append(Kind::Consent, "t", "p", Value::obj(vec![("scope", Value::str("mint"))]));
+        assert!(mintable_face(&log, &fp).is_err());
+        log.append(Kind::Consent, "t", "p", face(vec![("scope", Value::str("mint")), ("fprint", Value::str(&fp))]));
+        assert!(mintable_face(&log, &fp).is_ok());
+        assert!(mintable_face(&log, "0x00").is_err(), "a different faceprint");
+        log.append(Kind::Consent, "t", "p", face(vec![("scope", Value::str("mint")), ("fprint", Value::str(&fp)),
+                                                      ("revoked", Value::Bool(true))]));
+        assert_eq!(mintable_face(&log, &fp).unwrap_err(), vec!["the face consent was revoked"]);
     }
 
     #[test]

@@ -120,3 +120,28 @@ fn the_oracle_can_fail_a_naive_hypot_disagrees() {
     eprintln!("naive hypot differs from V8's on {differ} of {total} face widths");
     assert!(differ > 0);
 }
+
+#[test]
+fn persona_print_is_byte_identical_to_faicey() {
+    use streamair::fclone::{persona_print, PrintRef};
+    let o = json::parse(&std::fs::read_to_string("tests/fixtures/persona_oracle.json").unwrap()).unwrap();
+    assert_eq!(o.get("neither_throws"), Some(&Value::Bool(true)));
+    assert!(persona_print(None, None).is_err());
+    let Value::Arr(cases) = o.get("cases").unwrap() else { panic!() };
+    let pref = |v: Option<&Value>| -> Option<PrintRef> {
+        let v = v?;
+        let ms = v.get("measuresStr").or(v.get("m")).unwrap();
+        let Value::Arr(ms) = ms else { panic!() };
+        Some(PrintRef { hash: s(v.get("hash").unwrap()).to_string(),
+                        measures: ms.iter().map(|m| s(m).to_string()).collect(),
+                        precision_score: v.get("precisionScore").map(|p| s(p).to_string()) })
+    };
+    for (i, c) in cases.iter().enumerate() {
+        let parts = c.get("parts").unwrap();
+        let (f, v) = (pref(parts.get("face")), pref(parts.get("voice")));
+        let p = persona_print(f.as_ref(), v.as_ref()).unwrap();
+        assert_eq!(p.hash, s(c.get("hash").unwrap()), "persona hash, case {i}");
+        assert_eq!(p.precision_score, s(c.get("precisionScore").unwrap()), "precision, case {i}");
+    }
+    assert_eq!(cases.len(), 200);
+}

@@ -30,20 +30,38 @@ node testing/fclone/make_oracle.mjs <faicey>/src/face_clone 1000 > tests/fixture
   all triples close, the mesh is manifold, and V − E + F = −2 (the outline, the eyes and the mouth are holes).
   468 vertices, 1,322 edges, 88 on the boundary.
 
+## Done since the first cut
+
+- [x] **The capture pipeline.** `pose_normalize`, `aggregate` and `frontality`, plus `fclone_frames()`, the whole
+      path from frames to faceprint. On 60 generated frame sets they match faicey and ollywoo's `fclone.js`, compared
+      as digests of the raw f64 bits; 30 of the sets go all the way to the faceprint. Inputs are regenerated on both
+      sides from an exact Park–Miller LCG, so the fixture holds only digests (`testing/fclone/make_pose_oracle.mjs`).
+- [x] **V8's `Math.atan2`.** fdlibm's `atan2` and `atan` (V8 `base/ieee754`), step for step: 324 special pairs bit
+      for bit (zeros, subnormals, infinities, NaN), and 200,000 generated pairs by digest. The system libm's `atan2`
+      differs on **29,545 of 200,000**, and a test asserts that it does. `Math.max` keeps NaN where `f64::max` drops
+      it, so `js_max` is ported too.
+- [x] **The persona print** (faicey `persona.js`): face and voice bound into one hash. 200 / 200 cases match:
+      face only, voice only (the forensic print), both, and both with a `dvscope/1` vprint (which `persona.js`
+      reads as precision 0). Neither modality is refused, as there.
+- [x] **Identities in the stream** (`src/identity.rs`). `VOAICE_VPRINT=dvscope/1:…`, `FAICE_FPRINT=faceprint/1:0x…`,
+      `PERSONA_PRINT=0x…` and `VCLONE_FORGE_HEAD=…` go into OpusTags. They are read back case-insensitively; a
+      malformed or contradictory tag is refused, and each tag is verified against the `.voaice` and `.faice` files
+      it names. End to end in `tests/identity.rs`: production's `opusinfo` lists the four tags with no warning, and
+      `opusdec` decodes the file to exactly 48,000 samples.
+- [x] **The face mint rule** (`mintable_face`): a face measurement with this faceprint, a capture that recorded
+      `image_kept: false`, and the person's latest face consent for `mint` naming this faceprint and not revoked.
+      A voice consent does not cover the face. ollywoo's `forgelog.js` has the same rule (`mintableFace`), and the
+      set has "✋ consent: my face, to mint" and "⊘ revoke face consent".
+
 ## TODO
 
-- [ ] **Pose normalisation and frame averaging** (geometry.js `poseNormalize`, `aggregate`): arithmetic and means
-      in a fixed order, so they are portable bit for bit, with their own oracle on recorded frames.
-- [ ] **Frontality.** It calls `Math.atan2`, which V8 takes from fdlibm and Rust from the system libm. Port
-      fdlibm's `atan2` (it is freely licensed) and check it on every recorded pose before claiming the quality
-      figures.
-- [ ] **The persona print.** faicey's `persona.js` fuses face and voice into one print, `{v:1, kind:"persona",
-      modalities, faceHash, voiceHash, measures}`. It belongs here, since streamair carries both.
-- [ ] **Identities in the stream.** Write the vprint, the faceprint and the forge log's head into OpusTags
-      (`VOAICE_VPRINT=`, `FAICE_FPRINT=`, `VCLONE_FORGE_HEAD=`), so a `.opus` names the identities it was made
-      from and `streamair` can check them on read.
-- [ ] **A face mint rule.** `mintable()` covers a voice: measured, consented for that ref, engine cleared. A face
-      needs its own rule: measured, consented with scope `mint` for that faceprint, and no image retained (the
-      capture event already records `image_kept: false`).
-- [ ] **The forensic voice print** that `/voicey/measure` returns (six measures) alongside `dvscope/1`. The
-      tracking item is in voaice.rs `docs/VCLONE.md`.
+- [ ] **The forensic voice print** that `/voicey/measure` returns (six measures), beside `dvscope/1`. The
+      tracking item is in voaice.rs `docs/VCLONE.md`. Until it is ported, a persona print built from ollywoo's
+      forensic voice print is checked only in JavaScript.
+- [ ] **Read identities from any `.opus`.** The test reads the tags from streamair's own single-page OpusTags. The
+      general reader is voaice.rs 0.0.4's streaming Ogg reader; wire `Identity::from_comments` to it when it lands,
+      and add `streamair identity <file.opus>`.
+- [ ] **fdlibm `atan2` for any caller.** It lives in `fclone`; if anything else needs V8-exact trigonometry, move it
+      to its own module rather than copying it.
+- [ ] **A real camera.** Every check so far is on recorded or generated landmarks. Record a few real fCLONE captures
+      (landmarks and matrices only, with consent) as fixtures.
