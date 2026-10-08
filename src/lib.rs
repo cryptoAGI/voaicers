@@ -30,6 +30,7 @@
 pub mod attention;
 pub mod conv;
 pub mod cross;
+pub mod decoder;
 pub mod encoder;
 pub mod f16;
 pub mod gelu;

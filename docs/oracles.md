@@ -268,6 +268,38 @@ padding) not compared; non-finite activations not compared (the products' NaN co
 rounded, `powf`, `1/sqrtf(8)`, `sqrtf(0.125)`) gives `0x3EB504F3`, so the recorded op parameter, not a reading of the
 source, pins the scale; the scale in double is a different *operation* and is caught.
 
+### The decoder's input (0.1.2) — `tests/decin.rs` against every decoder call of `whisper_full`
+
+`whisper_build_graph_decoder` begins `cur = ggml_add(ggml_get_rows(d_te, embd), ggml_get_rows(d_pe, position))`
+(testing/decin/NOTES.md): the f16 token embedding's rows widened by `ggml_cpu_fp16_to_fp32` (`vcvtph2ps`, exact), the
+f32 positional embedding's rows copied, one f32 add with the token rows first; `embd` and `position` are set from the
+state's `whisper_batch`. `whisper_oracle --decin` runs `whisper_full_with_state` on each input in two configs —
+**A**, the transcript record's params, and **B**, the same with `no_timestamps` and a 300-token `prompt_tokens`
+(because every prompt A feeds tiny.en is `[SOT]`, one row: an English-only model has no language or task token, the
+record runs with timestamps, and jfk_x3's second window clears its past) — observing `sched_decode` (layout probe)
+through its eval callback at 1 and 4 threads, asking for exactly the two GET_ROWS (by their src0, `d_te` / `d_pe`) and
+their ADD. At the token GET_ROWS it reads the state's `whisper_batch` (layout probe; the struct mirrored and its size
+asserted) and self-checks it against the graph's own I32 inputs. Per call it records the batch (tokens, positions,
+`seq_id[i][0]`, `n_seq_id`, the logits flags) and one digest per row of the three nodes; then each config runs again
+unobserved. Self-checks, yes on all 8 inputs: every call's three nodes seen, in the order token rows → position rows →
+ADD; the ADD's src0 is the token rows; no other GET_ROWS; d_te f16, d_pe f32, outputs f32 [384, n]; batch = the graph's
+inputs on every call; config A's result observed = unobserved at 1 and at 4 threads. 256 KB for 8 inputs.
+
+| oracle | compares | result (0.1.2) |
+|---|---|---|
+| `oracle_decin_record_self_checks` | the record's self-checks and counts | A: 146 calls at 1 thread (8 prompts, 138 steps), B: 164 (8 prompts, 156 steps), the same at 4 threads; longest batch 226 rows, last position 307 |
+| `oracle_decin_observed_run_is_the_recorded_transcript` | the observed 1-thread run's result tokens (id, `p` bits) against 0.0.1's transcript record, taken unobserved | **128 / 128** tokens on 8 inputs |
+| `oracle_decin_batches` | each window's prompt built by `Prompt::window` (A: `[SOT]`; B: `[PREV, the last 223 of the prompt, SOT, NOT]`) through `Batch::prep_legacy`, each step by `Batch::prep_step` of the token the record shows fed: tokens, positions, sequence ids, `n_seq_id`, logits flags | **32 / 32** prompts and **588 / 588** steps (both configs, 1 and 4 threads) |
+| `oracle_decin_nodes_bit_exact` | on every call of both configs at both thread counts: the model's token rows, position rows and sum, and the fast path's sum (`DecoderInput::run_batch`), by row digest | **0 differ** of 15,088 row comparisons (620 calls, 3,772 rows) |
+| `oracle_decin_discriminators` | per input, on the 1-thread calls of both configs (the sum's rows) | positions off by one, step positions without the prompt length, the position row 0, the multilingual ids (SOT + 1), widening with subnormals flushed (DAZ), widening through bf16, the sum rounded to f16 — **each caught on every input that decodes** (7 of 8; min_len makes no decoder call). Indistinguishable, as predicted: the operands swapped (f32 addition commutes), the sum in double (exact for two f32); **and, found by the oracle, the position rows rounded to f16** — all 172,032 of d_pe's f32 values are exactly f16 values (the checkpoint was f16), which the test asserts |
+
+What this holds for: this laptop's native libggml-cpu (Zen+, AVX2 + FMA + F16C, no AVX-512); production's Zen 3
+library not run; `base.en` (n_state 512) not compared; **multilingual prompts** (`[SOT, lang, task]`) not exercised —
+both pinned models are English-only, so `Prompt::init`'s multilingual branch is read from the source, not checked; nor
+`carry_initial_prompt`, beam search or best-of (several decoders, so several rows per step and `seq_id` ≠ 0), the
+temperature fallback, or the past-clearing rule's own input (the window's seek, which the decode loop computes; the
+test supplies it for jfk_x3's second window). The ADD's thread split is not observable in the bits (elementwise).
+
 ## Efficiency — measured only after the oracles pass
 
 (0.0.4) Step 6 of the gate measures the Ogg/Opus reader after 4b passed: Ogg's CRC on 16 MiB sliced-by-8 against the
@@ -354,6 +386,14 @@ side) into the f16 cache — the reference as the standalone graph the record sh
 encoder alone with that whole call; step 13 is the like-for-like comparison. Each side prints the digests of the
 `kv_cross` (and for `whole`, `embd_enc`) it measured, and the gate stops if they differ.
 
+Step 14 (0.1.2) times the decoder's input for 1 token (one step) and 226 (config B's prompt), the same tokens on both
+sides. The reference: the two I32 inputs set, `ggml_graph_plan` and `ggml_graph_compute` of the three nodes as a
+standalone ggml graph on the shipped CPU backend, at 1 and nproc threads (`whisper_oracle --bench-decin`) — in whisper
+these three nodes head the whole decoder graph, which is planned and its threads started once for all of it, so the
+standalone graph charges three nodes with a per-graph cost; voaice: `Batch::prep_legacy` + `DecoderInput::run_batch`
+into a buffer kept between calls, one thread (`voaice bench-decin`). A call is microseconds, so wall is the mean over
+at least a second of calls, not a best of 10. The output digest is compared and the gate stops if it differs.
+
 ## The test inputs
 
 Eight WAVs, generated by `testing/make_audio.py` and pinned by sha256 in `testing/pins/audio.sha256`: JFK (11 s,
@@ -370,7 +410,9 @@ against a public getter** (the tensor map's size against the loader's count, `n_
 0.0.6 it also finds the state's schedulers (`sched_conv`, `sched_encode`) and `embd_conv` that way, and observes
 every node of the conv graph through ggml's own `ggml_backend_sched_set_eval_callback`; observing does not change the
 result (`embd_conv` is bit-identical with and without the callback, on all 8 inputs). Since 0.1.1 also `sched_cross`
-and `kv_cross` (its `k` / `v` tensors), checked against the CPY nodes that write them.
+and `kv_cross` (its `k` / `v` tensors), checked against the CPY nodes that write them. Since 0.1.2 `sched_decode` and
+the state's `whisper_batch` (mirrored, its size asserted), checked on every call against the graph's own `embd` and
+`position` tensors; the callback asks for three nodes only, and the observed runs' results equal the unobserved ones.
 
 ## Determinism of the reference
 
@@ -392,3 +434,8 @@ and `kv_cross` (its `k` / `v` tensors), checked against the CPY nodes that write
 - At 4 threads against 1, token ids and text are the same, but every token's probability differs in its bits, and
   on JFK the token timestamps move. The transcript oracle is therefore pinned at **1 thread**; a bit-exact transcript
   will always state its thread count.
+- (0.1.2) The decoder's **input** is bit-identical at 1 and 4 threads on every call (the batch and all three nodes),
+  so the thread dependence enters later in the decoder: with the record's params the same tokens are fed at 1 and 4
+  threads but the result's `p` bits differ on 5 of the 7 inputs that decode; with config B (the 300-token prompt) chirp
+  feeds a **different token** at 4 threads from its third call on — the 4-thread logits moved enough to change an
+  argmax. The logits (v0.2.0) will be compared at stated thread counts.

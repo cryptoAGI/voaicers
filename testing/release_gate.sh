@@ -84,6 +84,18 @@
 #      the WHOLE of whisper_encode_with_state — which runs the cross graph too, so v0.1.0's step 12 timed the reference
 #      doing more than voaice did — mel -> embd_enc -> kv_cross (`voaice bench-cross ... whole` against
 #      `whisper_oracle --bench-encode`), the digests of embd_enc and kv_cross compared, at 1, 2 and nproc threads
+#   4j. (0.1.2) the decoder's input: on EVERY decoder call whisper_full makes (each window's prompt and every one-token
+#      step) for the 8 inputs — with the transcript record's params (config A) and with a 300-token prompt and no
+#      timestamps (config B: the 226-row batch and positions past 225) — sched_decode's GET_ROWS(d_te, embd),
+#      GET_ROWS(d_pe, position) and their ADD read through its eval callback with the state's whisper_batch
+#      (`whisper_oracle --decin`, at 1 and 4 threads, then unobserved); voaice's prompt and batch builders and its
+#      three nodes (the model and the fast path) compared bit for bit (tests/decin.rs); the observed run equal to 0.0.1's
+#      transcript record; discriminators (positions off by one, step positions without the prompt, position row 0, the
+#      multilingual ids, DAZ widening, bf16 widening, the sum to f16; the position rows to f16, the operands swapped and
+#      the sum in double, which the data and IEEE make indistinguishable)
+#   14. (0.1.2) its efficiency, only after 4j passed: the three nodes for 1 token (a step) and 226 (config B's prompt),
+#      `voaice bench-decin` (batch prep + rows into the caller's buffer, one thread) against `whisper_oracle --bench-decin`
+#      (the inputs set, plan and compute of the same three nodes as a ggml graph) at 1 and nproc threads, digests compared
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
@@ -166,6 +178,12 @@ testing/oracle/bin/whisper_oracle --cross "$model" .oracle/cross .audio/*.wav 2>
 log "(the cross record took $(( $(date +%s) - t0 )) s: each input encoded five times — the cross graph observed at 1 and 4 threads, not observed at 1, 2, 4 — and the standalone cross graph at 1 and 4 threads; $(du -sh .oracle/cross | cut -f1) of digests)"
 sc=$(objdump -d --no-show-raw-insn "$lib" | sed -n '/<ggml_compute_forward_scale>:/,/^$/p')
 log "libggml-cpu's ggml_compute_forward_scale: $(echo "$sc" | grep -c 'vmulps') vmulps (ggml_vec_scale_f32: b == 0, whisper's Kscale), $(echo "$sc" | grep -cE 'vfn?madd') FMA (ggml_vec_mad1_f32, the b != 0 branch)"
+rm -rf .oracle/decin
+t0=$(date +%s)
+testing/oracle/bin/whisper_oracle --decin "$model" .oracle/decin .audio/*.wav 2>&1 | tee -a "$out"
+log "(the decin record took $(( $(date +%s) - t0 )) s: whisper_full seven times per input — config A observed at 1 and 4 threads and not observed at 1 and 4, config B observed at 1 and 4 and not observed at 1; $(du -sh .oracle/decin | cut -f1) of batches and digests)"
+gr=$(objdump -d --no-show-raw-insn "$lib" | sed -n '/<ggml_compute_forward_get_rows>:/,/^$/p'); cf=$(nfn ggml_cpu_fp16_to_fp32 0x200)
+log "libggml-cpu's ggml_compute_forward_get_rows: $(echo "$gr" | grep -c 'call.*<ggml_cpu_fp16_to_fp32@plt>') call of ggml_cpu_fp16_to_fp32 (the f16 rows), $(echo "$gr" | grep -c vcvtph2ps) vcvtph2ps inline; ggml_cpu_fp16_to_fp32: $(echo "$cf" | grep -c vcvtph2ps) vcvtph2ps (blocks of 8 and 4; the table for a tail, none at n_state 384)"
 log "this CPU: $(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -xE 'avx|avx2|fma|f16c|avx512f' | paste -sd' ') (production: Zen 3, the same extensions; its library is not the one checked here)"
 
 log "## 4. voaice.rs"
@@ -246,6 +264,13 @@ cargo test --release --test cross -- --ignored --nocapture --test-threads=1 2>&1
   | grep -vE "^\s*(Compiling|Finished|Running)|^$|^running" > "$step" || true
 tee -a "$out" < "$step"
 grep -q "test result: ok. 3 passed" "$step" || { log "FAIL: the cross K/V oracle comparisons did not all pass"; exit 1; }
+
+log "## 4j. the decoder's input (0.1.2): every decoder call's GET_ROWS d_te, GET_ROWS d_pe and ADD, and its batch"
+step=.oracle/decin_step.log
+cargo test --release --test decin -- --ignored --nocapture --test-threads=1 2>&1 \
+  | grep -vE "^\s*(Compiling|Finished|Running)|^$|^running" > "$step" || true
+tee -a "$out" < "$step"
+grep -q "test result: ok. 5 passed" "$step" || { log "FAIL: the decoder input oracle comparisons did not all pass"; exit 1; }
 nt=$(nproc)
 log "## 5. efficiency (only now): log-mel; wall = best of 10 calls, cpu = CPU ms per call (utime+stime, all threads,"
 log "##    loop >= 1 s), heap = bytes live at the first call's peak (KiB; voaice's counting allocator, the reference's"
@@ -466,7 +491,27 @@ for what in cross whole; do
       "$(echo "$r" | field rss_peak_delta_kb)" "$(echo "$v" | field rss_peak_delta_kb)" "$dg")"
   done
 done
+log "## 14. efficiency (only now): the decoder's input (0.1.2): the same tokens on both sides (token i = (i * 7919 + 50257)"
+log "##    mod n_vocab at position i); n = 1 is one decoding step's input, n = 226 config B's prompt. The reference: the two"
+log "##    I32 inputs set, ggml_graph_plan and ggml_graph_compute of the three nodes as a ggml graph on the shipped CPU"
+log "##    backend (in whisper these three are the head of the whole decoder graph, planned once with it: the plan and the"
+log "##    threads' start are a per-graph cost this standalone graph pays for three nodes alone); voaice: Batch::prep_legacy"
+log "##    + DecoderInput::run_batch into the caller's buffer, always one thread. One call is microseconds: wall = the mean"
+log "##    over >= 1 s (>= 1000 calls), cpu = CPU us per call over the same loop; the output's digest compared"
+log "$(printf '%-6s %8s | %10s %10s %7s | %10s %10s | %s' tokens ref_thr ref_us vo_us x cpu_ref cpu_vo digest)"
+for n in 1 226; do
+  v=$(target/release/voaice bench-decin "$model" "$n")
+  for th in 1 "$nt"; do
+    r=$(testing/oracle/bin/whisper_oracle --bench-decin "$model" "$th" "$n")
+    rd=$(echo "$r" | field out_digest); vd=$(echo "$v" | field out_digest)
+    [ "$rd" = "$vd" ] || { log "FAIL: decoder input digests differ in the benchmark ($rd vs $vd)"; exit 1; }
+    rw=$(echo "$r" | field wall_us_per_call); vw=$(echo "$v" | field wall_us_per_call)
+    log "$(printf '%-6s %8s | %10.4f %10.4f %6.2fx | %10s %10s | %s' "$n" "$th" "$rw" "$vw" "$(awk -v a="$rw" -v b="$vw" 'BEGIN{print a/b}')" \
+      "$(echo "$r" | field cpu_us_per_call)" "$(echo "$v" | field cpu_us_per_call)" "$vd")"
+  done
+done
+log "voaice: $(target/release/voaice bench-decin "$model" 1 | sed -E 's/.*(heap_per_call_bytes [0-9]+ held_kb [0-9]+).*/\1/') (the f16 token table and the f32 positions, held outside the call; the reference's are the model's)"
 log "load after the measurements: $(cut -d' ' -f1-3 /proc/loadavg)"
-log "## transcripts recorded (not yet reproduced by voaice.rs: the encoder is v0.1.0's, the cross K/V 0.1.1's, the decoder is v0.2.0's)"
+log "## transcripts recorded (not yet reproduced by voaice.rs: the encoder is v0.1.0's, the cross K/V 0.1.1's, the decoder's input 0.1.2's, the decoder is v0.2.0's)"
 for d in .oracle/tiny.en/*/; do log "$(basename "$d"): $(tr '\n' ' ' < "$d/transcript.txt")"; done
 log "GATE PASSED"

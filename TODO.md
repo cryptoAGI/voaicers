@@ -208,13 +208,33 @@ whisper.cpp (upstream/PIN) in the same run; only then is its speed measured.
       to f32 (4.7 MB for the eight, 2× the f16 bytes); at 4 threads nothing is gained over 2 (2 cores, SMT siblings).
       The cross K/V could also start on each panel of `embd_enc` as `ln_post` produces it (one pass, no re-read).
 
-## Next: 0.1.2 — the decoder's input (see docs/ROADMAP.md, the second decade)
-- [ ] `whisper_build_graph_decoder` (whisper.cpp:2458) begins: `cur = add(get_rows(d_te, embd), get_rows(d_pe,
-      position))` — `decoder.token_embedding.weight` is f16 [384, 51864] (GET_ROWS widens to f32: the table, exact),
-      `decoder.positional_embedding` f32 [384, 448]; then one ADD. Read the batch whisper builds for a prompt
-      (`whisper_batch_prep_legacy`: tokens, positions n_past.., the seq ids and `logits` flags) and for one token.
-- [ ] Oracle: the eval callback on `sched_decode` up to that ADD (layout probe: its offset), the prompts
-      `[SOT, (lang), task, NOT/BEG]` of the 8 recorded transcripts through `whisper_decode_with_state`.
+## Done: 0.1.2 — the decoder's input (CHANGELOG.md, testing/decin/NOTES.md)
+- [x] Read from the pin and the binary: `cur = add(get_rows(d_te, embd), get_rows(d_pe, position))`
+      (whisper.cpp:2515) — d_te f16 [384, 51864] widened by `ggml_cpu_fp16_to_fp32` (objdump: get_rows calls it;
+      `vcvtph2ps` in blocks of 8 and 4, the table for a tail — none at 384), d_pe **f32** [384, 448] copied, one f32
+      add, token rows first; `whisper_batch_prep_legacy` (positions `n_past + i`, logits on the last row only) for a
+      prompt, a one-row batch at `prompt.size() + i` for a step; the prompt `[PREV + past] + [SOT (+ lang, task) (+ NOT)]`.
+- [x] **Found while recording:** every prompt the recorded transcripts feed tiny.en is `[SOT]`, one row (English-only:
+      no language or task token; timestamps on: no NOT; jfk_x3's second window clears its past). The oracle added a
+      second config — no timestamps and a 300-token initial prompt — whose first prompts are 226 rows.
+- [x] Oracle (`whisper_oracle --decin`, tests/decin.rs): every decoder call of `whisper_full` on the 8 inputs, both
+      configs, 1 and 4 threads (620 calls, 3,772 rows): the batches rebuilt (32 prompts, 588 steps) and the three nodes
+      (model and fast) 0 rows differ; the observed run = 0.0.1's transcript record; seven discriminators caught on every
+      input that decodes, three indistinguishable — two as predicted, and the position rows rounded to f16, because
+      every d_pe value is an f16.
+- [x] Faster, bits unchanged: widen and add in one pass, eight values at a time (`vcvtph2ps` + `vaddps`), into the
+      caller's buffer; the batch's vectors sized once; nothing allocated per call; one thread.
+- [ ] Not covered: production's libggml-cpu (Zen 3); AVX-512; `base.en`; multilingual prompts (`[SOT, lang, task]`:
+      no multilingual model is pinned); several decoders (best-of / beam: `seq_id` ≠ 0, several rows per step);
+      `carry_initial_prompt`; the past-clearing rule's input (the window's seek — the decode loop's, later).
+- [ ] Efficiency left: none worth the code at this stage (microseconds against a decoder step); the f16 token table
+      is held as a 39.8 MB copy (38,898 KiB) beside the model's bytes — the logits product (0.1.7) reads the same
+      table and should share it.
+
+## Next: 0.1.3 — the self-attention products and the f16 self KV cache (see docs/ROADMAP.md)
+- [ ] attn_ln at the decoder's row count, Q (+ bias) × `KQscale`, K × `KQscale` (no bias), V + bias, the CPYs into
+      `kv_self` at `head`, the causal `KQ_mask` (−inf where a cell's pos > the row's, or another sequence) and its f16
+      cast — through the same `sched_decode` callback and both configs of 0.1.2's record.
 
 ## Then, in order
 

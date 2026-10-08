@@ -23,6 +23,8 @@
 //                                                              found in 0.1.1, the cross graph's kv_cross: it runs that too)
 //   whisper_oracle --cross <model.bin> <outdir> <wav ...>   (0.1.1) the cross graph (sched_cross) and kv_cross, see record_cross
 //   whisper_oracle --bench-cross <model.bin> <wav> <threads>   (0.1.1) the cross graph's time, see bench_cross
+//   whisper_oracle --decin <model.bin> <outdir> <wav ...>   (0.1.2) the decoder's input on every decoder call, see record_decin
+//   whisper_oracle --bench-decin <model.bin> <threads> <n_tokens>   (0.1.2) those three nodes' time, see bench_decin
 //
 // --bench-mel measures the reference's whisper_pcm_to_mel_with_state the way `voaice bench-mel` measures voaice's,
 // in a fresh process each: the heap bytes live at the first call's peak (operator new counted, below), peak RSS of
@@ -2237,7 +2239,260 @@ static int bench_cross(const char * model_path, const char * wav, int threads) {
     return 0;
 }
 
+// --decin <model.bin> <outdir> <wav ...> (0.1.2): the decoder's input. whisper_full_with_state on each input with the
+// params of the 0.0.1 transcript record (config A: greedy, temperature_inc 0, language en, token timestamps) and with a
+// 300-token prompt and no timestamps (config B, see decin_params), sched_decode observed through its eval callback at 1
+// and 4 threads (whisper_full's n_threads), then run again unobserved (A at 1 and 4, B at 1).
+// For EVERY decoder call (the prompt of each window and every one-token step) the callback sees the graph's first two
+// GET_ROWS (d_te by `embd`, d_pe by `position`) and their ADD, and at the first of them reads the state's whisper_batch
+// (the layout probe's offset, self-checked against the graph's own input tensors). Writes per input:
+//   decin_calls.tsv   per call: config (A, B), threads, call index, n_tokens, the batch's token / pos / seq_id[i][0] / n_seq_id / logits
+//                     (comma lists), the offset of its rows in decin.d64
+//   decin.d64         per call, one 64-bit FNV-1a digest per row: the token rows (GET_ROWS d_te), the position rows
+//                     (GET_ROWS d_pe), the sum (ADD) — n_tokens each, in that order
+//   decin_result.tsv  the observed 1-thread run's result tokens (segment, index, id, p bits): the record's transcript
+//   decin.tsv         the self-checks and the facts
+struct batch_mirror { int32_t n_tokens; int32_t * token; int32_t * pos; int32_t * n_seq_id; int32_t ** seq_id; int8_t * logits; };
+static_assert(sizeof(batch_mirror) == VOAICE_SIZEOF_BATCH, "whisper_batch layout changed");
+struct decin_call {
+    int n = 0;
+    std::vector<int32_t> tok, pos, seq, nseq;
+    std::vector<int8_t> logits;
+    std::vector<uint64_t> te, pe, add;
+    int seen = 0;   // 1 = te, 2 = te + pe, 3 = all three, in that order
+};
+struct decin_capture {
+    whisper_state * st = nullptr;
+    const ggml_tensor * d_te = nullptr, * d_pe = nullptr;
+    int n_state = 0;
+    std::vector<decin_call> calls;
+    bool batch_eq_inputs = true, types = true, order = true, add_src0_te = true, other_get_rows = false;
+    int add_inplace = 0;
+};
+static bool is_add_te_pe(const ggml_tensor * t, const decin_capture & c) {
+    if (t->op != GGML_OP_ADD || !t->src[0] || !t->src[1]) return false;
+    const ggml_tensor * a = t->src[0], * b = t->src[1];
+    if (a->op != GGML_OP_GET_ROWS || b->op != GGML_OP_GET_ROWS) return false;
+    return (a->src[0] == c.d_te && b->src[0] == c.d_pe) || (a->src[0] == c.d_pe && b->src[0] == c.d_te);
+}
+static bool decin_cb(ggml_tensor * t, bool ask, void * ud) {
+    auto & c = *static_cast<decin_capture *>(ud);
+    const bool te = t->op == GGML_OP_GET_ROWS && t->src[0] == c.d_te, pe = t->op == GGML_OP_GET_ROWS && t->src[0] == c.d_pe;
+    const bool add = is_add_te_pe(t, c);
+    if (ask) {
+        if (t->op == GGML_OP_GET_ROWS && !te && !pe) c.other_get_rows = true;
+        return te || pe || add;
+    }
+    const std::vector<uint64_t> d = row_digests(t, c.n_state);
+    c.types = c.types && t->type == GGML_TYPE_F32 && t->ne[0] == c.n_state;
+    if (te) {
+        decin_call k;
+        const auto & b = *reinterpret_cast<const batch_mirror *>((const char *)c.st + VOAICE_OFF_STATE_BATCH);
+        k.n = b.n_tokens;
+        const std::vector<uint8_t> in = tensor_bytes(t->src[1]);
+        c.batch_eq_inputs = c.batch_eq_inputs && t->src[1]->type == GGML_TYPE_I32 && (int64_t)k.n == ggml_nelements(t->src[1]) &&
+                            (int64_t)k.n == t->ne[1] && in.size() == 4 * (size_t)k.n;
+        for (int i = 0; i < k.n; i++) {
+            k.tok.push_back(b.token[i]); k.pos.push_back(b.pos[i]); k.nseq.push_back(b.n_seq_id[i]);
+            k.seq.push_back(b.seq_id[i][0]); k.logits.push_back(b.logits[i]);
+            int32_t v; std::memcpy(&v, in.data() + 4 * i, 4);
+            c.batch_eq_inputs = c.batch_eq_inputs && v == b.token[i];
+        }
+        c.types = c.types && c.d_te->type == GGML_TYPE_F16;
+        k.te = d; k.seen = 1;
+        c.calls.push_back(k);
+        return true;
+    }
+    check(!c.calls.empty(), "decin: a position row or a sum before any token row");
+    decin_call & k = c.calls.back();
+    if (pe) {
+        const std::vector<uint8_t> in = tensor_bytes(t->src[1]);
+        c.batch_eq_inputs = c.batch_eq_inputs && t->src[1]->type == GGML_TYPE_I32 && in.size() == 4 * (size_t)k.n;
+        for (int i = 0; i < k.n && c.batch_eq_inputs; i++) { int32_t v; std::memcpy(&v, in.data() + 4 * i, 4); c.batch_eq_inputs = v == k.pos[i]; }
+        c.types = c.types && c.d_pe->type == GGML_TYPE_F32;
+        c.order = c.order && k.seen == 1;
+        k.pe = d; k.seen = 2;
+    } else {
+        c.order = c.order && k.seen == 2;
+        c.add_src0_te = c.add_src0_te && t->src[0]->src[0] == c.d_te;
+        c.add_inplace += t->data == t->src[0]->data || t->data == t->src[1]->data;
+        k.add = d; k.seen = 3;
+    }
+    return true;
+}
+static std::string csv(const std::vector<int32_t> & v) { std::string s; for (size_t i = 0; i < v.size(); i++) s += (i ? "," : "") + std::to_string(v[i]); return s; }
+// config A = the 0.0.1 transcript record's params (see main); config B = the same with no_timestamps and DECIN_PROMPT as
+// prompt_tokens (not carried), so each window's first prompt is [PREV, the last 223 of them, SOT, NOT]: 226 tokens, the
+// many-row batch and the positions past 225 that config A (whose prompts are all [SOT]) never reaches
+static std::vector<whisper_token> decin_prompt() {
+    static const whisper_token words[23] = {843, 523, 616, 5891, 3399, 1265, 407, 644, 534, 1499, 460, 466, 329, 345, 1265,
+                                            644, 345, 460, 466, 329, 534, 1499, 13};   // jfk's recorded text tokens
+    std::vector<whisper_token> v(300);
+    for (size_t i = 0; i < v.size(); i++) v[i] = words[i % 23];
+    return v;
+}
+static whisper_full_params decin_params(int threads, bool prompted, const std::vector<whisper_token> & prompt) {
+    whisper_full_params fp = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    fp.n_threads = threads;
+    fp.print_progress = false; fp.print_realtime = false; fp.print_timestamps = false; fp.print_special = false;
+    fp.token_timestamps = true;
+    fp.temperature_inc = 0.0f;
+    fp.language = "en";
+    if (prompted) { fp.no_timestamps = true; fp.prompt_tokens = prompt.data(); fp.prompt_n_tokens = (int)prompt.size(); }
+    return fp;
+}
+static std::vector<std::string> result_lines(whisper_context * ctx, whisper_state * st) {
+    (void)ctx;
+    std::vector<std::string> r;
+    for (int s = 0; s < whisper_full_n_segments_from_state(st); s++)
+        for (int k = 0; k < whisper_full_n_tokens_from_state(st, s); k++) {
+            whisper_token_data d = whisper_full_get_token_data_from_state(st, s, k);
+            char line[96];
+            std::snprintf(line, sizeof line, "token\t%d\t%d\t%d\t%08x", s, k, d.id, f32_bits(d.p));
+            r.push_back(line);
+        }
+    return r;
+}
+static int record_decin(const char * model_path, const std::string & outdir, int nwav, char ** wavs) {
+    if (mkdir(outdir.c_str(), 0755) != 0 && errno != EEXIST) die("cannot create outdir (its parent must exist)");
+    whisper_context * ctx = load_quiet(model_path);
+    auto & tensors = model_tensors(ctx);
+    const int n_state = whisper_model_n_text_state(ctx);
+    for (int a = 0; a < nwav; a++) {
+        std::string path = wavs[a];
+        std::string stem = path.substr(path.find_last_of('/') + 1);
+        stem = stem.substr(0, stem.find_last_of('.'));
+        const std::string dir = outdir + "/" + stem;
+        mkdir(dir.c_str(), 0755);
+        std::vector<float> pcm = read_wav(path.c_str());
+        const std::vector<whisper_token> prompt = decin_prompt();
+        decin_capture caps[2][2];
+        std::vector<std::string> res[2][4];
+        const int threads[4] = {1, 4, 1, 4};
+        for (int cfg = 0; cfg < 2; cfg++)
+            for (int r = 0; r < (cfg ? 3 : 4); r++) {   // r = 0, 1: observed at 1 and 4 threads; r = 2, 3: not observed
+                whisper_state * st = whisper_init_state(ctx);
+                check(st != nullptr, "whisper_init_state failed");
+                ggml_backend_sched_t sd = state_sched(st, VOAICE_OFF_STATE_SCHED_DECODE);
+                if (r < 2) {
+                    decin_capture & c = caps[cfg][r];
+                    c.st = st; c.n_state = n_state;
+                    c.d_te = tensors.at("decoder.token_embedding.weight");
+                    c.d_pe = tensors.at("decoder.positional_embedding");
+                    ggml_backend_sched_set_eval_callback(sd, decin_cb, &c);
+                }
+                check(whisper_full_with_state(ctx, st, decin_params(threads[r], cfg == 1, prompt), pcm.data(), (int)pcm.size()) == 0, "whisper_full failed");
+                res[cfg][r] = result_lines(ctx, st);
+                whisper_free_state(st);
+            }
+        std::vector<uint64_t> d64;
+        FILE * cf = std::fopen((dir + "/decin_calls.tsv").c_str(), "w");
+        int prompts[2] = {0, 0}, steps[2] = {0, 0}, rows = 0, max_n = 0, max_pos = 0;
+        bool complete = true, thr[2], obs1[2], obs4[2], res14[2], all = true;
+        int first_diff[2] = {-1, -1};
+        for (int cfg = 0; cfg < 2; cfg++)
+            for (int r = 0; r < 2; r++) {
+                const decin_capture & c = caps[cfg][r];
+                all = all && c.batch_eq_inputs && c.types && c.order && c.add_src0_te && !c.other_get_rows;
+                for (size_t k = 0; k < c.calls.size(); k++) {
+                    const decin_call & x = c.calls[k];
+                    complete = complete && x.seen == 3 && (int)x.te.size() == x.n && (int)x.pe.size() == x.n && (int)x.add.size() == x.n;
+                    if (r == 0) {
+                        (x.pos[0] == 0 ? prompts[cfg] : steps[cfg])++;
+                        rows += x.n; max_n = std::max(max_n, x.n); max_pos = std::max(max_pos, x.pos[x.n - 1]);
+                    }
+                    std::vector<int32_t> lg(x.logits.begin(), x.logits.end());
+                    std::fprintf(cf, "call\t%c\t%d\t%zu\t%d\t%s\t%s\t%s\t%s\t%s\t%zu\n", "AB"[cfg], threads[r], k, x.n, csv(x.tok).c_str(),
+                                 csv(x.pos).c_str(), csv(x.seq).c_str(), csv(x.nseq).c_str(), csv(lg).c_str(), d64.size());
+                    for (const auto * v : {&x.te, &x.pe, &x.add}) d64.insert(d64.end(), v->begin(), v->end());
+                }
+            }
+        std::fclose(cf);
+        write_bin(dir + "/decin.d64", d64.data(), d64.size());
+        FILE * rf = std::fopen((dir + "/decin_result.tsv").c_str(), "w");
+        for (auto & l : res[0][0]) std::fprintf(rf, "%s\n", l.c_str());
+        std::fclose(rf);
+        for (int cfg = 0; cfg < 2; cfg++) {
+            const auto & x1 = caps[cfg][0].calls, & x4 = caps[cfg][1].calls;
+            thr[cfg] = x1.size() == x4.size();
+            for (size_t k = 0; k < std::min(x1.size(), x4.size()); k++)
+                if (!(x1[k].tok == x4[k].tok && x1[k].pos == x4[k].pos && x1[k].seq == x4[k].seq && x1[k].logits == x4[k].logits &&
+                      x1[k].te == x4[k].te && x1[k].pe == x4[k].pe && x1[k].add == x4[k].add)) { thr[cfg] = false; first_diff[cfg] = (int)k; break; }
+            obs1[cfg] = res[cfg][0] == res[cfg][2];
+            obs4[cfg] = cfg == 1 || res[cfg][1] == res[cfg][3];
+            res14[cfg] = res[cfg][0] == res[cfg][1];
+        }
+        int inplace = 0;
+        for (int cfg = 0; cfg < 2; cfg++) inplace += caps[cfg][0].add_inplace;
+        const auto yn = [](bool b) { return b ? "yes" : "NO"; };
+        FILE * m = std::fopen((dir + "/decin.tsv").c_str(), "w");
+        std::fprintf(m, "n_state\t%d\nd_te_type\t%s\nd_pe_type\t%s\nA_calls_1t\t%zu\nA_calls_4t\t%zu\nA_prompts\t%d\nA_steps\t%d\n"
+                        "B_calls_1t\t%zu\nB_calls_4t\t%zu\nB_prompts\t%d\nB_steps\t%d\nrows_1t\t%d\nmax_n_tokens\t%d\nmax_pos\t%d\n"
+                        "every_call_te_pe_add_observed\t%s\nchecks_batch_eq_inputs_types_order_add_src0_te_no_other_get_rows\t%s\n"
+                        "add_in_place_1t\t%d\nA_calls_threads_1_vs_4_identical\t%s\t%d\nB_calls_threads_1_vs_4_identical\t%s\t%d\n"
+                        "A_result_observed_eq_unobserved_1t\t%s\nA_result_observed_eq_unobserved_4t\t%s\nA_result_1t_eq_4t\t%s\n"
+                        "B_result_observed_eq_unobserved_1t\t%s\nB_result_1t_eq_4t\t%s\nA_result_tokens\t%zu\nB_result_tokens\t%zu\n",
+                     n_state, ggml_type_name(caps[0][0].d_te->type), ggml_type_name(caps[0][0].d_pe->type), caps[0][0].calls.size(),
+                     caps[0][1].calls.size(), prompts[0], steps[0], caps[1][0].calls.size(), caps[1][1].calls.size(), prompts[1], steps[1],
+                     rows, max_n, max_pos, yn(complete), yn(all), inplace, yn(thr[0]), first_diff[0], yn(thr[1]), first_diff[1],
+                     yn(obs1[0]), yn(obs4[0]), yn(res14[0]), yn(obs1[1]), yn(res14[1]), res[0][0].size(), res[1][0].size());
+        std::fclose(m);
+        std::fprintf(stderr, "whisper_oracle: %s: A %zu calls (%d prompts, %d steps), B %zu calls (%d prompts, %d steps); %d rows, longest batch %d, "
+                             "last position %d; all observed: %s; checks: %s; add in place %d; calls 1 vs 4 identical: %s / %s (first differing call %d / %d); "
+                             "observed = unobserved: A %s %s, B %s; results 1 = 4 threads: %s / %s\n",
+                     stem.c_str(), caps[0][0].calls.size(), prompts[0], steps[0], caps[1][0].calls.size(), prompts[1], steps[1], rows, max_n,
+                     max_pos, yn(complete), yn(all), inplace, yn(thr[0]), yn(thr[1]), first_diff[0], first_diff[1], yn(obs1[0]), yn(obs4[0]),
+                     yn(obs1[1]), yn(res14[0]), yn(res14[1]));
+    }
+    whisper_free(ctx);
+    return 0;
+}
+
+// --bench-decin <model.bin> <threads> <n_tokens>: the decoder's input as a standalone graph on the shipped CPU backend —
+// exactly the three nodes whisper builds, add(get_rows(d_te, embd), get_rows(d_pe, position)) — for n_tokens tokens
+// (token i = (i * 7919 + 50257) % n_vocab, position i). One call = what whisper_decode_internal does for these nodes: set
+// the two I32 inputs, plan, compute (the CPU backend plans every graph it computes). wall = mean over >= 1 s of calls
+// (one call is microseconds: a best-of-10 is the timer's resolution), cpu = CPU per call over the same loop.
+// out_digest = digest32 over the [n_tokens][n_state] sum.
+static int bench_decin(const char * model_path, int threads, int n_tokens) {
+    whisper_context * ctx = load_quiet(model_path);
+    auto & m = model_tensors(ctx);
+    const int n_vocab = whisper_model_n_vocab(ctx);
+    ggml_init_params p = { (size_t)64 << 20, nullptr, false };
+    ggml_context * g = ggml_init(p);
+    check(g != nullptr, "ggml_init failed");
+    ggml_tensor * te = conv2_graph::copy(g, m.at("decoder.token_embedding.weight")), * pe = conv2_graph::copy(g, m.at("decoder.positional_embedding"));
+    ggml_tensor * embd = ggml_new_tensor_1d(g, GGML_TYPE_I32, n_tokens), * pos = ggml_new_tensor_1d(g, GGML_TYPE_I32, n_tokens);
+    ggml_tensor * out = ggml_add(g, ggml_get_rows(g, te, embd), ggml_get_rows(g, pe, pos));
+    ggml_cgraph * gf = ggml_new_graph(g);
+    ggml_build_forward_expand(gf, out);
+    std::vector<int32_t> tok(n_tokens), ps(n_tokens);
+    for (int i = 0; i < n_tokens; i++) { tok[i] = (int32_t)(((int64_t)i * 7919 + 50257) % n_vocab); ps[i] = i; }
+    std::vector<uint8_t> work;
+    auto call = [&]() {
+        std::memcpy(embd->data, tok.data(), 4 * (size_t)n_tokens);
+        std::memcpy(pos->data, ps.data(), 4 * (size_t)n_tokens);
+        ggml_cplan cp = ggml_graph_plan(gf, threads, nullptr);
+        if (work.size() < cp.work_size) work.resize(cp.work_size);
+        cp.work_data = work.data();
+        check(ggml_graph_compute(gf, &cp) == GGML_STATUS_SUCCESS, "graph compute failed");
+    };
+    call();
+    const double c0 = cpu_seconds(), w0 = now_ms();
+    long reps = 0;
+    while (reps < 1000 || now_ms() - w0 < 1000.0) { call(); reps++; }
+    const double w1 = now_ms(), c1 = cpu_seconds();
+    std::printf("bench-decin-reference threads %d n_tokens %d wall_us_per_call %.4f cpu_us_per_call %.4f reps %ld out_digest %016llx\n",
+                threads, n_tokens, (w1 - w0) * 1000.0 / reps, (c1 - c0) * 1e6 / reps, reps,
+                (unsigned long long)digest32((const float *)out->data, (size_t)n_tokens * out->ne[0]));
+    ggml_free(g);
+    whisper_free(ctx);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    if (argc >= 4 && std::strcmp(argv[1], "--decin") == 0) return record_decin(argv[2], argv[3], argc - 4, argv + 4);
+    if (argc == 5 && std::strcmp(argv[1], "--bench-decin") == 0) return bench_decin(argv[2], std::atoi(argv[3]), std::atoi(argv[4]));
     if (argc >= 4 && std::strcmp(argv[1], "--cross") == 0) return record_cross(argv[2], argv[3], argc - 4, argv + 4);
     if (argc == 5 && std::strcmp(argv[1], "--bench-cross") == 0) return bench_cross(argv[2], argv[3], std::atoi(argv[4]));
     if (argc >= 4 && std::strcmp(argv[1], "--encoder") == 0) return record_encoder(argv[2], argv[3], argc - 4, argv + 4);

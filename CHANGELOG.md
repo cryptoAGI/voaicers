@@ -1,5 +1,94 @@
 # Changelog
 
+## 0.1.2 — 2026-10-08 — the decoder's input, bit-exact: every decoder call `whisper_full` makes
+
+**`whisper_build_graph_decoder` begins `add(get_rows(d_te, embd), get_rows(d_pe, position))` — the f16 token row
+widened, the f32 position row added — and `whisper_decode_internal` takes its inputs from the batch whisper builds:
+the prompt through `whisper_batch_prep_legacy`, every next token as a one-row batch. voaice builds the same prompts and
+batches and computes the same rows, bit for bit, on every decoder call of `whisper_full` for the 8 inputs — 620 calls,
+3,772 rows, at 1 and 4 threads — all exact on the first oracle run. Found while recording: every prompt the recorded
+transcripts feed tiny.en is the single token `[SOT]`, so a second configuration (a 300-token prompt, no timestamps)
+reaches the 226-row batch; and d_pe, stored f32, holds only f16 values, so one planned discriminator cannot fail.**
+Record: `testing/results/0.1.2.txt`; how it was read and found: `testing/decin/NOTES.md`.
+
+### The op, read from the pin and the binary
+- whisper.cpp:2515: `cur = ggml_add(ggml_get_rows(model.d_te, embd), ggml_get_rows(model.d_pe, position))`. `d_te` =
+  `decoder.token_embedding.weight`, the weight type: **f16** `[384, 51864]`; `d_pe` = `decoder.positional_embedding`,
+  **f32** `[384, 448]` (whisper.cpp:1797). The token rows are the ADD's first operand.
+- GET_ROWS from f16 (ops.cpp:4831) widens each row with `ggml_cpu_fp16_to_fp32` — objdump: `ggml_compute_forward_get_rows`
+  calls it (no `vcvtph2ps` of its own); it is `vcvtph2ps` in blocks of 8 and 4 and the table for a tail (none at 384).
+  Widening is exact and both agree on all 65,536 patterns (0.0.3): nothing to round. GET_ROWS from f32 copies
+  (`ggml_vec_cpy_f32`); the ADD is one f32 add per value. Rows split by thread: no bit depends on it.
+- The batch (whisper.cpp:511, 7456): a window's prompt as `whisper_batch_prep_legacy(prompt, n_past 0, seq 0)` —
+  positions `n_past + i`, `n_seq_id` 1, logits on the **last row only**; each step one row, the decoder's last sampled
+  token at position `prompt.size() + i`, logits on.
+- The prompt (whisper.cpp:6975, 7106): `[SOT]`, `+ [lang, task]` for a multilingual model, `+ [NOT]` without
+  timestamps; before it, when there is past text, `[PREV]` and the last `min(max_prompt_ctx − 1, |past|)` tokens
+  (`max_prompt_ctx = min(n_max_text_ctx, 448 / 2)` = 224); a window starting within 500 frames of the end clears the past.
+
+### The oracle
+- `whisper_oracle --decin`: the layout probe adds `whisper_state::sched_decode` and `whisper_state::batch` (mirrored, its
+  size asserted); the eval callback asks only for the two GET_ROWS (by their src0) and their ADD, and at the token rows
+  reads the state's batch, self-checked on every call against the graph's own `embd` / `position` tensors. Per call: the
+  batch and one digest per row of the three nodes. `whisper_full` on each input in **config A** (the 0.0.1 transcript
+  record's params) observed at 1 and 4 threads and unobserved at 1 and 4, and **config B** (the same + `no_timestamps`
+  + 300 `prompt_tokens`) observed at 1 and 4 and unobserved at 1. Self-checks yes on 8 / 8 (order token rows → position
+  rows → ADD, the ADD's src0 the token rows, no other GET_ROWS, the types and shapes, batch = graph inputs, observed =
+  unobserved). 256 KB for 8 inputs, ~4 min.
+- **Found: config A's prompts are all `[SOT]`, one row.** tiny.en is English-only (no language or task token), the
+  record runs with timestamps (no NOT), and jfk_x3's second window starts at 2,900 of 3,300 frames, within 500 of the
+  end, so its past is cleared. A one-row prompt cannot tell "logits on the last row only" from "on every row", nor
+  exercise a prompt's positions — hence config B: `[PREV, the last 223 of the prompt, SOT, NOT]`, 226 rows, positions
+  0..225, the steps on to 307.
+- `oracle_decin_nodes_bit_exact`: every call of both configs at both thread counts — the model's token rows, position
+  rows and sum, and the fast path's sum: **0 differ** of 15,088 row comparisons (620 calls, 3,772 rows).
+- `oracle_decin_batches`: **32 / 32** prompts (`Prompt::window` → `Batch::prep_legacy`) and **588 / 588** steps
+  (`Batch::prep_step`) equal the recorded batches — tokens, positions, sequence ids, `n_seq_id`, logits flags. The
+  past-clearing rule's input (the window's seek) belongs to the decode loop; the test supplies it for jfk_x3's second
+  window and says so.
+- `oracle_decin_observed_run_is_the_recorded_transcript`: the observed 1-thread result = 0.0.1's transcript record,
+  **128 / 128** tokens, ids and `p` bits.
+- `oracle_decin_discriminators` (the 1-thread calls of both configs, per input), each caught on every input that
+  decodes (7 of 8; min_len makes no decoder call): positions off by one (every row), step positions without the prompt
+  length (every step), the position row 0 (every row past 0), the multilingual ids SOT + 1 (5–20 rows), widening with
+  f16 subnormals flushed (174–299 rows: SOT's own row holds 3 of d_te's 91,135 subnormals), widening through bf16 and
+  the sum rounded to f16 (every row). Indistinguishable, as predicted: the operands swapped (f32 addition commutes),
+  the sum in double (exact for two f32). **Found: the position rows rounded to f16 is indistinguishable too — all
+  172,032 of d_pe's f32 values are exactly f16 values** (the checkpoint was f16; the converter widened it). The test
+  asserts that property instead of the discriminator.
+- **Found: the thread count moves the reference's decoder, not its input.** Config A feeds the same tokens at 1 and 4
+  threads and every input row is identical, but the result's `p` bits differ on 5 of the 7 inputs that decode; in
+  config B chirp is fed a different token at 4 threads from its third call on. The logits (v0.2.0) will be compared at
+  stated thread counts, as the transcript always was.
+- **What this holds for:** this laptop's native libggml-cpu (Zen+, AVX2 + FMA + F16C, no AVX-512); production's Zen 3
+  library not run; `base.en` (n_state 512) not compared; **multilingual prompts not exercised** (no multilingual model is
+  pinned: `Prompt::init`'s language and task tokens are read from the source only); several decoders (best-of, beam:
+  `seq_id` ≠ 0, several rows per step), `carry_initial_prompt` and the temperature fallback not exercised.
+
+### Faster, bits unchanged
+- The token row widened and its position row added in one pass, eight values at a time (`vcvtph2ps` — the reference's
+  own instruction — and `vaddps`), straight into the caller's buffer; the batch's vectors sized once; **nothing
+  allocated per call** (0 bytes after the first); one thread (a step is one row; the reference's row split cannot
+  change a bit).
+
+### Measured (gate step 14, only after 4j passed; Ryzen 3 3200U, load ≈ 4.5; rerun at ≈ 3.2 in `.oracle/step14_rerun.txt`)
+The same tokens on both sides, output digests equal; the reference = the two inputs set, plan and compute of the three
+nodes as a ggml graph; voaice = `Batch::prep_legacy` + `DecoderInput::run_batch`; mean per call over ≥ 1 s:
+
+| tokens | whisper.cpp, 1 thread | whisper.cpp, 4 threads | voaice.rs (1 thread) |
+|---|---|---|---|
+| 1 (a step) | 1.05 · 1.00 µs | 20.1 · 4.8 µs wall (51.5 · 18.7 CPU-µs) | **0.108 · 0.107–0.114 µs** |
+| 226 (config B's prompt) | 110.5 · 61.2–66.3 µs | 43.2 · 40.8–55.3 µs wall | **22.8 · 21.4–21.7 µs** |
+
+- **Read with care.** For one token the reference's microsecond is mostly planning and dispatching a graph; in whisper
+  these nodes head the whole decoder graph and share its plan and thread start, so that cost is not theirs and the
+  one-token ratio is not claimed. The per-row work is comparable: ~0.095 µs a row against 0.27–0.49 µs, **2.9–3.1× at
+  one thread in the rerun** (4.9× in the gate, whose reference figure was taken at load 4.5). At the scale of a
+  transcript this stage is noise: well under a microsecond a token against a decoder step of milliseconds (that step
+  is v0.2.0's to measure).
+- Memory: voaice holds the f16 token table copied from the model (38,898 KiB) and the f32 positions (672 KiB) outside
+  the call; the reference reads the model's tensors in place. The logits product (0.1.7) reads the same table.
+
 ## 0.1.1 — 2026-10-08 — cross-attention K and V, bit-exact: every node of `sched_cross` and `kv_cross` itself
 
 **The second decade opens with the cross graph `whisper_encode_with_state` runs after the encoder: per decoder layer

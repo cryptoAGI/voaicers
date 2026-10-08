@@ -33,6 +33,10 @@ int main() {
     std::printf("#define VOAICE_OFF_STATE_KV_CROSS     %zu\n", offsetof(whisper_state, kv_cross));
     std::printf("#define VOAICE_OFF_KV_K               %zu\n", offsetof(whisper_kv_cache, k));
     std::printf("#define VOAICE_OFF_KV_V               %zu\n", offsetof(whisper_kv_cache, v));
+    // (0.1.2) the decoder's scheduler and the batch whisper_decode_internal reads its inputs from
+    std::printf("#define VOAICE_OFF_STATE_SCHED_DECODE %zu\n", offsetof(whisper_state, sched_decode));
+    std::printf("#define VOAICE_OFF_STATE_BATCH        %zu\n", offsetof(whisper_state, batch));
+    std::printf("#define VOAICE_SIZEOF_BATCH       %zu\n", sizeof(whisper_batch));
     std::printf("#define VOAICE_SIZEOF_MEL         %zu\n", sizeof(whisper_mel));
     std::printf("#define VOAICE_SIZEOF_FILTERS     %zu\n", sizeof(whisper_filters));
     return 0;
