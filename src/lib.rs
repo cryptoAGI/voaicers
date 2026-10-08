@@ -3,7 +3,8 @@
 //! exact first, fast second. Every stage reproduces the compiled output of the pinned whisper.cpp (upstream/PIN)
 //! bit for bit, checked by an oracle that runs the shipped library on the same input (testing/oracle).
 //!
-//! 0.0.9 holds the first stages: the model loader with its sha256 guard ([`model`]), the WAV input ([`wav`]) and the
+//! v0.1.0 holds the whole encoder, bit for bit what the pinned whisper.cpp's `whisper_encode_with_state` computes, and
+//! the stages it is built from: the model loader with its sha256 guard ([`model`]), the WAV input ([`wav`]) and the
 //! log-mel front end ([`mel`], allocation-free and threaded since 0.0.2, still 0 ULP); the first encoder kernels
 //! (0.0.3): f32 ↔ f16 as ggml-cpu converts ([`f16`]) and GELU with ggml's f16 table ([`gelu`]), bit-exact on every
 //! input; the streaming Ogg/Opus reader (0.0.4, [`ogg`]): pages, CRC, packets, headers and the exact duration, one page
@@ -17,12 +18,18 @@
 //! (each block's attn_ln and mlp_ln, ln_post) bit-exact against the encoder graph's own nodes; the matrix products on
 //! activations (0.0.9, [`matmul`]): `mul_mat`'s f32 → f16 `from_float` split by thread, then the f16 dot — every
 //! block's Q, K, V and their f16 copies, the out projection, the MLP, their biases, GELU and residuals, bit-exact
-//! against every such node and faster; plus [`measure`] (CPU time and peak RSS from `/proc`,
-//! for the gate). [`vclone`] holds voaice's voice identities: the vprint, byte-identical to cryptoAGI/voaice's
-//! vprint.py, and the hash-chained forge log (docs/VCLONE.md). The rest of the encoder (flash attention, v0.1.0),
-//! and the decoder, are not here yet (TODO.md).
+//! against every such node and faster; flash attention (v0.1.0, [`attention`]): ggml's tiled kernel — Q in f32, the f16
+//! `kv_pad` cache with its 36 zero rows attended, f32 FMA-chain scores, the online softmax with ggml's own 8-lane
+//! `ggml_v_expf` for the probabilities and glibc's `expf` for the rescale, the output accumulated in f32 — and the
+//! encoder whole ([`encoder`]): the mel → conv stage → four blocks → ln_post = `embd_enc`, bit-exact against every node
+//! of whisper's encoder graph and against `embd_enc` itself, about four times the reference's speed at one thread; plus
+//! [`measure`] (CPU time and peak RSS from `/proc`, for the gate). [`vclone`] holds voaice's voice identities: the
+//! vprint, byte-identical to cryptoAGI/voaice's vprint.py, and the hash-chained forge log (docs/VCLONE.md). The decoder
+//! (v0.2.0) is not here yet (TODO.md, docs/ROADMAP.md).
 
+pub mod attention;
 pub mod conv;
+pub mod encoder;
 pub mod f16;
 pub mod gelu;
 pub mod json;

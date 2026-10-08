@@ -1,5 +1,99 @@
 # Changelog
 
+## v0.1.0 — 2026-10-08 — MILESTONE: the whole encoder, bit-exact — flash attention, four blocks, ln_post, `embd_enc`
+
+**From voaice's own mel to `embd_enc`, bit for bit what the pinned whisper.cpp's `whisper_encode_with_state` leaves in
+`whisper_state::embd_enc`: every computed node of the encoder graph (96 per run) and `embd_enc` itself 0 differ on 8
+inputs at 1, 2 and 4 threads. Flash attention — ggml's tiled kernel, the one whisper's graph actually takes — 0 differ
+in 36,864,000 values; nine discriminators caught on every input, one of them confirmed by the reference's own other
+path. Then the whole encoder, mel → `embd_enc`, 3.85× whisper.cpp at one thread in the gate run (1,038 against 3,994
+ms; 4.04× in a rerun: 987 against 3,983), 3.05–3.14× at two threads, 2.95–3.01× at four, in 17.9 MB of heap against
+the 29.4 MB of compute buffers and cache whisper allocates for it.** The first ten increments are done: 0.0.1 … 0.0.9
+built this milestone.
+Record: `testing/results/0.1.0.txt`; how it was read and found: `testing/attention/NOTES.md`.
+
+### The op, read from the pin and the binary — and the path, before the path
+- whisper's encoder: `Q = permute(reshape_3d(q_add, 64, 6, 1500))` stays **f32**; K and V are 0.0.9's f16 CPYs into
+  `kv_pad`, viewed as [64, 1536, 6]; `flash_attn_ext(Q, K, V, no mask, 1.0f/sqrtf(64))`.
+- **`kv_pad` has 1,536 rows** (`GGML_PAD(1500, 256)`); `whisper_kv_cache_init` clears its buffer and the CPYs write rows
+  0..1499 only, so **the 36 padding rows are +0, and with no mask they are attended**: each scores exactly +0 (every
+  product ±0, `+0 + −0 = +0`), adds `exp(0 − M)` to the denominator, nothing to the numerator. The record checks the
+  padding is +0 in every block; leaving it out is a discriminator.
+- ggml has two flash-attention kernels and a shape test picks one. TODO.md had read the one-chunk path (Q → f16,
+  `ggml_vec_dot_f16` scores, V accumulated in f16). **whisper's encoder takes the tiled path**
+  (`ggml_compute_forward_flash_attn_ext_tiled`: Q f32, K/V f16, 1,500 ≥ the 64-row tile, 64 % 8 = 0): scores as f32
+  FMA chains from +0 (`simd_gemm`: every element its own chain) × 0.125; per tile of 64 keys the max (a `vmaxss`
+  chain), `fmaxf`, and when it grows a rescale of the output and the sum by **glibc's `expf(Mold − Mnew)`**; the
+  probabilities by `ggml_vec_soft_max_f32` — **ggml's own 8-lane `ggml_v_expf`** (ARM's optimized-routines expf), summed
+  8 at a time in f32 as `((y0 + y4) + (y2 + y6)) + ((y1 + y5) + (y3 + y7))`, those sums added in double, then
+  `S = (float)((double)S + sum)`; **the output accumulated in f32** by FMA chains over each tile's keys; × 1/S at the end.
+  Confirmed in this laptop's libggml-cpu: 47 `vfmadd231ps`, one `vmaxss`, `fmaxf@plt`, `expf@plt` (GLIBC_2.27),
+  `ggml_vec_soft_max_f32@plt` (8 FMA, the pairing, `vaddsd`), `vcvtss2sd / vaddsd / vcvtsd2ss` for S, no `vcvtps2ph`.
+- Rows are independent (per-row softmax state; every score and output element one chain), so the reference is
+  bit-identical at any thread count — checked at 1..8 — and so is `embd_enc` (1, 2, 4).
+
+### The oracle
+- `whisper_oracle --encoder`: an eval callback on `sched_encode` observing every node (0.0.9's keys + the norm chains, the
+  positional ADD, FLASH_ATTN_EXT), one digest per row of each of the 97 computed nodes, `embd_enc` whole after
+  unobserved runs at 1, 2 and 4 threads (read from the state through the layout probe). At each FLASH_ATTN_EXT the
+  callback copies Q and all of `kv_pad` before the node runs: types, shapes, strides, op params checked, padding +0. The
+  standalone attention graph (what `--bench-attn` times) = the node at 1..8 threads; the same graph with
+  `cplan.use_ref` (the one-chunk path) recorded too: **it changes 2,303,363–2,303,984 of each block's 2,304,000 values.**
+  28 MB for 8 inputs.
+- `oracle_attention_nodes_bit_exact`: every block's attention fed Q, K, V that voaice computes from attn_ln's recorded
+  input (each first equal to the record's q_add / k_cpy / v_cpy digests): the fast path at 1 and 4 threads **0 values
+  differ** of 36,864,000; the model on all of block 0 and every 10th frame of blocks 1–3 **0 rows differ** of 15,600.
+- `oracle_encoder_end_to_end`: the WAV → voaice's mel → the conv stage → four blocks → ln_post at 1, 2 and 4 threads:
+  **every node the record names (96: all but the CONT voaice's conv stage folds into its add) 0 rows differ** — 2,304
+  node comparisons, 3,456,000 rows — and `Encoder::encode_into` (no taps, caller-owned buffers, called twice)
+  **`embd_enc` 0 values differ** on every input at every thread count.
+- `oracle_attention_discriminators` (every 25th frame and the last, 6 heads, 4 blocks, of 244 rows per input), each
+  caught on every input: glibc `expf` for the probabilities (244), `ggml_v_expf` for the rescale (226–238), no running
+  max (234–242), kv_pad's zero rows excluded (244), scores without FMA (244), output without FMA (244), the softmax sums in
+  f32 (215–233), out / S (244), the one-chunk path (244). **Q scaled before the dot: 0 on every input** — ×1/8 is exact,
+  so this reading cannot be told apart, as predicted, and it is reported as such.
+- **Found by the record:** voaice's model of the one-chunk path, checked against the reference's own `use_ref` output,
+  matches it (0 of 1,952 rows) only with `S = S·ms + vs` in **two** roundings; with an FMA, 543 rows differ. GCC did not
+  contract it: it split the update by branch (`vmulss`, then `vaddss`), as the disassembly then showed.
+- **What this holds for:** this laptop's native libggml-cpu (Zen+, AVX2 + FMA + F16C, no AVX-512) and glibc 2.35's
+  `expf` as its ifunc picks it here, called through the same symbol by both sides. Production's Zen 3 library and glibc
+  were not run; an AVX-512 build (`ggml_v_expf`'s 16-lane form, another softmax pairing) not compared; `base.en` (8
+  heads) not compared; non-finite activations through attention not compared (the same operations, but NaN payloads
+  and the max tree's choice among NaNs not checked).
+
+### Faster, bits unchanged
+- K transposed per tile and V widened **once per head per call**; the reference re-packs K for every 64-query tile.
+- The softmax on the tile in two passes (no vector live across glibc's `expf`), the eight-sums of eight rows at once in
+  double lanes, the rescale folded into the output product's load; 6-row × 16-column register blocks for the scores
+  and the output (simd_gemm's shape), query tiles of 60 (1,500 = 25 whole tiles); threads by query tiles behind a
+  per-head `std::sync::Barrier` (one scope per call), which also keeps the widened K/V to one head (0.8 MB).
+- `Encoder::encode_into`: the conv stage, the blocks and ln_post chained through an `EncoderBuffers` the caller owns;
+  every earlier fusion kept (attn_ln and mlp_ln inside the conversions, one conversion for Q/K/V, the MLP by panels).
+- Ablations on block 0 (one thread): the softmax ≈ 14.5 ms of ~90, of which `ggml_v_expf` ≈ 11 ms (its own op count);
+  scores + output ≈ 73 ms against a 65 ms floor of 256-bit FMAs on this core.
+
+### Measured (gate step 12, only after 4h passed; Ryzen 3 3200U, 2 cores / 4 threads, load 1.5 → 3.5)
+jfk; each side in a fresh process; wall = best of 10 (gate run · one rerun at load 2.1 → 3.2,
+`.oracle/step12_rerun.txt`):
+
+| | threads | whisper.cpp | voaice.rs | × |
+|---|---|---|---|---|
+| **the whole encoder, mel → `embd_enc`** | 1 | 3,994 · 3,983 ms | **1,038 · 987 ms** | **3.85 · 4.04×** |
+| | 2 | 2,436 · 2,431 | 799 · 774 | 3.05 · 3.14× |
+| | 4 | 2,378 · 2,435 | 791 · 824 | 3.01 · 2.95× |
+| block 0's attention | 1 | 150.8 · 146.6 | 91.9 · 91.3 | 1.64 · 1.61× |
+| | 2 | 94.7 · 90.6 | 64.1 · 59.2 | 1.48 · 1.53× |
+| | 4 | 89.7 · 90.8 | 70.2 · 62.0 | 1.28 · 1.46× |
+
+- CPU per encode: 1,149 against 4,250 CPU-ms at one thread (3.7×); 2,005 against 5,910 at two; 2,729 against 9,908 at
+  four. The `embd_enc` each side measured was digested and compared by the gate: `50d38ec85f2778b9` on both.
+- Memory: voaice's encode holds **17,869 KiB** at its peak at one thread (its buffers between stages, allocated by the
+  first call; 21,919 at four), against whisper's **29,398 KiB** of compute buffers and `kv_pad` (allocated by
+  `whisper_init_state`). Both hold the weights outside the call: whisper f16, voaice widened to f32 for the products
+  (28 MB for the four blocks, 2× the f16 bytes) — said here, not hidden. Attention alone: 3,049 against 4,651 KiB.
+- At four threads voaice is no faster than at two on this 2-core laptop (SMT siblings share the FMA pipes); the
+  reference's thread pool gains as little.
+
 ## 0.0.9 — 2026-10-08 — the matrix products on activations, bit-exact: every block's Q, K, V, out projection and MLP
 
 **`mul_mat`'s f32 → f16 conversion of the activations (`from_float`, split by thread) and 0.0.6's f16 dot, with every

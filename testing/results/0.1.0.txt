@@ -1,0 +1,598 @@
+# voaice.rs 0.1.0 release gate — 2026-10-08T13:20:09Z
+# host: x86_64, 4 cpus, AMD Ryzen 3 3200U with Radeon Vega Mobile Gfx; load 1.52 1.64 1.50
+# rustc: rustc 1.99.0 (b940084d7 2026-09-28); gcc: gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
+## 1. reference
+built testing/oracle/bin/whisper_oracle (reference 080bbbe85230f624f0b52127f1ae1218247989f9, ggml 0.16.0)
+## 2. inputs
+model models/ggml-tiny.en.bin sha256 921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f (pinned)
+audio ok: 8 files match testing/pins/audio.sha256
+resampler audio ok: 55 files match testing/pins/resample.sha256
+## 3. record (the shipped libwhisper.so, in process)
+whisper_oracle: chirp: 40000 samples, mel 80x3250, threads agree: yes, 1 segments
+whisper_oracle: jfk: 176000 samples, mel 80x4100, threads agree: yes, 2 segments
+whisper_oracle: jfk_x3: 528000 samples, mel 80x6300, threads agree: yes, 6 segments
+whisper_oracle: min_len: 201 samples, mel 80x3001, threads agree: yes, 0 segments
+whisper_oracle: noise_loud: 16000 samples, mel 80x3100, threads agree: yes, 0 segments
+whisper_oracle: odd_len: 12345 samples, mel 80x3077, threads agree: yes, 1 segments
+whisper_oracle: short: 4800 samples, mel 80x3030, threads agree: yes, 0 segments
+whisper_oracle: silence: 16000 samples, mel 80x3100, threads agree: yes, 1 segments
+whisper_oracle: f16: 65536 f16 widened 4 ways; 1429656 f32 narrowed 3 ways; all 2^32 f32 digested (chunks where libggml-base == ggml-cpu tail: 65536, == ggml-cpu row: 65280 of 65536); gelu table; gelu op on 1495192 values (1 vs 4 threads identical: yes) and on all 2^32
+(the f16 record took 55 s: all 2^32 f32 patterns, three conversions and the GELU op, one thread)
+resample_oracle (libcommon.a's read_audio_data): 55 files recorded, 1955875 samples
+libcommon.a's common-whisper.cpp.o (miniaudio inside): 0 FMA instructions, 0 ymm uses
+whisper_oracle: vec_dot_f16: 1436 records (real rows of every f16 tensor, lengths 1..300, random patterns)
+whisper_oracle: chirp: conv graph 14 nodes; conv1 im2col + mul_mat + add + gelu recorded; 1 vs 4 threads identical: yes; embd_conv with and without observing: yes; standalone graph = scheduler: yes
+whisper_oracle: jfk: conv graph 14 nodes; conv1 im2col + mul_mat + add + gelu recorded; 1 vs 4 threads identical: yes; embd_conv with and without observing: yes; standalone graph = scheduler: yes
+whisper_oracle: jfk_x3: conv graph 14 nodes; conv1 im2col + mul_mat + add + gelu recorded; 1 vs 4 threads identical: yes; embd_conv with and without observing: yes; standalone graph = scheduler: yes
+whisper_oracle: min_len: conv graph 14 nodes; conv1 im2col + mul_mat + add + gelu recorded; 1 vs 4 threads identical: yes; embd_conv with and without observing: yes; standalone graph = scheduler: yes
+whisper_oracle: noise_loud: conv graph 14 nodes; conv1 im2col + mul_mat + add + gelu recorded; 1 vs 4 threads identical: yes; embd_conv with and without observing: yes; standalone graph = scheduler: yes
+whisper_oracle: odd_len: conv graph 14 nodes; conv1 im2col + mul_mat + add + gelu recorded; 1 vs 4 threads identical: yes; embd_conv with and without observing: yes; standalone graph = scheduler: yes
+whisper_oracle: short: conv graph 14 nodes; conv1 im2col + mul_mat + add + gelu recorded; 1 vs 4 threads identical: yes; embd_conv with and without observing: yes; standalone graph = scheduler: yes
+whisper_oracle: silence: conv graph 14 nodes; conv1 im2col + mul_mat + add + gelu recorded; 1 vs 4 threads identical: yes; embd_conv with and without observing: yes; standalone graph = scheduler: yes
+(the conv1 record took 92 s: each input encoded three times, observed at 1 and 4 threads and not observed)
+libggml-cpu's ggml_vec_dot_f16 (0x000000000006fa30): 8 vcvtph2ps, 4 ymm vfmadd231ps, 2 vhaddps, 1 vaddsd (the double tail); GGML_LLAMAFILE OFF in the build
+whisper_oracle: chirp: 18 nodes observed; conv2 im2col + mul_mat + add + gelu, cont + pe add recorded; 1 vs 4 threads identical: yes; embd_conv = last node, unobserved: yes; embd_enc observed = unobserved: yes; standalone conv2 / stage = scheduler: yes / yes
+whisper_oracle: jfk: 18 nodes observed; conv2 im2col + mul_mat + add + gelu, cont + pe add recorded; 1 vs 4 threads identical: yes; embd_conv = last node, unobserved: yes; embd_enc observed = unobserved: yes; standalone conv2 / stage = scheduler: yes / yes
+whisper_oracle: jfk_x3: 18 nodes observed; conv2 im2col + mul_mat + add + gelu, cont + pe add recorded; 1 vs 4 threads identical: yes; embd_conv = last node, unobserved: yes; embd_enc observed = unobserved: yes; standalone conv2 / stage = scheduler: yes / yes
+whisper_oracle: min_len: 18 nodes observed; conv2 im2col + mul_mat + add + gelu, cont + pe add recorded; 1 vs 4 threads identical: yes; embd_conv = last node, unobserved: yes; embd_enc observed = unobserved: yes; standalone conv2 / stage = scheduler: yes / yes
+whisper_oracle: noise_loud: 18 nodes observed; conv2 im2col + mul_mat + add + gelu, cont + pe add recorded; 1 vs 4 threads identical: yes; embd_conv = last node, unobserved: yes; embd_enc observed = unobserved: yes; standalone conv2 / stage = scheduler: yes / yes
+whisper_oracle: odd_len: 18 nodes observed; conv2 im2col + mul_mat + add + gelu, cont + pe add recorded; 1 vs 4 threads identical: yes; embd_conv = last node, unobserved: yes; embd_enc observed = unobserved: yes; standalone conv2 / stage = scheduler: yes / yes
+whisper_oracle: short: 18 nodes observed; conv2 im2col + mul_mat + add + gelu, cont + pe add recorded; 1 vs 4 threads identical: yes; embd_conv = last node, unobserved: yes; embd_enc observed = unobserved: yes; standalone conv2 / stage = scheduler: yes / yes
+whisper_oracle: silence: 18 nodes observed; conv2 im2col + mul_mat + add + gelu, cont + pe add recorded; 1 vs 4 threads identical: yes; embd_conv = last node, unobserved: yes; embd_enc observed = unobserved: yes; standalone conv2 / stage = scheduler: yes / yes
+(the conv2 record took 95 s: each input encoded three times, observed at 1 and 4 threads and not observed)
+whisper_oracle: chirp: 127 encoder nodes observed; 9 norm -> mul -> add chains recorded; eps 1e-5f: yes; the named weights: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes; ln_post = embd_enc: yes; standalone = scheduler: yes
+whisper_oracle: jfk: 127 encoder nodes observed; 9 norm -> mul -> add chains recorded; eps 1e-5f: yes; the named weights: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes; ln_post = embd_enc: yes; standalone = scheduler: yes
+whisper_oracle: jfk_x3: 127 encoder nodes observed; 9 norm -> mul -> add chains recorded; eps 1e-5f: yes; the named weights: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes; ln_post = embd_enc: yes; standalone = scheduler: yes
+whisper_oracle: min_len: 127 encoder nodes observed; 9 norm -> mul -> add chains recorded; eps 1e-5f: yes; the named weights: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes; ln_post = embd_enc: yes; standalone = scheduler: yes
+whisper_oracle: noise_loud: 127 encoder nodes observed; 9 norm -> mul -> add chains recorded; eps 1e-5f: yes; the named weights: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes; ln_post = embd_enc: yes; standalone = scheduler: yes
+whisper_oracle: odd_len: 127 encoder nodes observed; 9 norm -> mul -> add chains recorded; eps 1e-5f: yes; the named weights: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes; ln_post = embd_enc: yes; standalone = scheduler: yes
+whisper_oracle: short: 127 encoder nodes observed; 9 norm -> mul -> add chains recorded; eps 1e-5f: yes; the named weights: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes; ln_post = embd_enc: yes; standalone = scheduler: yes
+whisper_oracle: silence: 127 encoder nodes observed; 9 norm -> mul -> add chains recorded; eps 1e-5f: yes; the named weights: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes; ln_post = embd_enc: yes; standalone = scheduler: yes
+(the norm record took 94 s: each input encoded three times, every encoder node observed at 1 and 4 threads, and not observed)
+libggml-cpu's ggml_vec_cvar_f32: 1 vmulps, 9 vaddsd, 0 FMA; ggml_compute_forward_norm: 2 vsqrtss, 2 vcvtsd2ss, 0 FMA, 1 vaddsd (the in-order double sum)
+whisper_oracle: chirp: 127 encoder nodes observed; 4 blocks x 17 nodes digested; f16 weights, plain CPU buffers: yes; K unbiased: yes; biases named: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes; standalone = scheduler: yes
+whisper_oracle: jfk: 127 encoder nodes observed; 4 blocks x 17 nodes digested; f16 weights, plain CPU buffers: yes; K unbiased: yes; biases named: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes; standalone = scheduler: yes
+whisper_oracle: jfk_x3: 127 encoder nodes observed; 4 blocks x 17 nodes digested; f16 weights, plain CPU buffers: yes; K unbiased: yes; biases named: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes; standalone = scheduler: yes
+whisper_oracle: min_len: 127 encoder nodes observed; 4 blocks x 17 nodes digested; f16 weights, plain CPU buffers: yes; K unbiased: yes; biases named: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes; standalone = scheduler: yes
+whisper_oracle: noise_loud: 127 encoder nodes observed; 4 blocks x 17 nodes digested; f16 weights, plain CPU buffers: yes; K unbiased: yes; biases named: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes; standalone = scheduler: yes
+whisper_oracle: odd_len: 127 encoder nodes observed; 4 blocks x 17 nodes digested; f16 weights, plain CPU buffers: yes; K unbiased: yes; biases named: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes; standalone = scheduler: yes
+whisper_oracle: short: 127 encoder nodes observed; 4 blocks x 17 nodes digested; f16 weights, plain CPU buffers: yes; K unbiased: yes; biases named: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes; standalone = scheduler: yes
+whisper_oracle: silence: 127 encoder nodes observed; 4 blocks x 17 nodes digested; f16 weights, plain CPU buffers: yes; K unbiased: yes; biases named: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes; standalone = scheduler: yes
+whisper_oracle: mm-nan: 12 rows (10 with a NaN), query.weight x rows + bias at 1..8 threads recorded
+(the matmul record took 128 s: each input encoded three times, every encoder node observed at 1 and 4 threads, and not observed; 80M of digests and attention outputs)
+libggml-cpu's ggml_cpu_fp32_to_fp16 (mul_mat's from_float): 2 vcvtps2ph; ggml_compute_forward_mul_mat: 25 calls, 0 FMA (the dot is ggml_vec_dot_f16 through the traits); GGML_CPU_REPACK ON (no f16 repack: 0 f16 traits)
+whisper_oracle: chirp: 97 encoder nodes digested; attention inputs as built: yes; kv_pad padding +0: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes, 1 = 2 = 4 threads: yes, = last node: yes; standalone attention = scheduler at 1..8 threads: yes; use_ref changes 2303961 values (6000 rows)
+whisper_oracle: jfk: 97 encoder nodes digested; attention inputs as built: yes; kv_pad padding +0: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes, 1 = 2 = 4 threads: yes, = last node: yes; standalone attention = scheduler at 1..8 threads: yes; use_ref changes 2303962 values (6000 rows)
+whisper_oracle: jfk_x3: 97 encoder nodes digested; attention inputs as built: yes; kv_pad padding +0: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes, 1 = 2 = 4 threads: yes, = last node: yes; standalone attention = scheduler at 1..8 threads: yes; use_ref changes 2303363 values (6000 rows)
+whisper_oracle: min_len: 97 encoder nodes digested; attention inputs as built: yes; kv_pad padding +0: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes, 1 = 2 = 4 threads: yes, = last node: yes; standalone attention = scheduler at 1..8 threads: yes; use_ref changes 2303984 values (6000 rows)
+whisper_oracle: noise_loud: 97 encoder nodes digested; attention inputs as built: yes; kv_pad padding +0: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes, 1 = 2 = 4 threads: yes, = last node: yes; standalone attention = scheduler at 1..8 threads: yes; use_ref changes 2303972 values (6000 rows)
+whisper_oracle: odd_len: 97 encoder nodes digested; attention inputs as built: yes; kv_pad padding +0: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes, 1 = 2 = 4 threads: yes, = last node: yes; standalone attention = scheduler at 1..8 threads: yes; use_ref changes 2303976 values (6000 rows)
+whisper_oracle: short: 97 encoder nodes digested; attention inputs as built: yes; kv_pad padding +0: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes, 1 = 2 = 4 threads: yes, = last node: yes; standalone attention = scheduler at 1..8 threads: yes; use_ref changes 2303972 values (6000 rows)
+whisper_oracle: silence: 97 encoder nodes digested; attention inputs as built: yes; kv_pad padding +0: yes; 1 vs 4 threads identical: yes; embd_enc observed = unobserved: yes, 1 = 2 = 4 threads: yes, = last node: yes; standalone attention = scheduler at 1..8 threads: yes; use_ref changes 2303981 values (6000 rows)
+(the encoder record took 203 s: each input encoded five times — observed at 1 and 4 threads, not observed at 1, 2, 4 — and each attention node recomputed at 1..8 threads and by use_ref; 28M of digests and embd_enc)
+libggml-cpu's ggml_compute_forward_flash_attn_ext_tiled (the path whisper's encoder takes): 47 vfmadd231ps (simd_gemm's chains), 1 vmaxss (the tile max), 3 calls of glibc expf, 1 of fmaxf, 1 of ggml_vec_soft_max_f32, 0 vcvtps2ph (Q is not converted), 1 vaddsd (S += the double sum); ggml_vec_soft_max_f32: 8 FMA (ggml_v_expf), 2 vaddsd, 1 call of expf (the n % 8 tail); expf from (GLIBC_2.27)
+this CPU: fma avx f16c avx2 (production: Zen 3, the same extensions; its library is not the one checked here)
+## 4. voaice.rs
+    Finished `release` profile [optimized] target(s) in 0.03s
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 0 passed; 0 failed; 13 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test guard_refuses_a_modified_model ... guard: refused: modified tiny.en has the size of ggml-tiny.en.bin (77704715 bytes) but sha256 97fcb6d6c685525d1c12436fe4407284eef7477a9cbce735a09ba20eaf4bb1f8, not the pinned 921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f
+ok
+test oracle_f16_discriminates_round_half_away ... oracle_f16_discriminates: round-half-away differs in 31752 of 1429656 boundary values (first: input 0x33000000 -> ours 1, reference 0), and in 8448 of 65536 chunks of all 2^32
+ok
+test oracle_f16_to_f32_all_65536 ... oracle_f16_to_f32 (port: scalar for base/table/tail, row for the F16C row):
+  ggml base    : 65536 / 65536 identical
+  ggml table   : 65536 / 65536 identical
+  ggml cpu_tail: 65536 / 65536 identical
+  ggml cpu_row : 65536 / 65536 identical
+ok
+test oracle_f32_to_f16_boundary_set ... oracle_f32_to_f16_boundary_set (1429656 inputs, 4047 NaN; the portable and F16C conversions differ on 4029, all NaN):
+  scalar   vs libggml-base ggml_fp32_to_fp16      : 1429656 / 1429656 identical
+  scalar   vs ggml-cpu GGML_CPU_FP32_TO_FP16 (tail): 1429656 / 1429656 identical
+  row      vs ggml-cpu ggml_cpu_fp32_to_fp16 (F16C): 1429656 / 1429656 identical
+  vcvtps2ph model vs ggml_cpu_fp32_to_fp16 (F16C)  : 1429656 / 1429656 identical
+ok
+test oracle_f32_to_f16_every_pattern ... oracle_f32_to_f16_every_pattern (7.8 s here; the reference's own scalar copies agree on 65536 chunks, its row and scalar on 65280):
+  scalar vs libggml-base          : 65536 / 65536 chunks identical (all of 4,294,967,296 patterns)
+  scalar vs ggml-cpu tail         : 65536 / 65536 chunks identical (all of 4,294,967,296 patterns)
+  row vs ggml-cpu row (F16C)      : 65536 / 65536 chunks identical (all of 4,294,967,296 patterns)
+  vcvtps2ph model vs ggml-cpu row : 65536 / 65536 chunks identical (all of 4,294,967,296 patterns)
+ok
+test oracle_gelu_op ... oracle_gelu_op:
+  vector: 1495192 / 1495192 identical
+  scalar: 1495192 / 1495192 identical
+  every f32 pattern (11.2 s here): vector 65536 / 65536 chunks identical, scalar 65536 / 65536
+ok
+test oracle_gelu_table_all_65536 ... oracle_gelu_table: 65536 / 65536 entries identical (built in 2.62 ms)
+ok
+test oracle_gelu_table_discriminates_unfused ... oracle_gelu_discriminates: the unfused GELU differs in 1 of 65536 table entries (first: input 0x0000bfff -> ours 43474, reference 43475)
+ok
+test oracle_mel_bit_exact ... oracle_mel (2316640 values):
+  chirp       80 x 3250 =  260000 values: 0 differ, max 0 ULP
+  jfk         80 x 4100 =  328000 values: 0 differ, max 0 ULP
+  jfk_x3      80 x 6300 =  504000 values: 0 differ, max 0 ULP
+  min_len     80 x 3001 =  240080 values: 0 differ, max 0 ULP
+  noise_loud  80 x 3100 =  248000 values: 0 differ, max 0 ULP
+  odd_len     80 x 3077 =  246160 values: 0 differ, max 0 ULP
+  short       80 x 3030 =  242400 values: 0 differ, max 0 ULP
+  silence     80 x 3100 =  248000 values: 0 differ, max 0 ULP
+ok
+test oracle_mel_discriminates_fused_fft ... oracle_mel_discriminates: fused-FFT variant on jfk: 25242 of 328000 values differ, max 32768 ULP
+ok
+test oracle_mel_threads_bit_identical ... oracle_mel_threads: 8 inputs x threads {2, 3, 4, 8}: 9266560 values, all identical to 1 thread and to the reference
+ok
+test oracle_model_hparams_tensors_vocab_filters ... oracle_model: 167 tensors (77110272 bytes) identical by sha256, filterbank 80x201 bit-exact, 51864 vocab strings identical (1 hold a NUL the C API cannot show past)
+ok
+test oracle_pcm_input_identical ... ok
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.49s
+## 4b. the Ogg/Opus reader (0.0.4): opus-tools 0.2 (opusinfo, opusdec), libopus 1.4, libogg 1.3.5 on mindX production
+35 pinned files: sha256 ok
+reference: {"date": "2026-10-08T04:32:13Z", "host_cpu": "AMD EPYC 7543P 32-Core Processor", "reference": {"libopus": "libopus 1.4", "opus_tools": "opusinfo from opus-tools 0.2"}, "packages": "libogg0 1.3.5-3build1; libopus0 1.4-1bu…
+test bounded_memory_one_byte_at_a_time ... ok
+test oracle_opus_adversarial_files_refused ...   refused    m_crc_field              byte 3939 (page 3): Crc: stored e908fb4a, computed e908fb4b  | reference: opusinfo 28 warning(s), opusdec Some(476160) samples (exit Some(0))
+  refused    m_body_bit               byte 3939 (page 3): Crc: stored e908fb4b, computed eed9cf60  | reference: opusinfo 28 warning(s), opusdec Some(476160) samples (exit Some(0))
+  refused    m_truncated_mid_page     byte 35424 (page 13): TruncatedPage: 3 of 35 body bytes  | reference: opusinfo 1 warning(s), opusdec Some(527688) samples (exit Some(0))
+  refused    m_truncated_last_byte    byte 35424 (page 13): TruncatedPage: 34 of 35 body bytes  | reference: opusinfo 1 warning(s), opusdec Some(527688) samples (exit Some(0))
+  refused    m_truncated_header       byte 35424 (page 13): TruncatedPage: 10 of 27 header bytes  | reference: opusinfo 1 warning(s), opusdec Some(527688) samples (exit Some(0))
+  refused    m_no_eos                 byte 35424 (page 13): NoEndOfStream: the file ends with no end-of-stream page  | reference: opusinfo 1 warning(s), opusdec Some(527688) samples (exit Some(0))
+  refused    m_dropped_page           byte 7175 (page 4): Sequence: page sequence 5, expected 4  | reference: opusinfo 11 warning(s), opusdec Some(476160) samples (exit Some(0))
+  refused    m_duplicated_page        byte 10027 (page 5): Sequence: page sequence 4, expected 5  | reference: opusinfo 12 warning(s), opusdec Some(572160) samples (exit Some(0))
+  refused    m_capture                byte 3917 (page 3): CapturePattern: [4f, 67, 67, 58] where OggS should be  | reference: opusinfo 28 warning(s), opusdec Some(476160) samples (exit Some(0))
+  refused    m_version                byte 3921 (page 3): Version: stream structure version 1  | reference: opusinfo 13 warning(s), opusdec Some(476160) samples (exit Some(0))
+  refused    m_granule_backwards      byte 7163 (page 4): GranuleBackwards: granule 95040 after 96000  | reference: opusinfo 2 warning(s), opusdec the base's samples
+  refused    m_granule_mismatch       byte 7163 (page 4): GranuleMismatch: granule 144960, expected 96000 + 48000 = 144000  | reference: opusinfo 1 warning(s), opusdec the base's samples
+  refused    m_granule_beyond_eos     byte 35430 (page 13): GranuleBeyondSamples: granule 534072, but the packets decode only to 528960  | reference: opusinfo 1 warning(s), opusdec Some(528648) samples (exit Some(0))
+  refused    m_serial                 byte 3931 (page 3): Serial: serial 00000fa5 in a stream of 00000fa4  | reference: opusinfo 19 warning(s), opusdec Some(476160) samples (exit Some(0))
+  refused    m_bos_again              byte 3922 (page 3): HeaderFlags: BOS on a page after the first  | reference: opusinfo 1 warning(s), opusdec the base's samples
+  refused    m_continued_flag         byte 3922 (page 3): Continuation: continued flag with no packet to continue  | reference: opusinfo 11 warning(s), opusdec Some(527040) samples (exit Some(0))
+  refused    m_eos_removed            byte 35430 (page 13): GranuleMismatch: granule 528312, expected 528000 + 960 = 528960  | reference: opusinfo 2 warning(s), opusdec Some(528648) samples (exit Some(0))
+  refused    m_head_magic             byte 28 (page 0): OpusHead: not an OpusHead packet (19 bytes)  | reference: opusinfo 0 warning(s), opusdec None samples (exit Some(1))
+  refused    m_tags_magic             byte 47 (page 1): OpusTags: not an OpusTags packet (764 bytes)  | reference: opusinfo 553 warning(s), opusdec None samples (exit Some(1))
+  refused    m_appended_stream        byte 35487 (page 14): DataAfterEnd: bytes after the end-of-stream page (a chained or appended stream)  | reference: opusinfo 3 warning(s), opusdec Some(1056000) samples (exit Some(0))
+  accepted   m_start_offset           start granule 48000, duration 528000 = opusdec's 528000 (reference warned: false)
+  refused    m_preskip_over           byte 847 (page 2): PreSkip: the stream ends at 915 samples, before its pre-skip of 2000  | reference: opusinfo 1 warning(s), opusdec None samples (exit Some(1))
+oracle_opus_adversarial_files_refused: 21 / 21 refused with the expected kind, 1 / 1 valid variant accepted; the reference noticed 21 of the 21 (opusinfo warned or opusdec's output changed)
+ok
+test oracle_opus_discriminators ... oracle_opus_discriminators over 35 files, 427 pages:
+  pre-skip added instead of subtracted: wrong on 34 / 35 files (right only where pre-skip is 0)
+  no end trimming:                      wrong on 34 / 35 files
+  code-3 frame count ignored:           wrong on 3 / 35 files (those with multi-frame packets)
+  zlib's CRC-32:                        verifies 0 / 427 pages; Ogg's verifies 427 / 427
+ok
+test oracle_opus_good_files ... oracle_opus_good_files: 35 files (14 by streamair, 21 by opusenc)
+   35 / 35  audio packets (libogg)
+   35 / 35  bytes (opusinfo total data length)
+   35 / 35  channels (opusinfo, opusdec)
+   35 / 35  comments (a picture as opusinfo summarises it)
+   35 / 35  decoded samples (libopus per packet)
+   35 / 35  duration = opusdec's samples
+   35 / 35  every packet's bytes, samples (libogg + libopus)
+   35 / 35  every page's sequence, granule, flags (libogg)
+   35 / 35  input rate
+   35 / 35  last granule (libogg)
+   35 / 35  output gain
+   35 / 35  packet duration max/avg/min (opusinfo)
+   35 / 35  pages (libogg)
+   35 / 35  playback length (opusinfo)
+   35 / 35  pre-skip
+   35 / 35  samples kept by packet = duration
+   35 / 35  the reference found no fault
+   35 / 35  vendor
+ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test end_trimming_stays_on_the_last_page ... ok
+test the_silence_cli_lengths_read_back_exactly ... ok
+test writer_to_reader_round_trips ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s
+voaice opus info on one pinned file:
+    file            testing/opus/files/e_six_family1_96k.opus
+    bytes           17468
+    pages           4
+    packets         51 audio (16464 bytes; largest 425 bytes)
+    version         1
+    channels        6
+    pre-skip        312
+    input rate      16000 Hz
+    output gain     0 (Q7.8) = 0 dB
+    mapping family  1 (4 streams, 2 coupled; mapping [0, 4, 1, 2, 3, 5])
+    vendor          libopus 1.4, libopusenc 0.2.1
+    comments        2
+      ENCODER=opusenc from opus-tools 0.2
+      ENCODER_OPTIONS=--serial 4004 --bitrate 96
+    packet samples  960 min, 960 max (48 kHz)
+    start granule   0
+    last granule    48312
+    decoded         48960 samples at 48 kHz
+    end trim        648 samples
+    duration        48000 samples at 48 kHz (0m:01.000s)
+SKIPPED: unreachable.invalid unreachable — the reference was not asked again in this run; the comparisons above are
+         against its answers recorded in testing/opus/reference.jsonl ("date": "2026-10-08T04:32:13Z")
+## 4c. the resampler (0.0.5): whisper-cli's read_audio_data (miniaudio 0.11.24 in the build's libcommon.a)
+test oracle_resample_bit_exact ... r8000_m_s16             8000 Hz 1 ch s16   10407 frames ->   20814 samples (zero tail 0): identical
+r8000_s_s16             8000 Hz 2 ch s16   10407 frames ->   20814 samples (zero tail 0): identical
+r8000_m_f32             8000 Hz 1 ch f32   10407 frames ->   20814 samples (zero tail 0): identical
+r8000_s_f32             8000 Hz 2 ch f32   10407 frames ->   20814 samples (zero tail 0): identical
+r16000_m_s16           16000 Hz 1 ch s16   20808 frames ->   20808 samples (zero tail 0): identical
+r16000_s_s16           16000 Hz 2 ch s16   20808 frames ->   20808 samples (zero tail 0): identical
+r16000_m_f32           16000 Hz 1 ch f32   20808 frames ->   20808 samples (zero tail 0): identical
+r16000_s_f32           16000 Hz 2 ch f32   20808 frames ->   20808 samples (zero tail 0): identical
+r22050_m_s16           22050 Hz 1 ch s16   28674 frames ->   20806 samples (zero tail 0): identical
+r22050_s_s16           22050 Hz 2 ch s16   28674 frames ->   20806 samples (zero tail 0): identical
+r22050_m_f32           22050 Hz 1 ch f32   28674 frames ->   20806 samples (zero tail 0): identical
+r22050_s_f32           22050 Hz 2 ch f32   28674 frames ->   20806 samples (zero tail 0): identical
+r22050_m_u8            22050 Hz 1 ch u8    28674 frames ->   20806 samples (zero tail 0): identical
+r22050_m_s24           22050 Hz 1 ch s24   28674 frames ->   20806 samples (zero tail 0): identical
+r22050_m_s32           22050 Hz 1 ch s32   28674 frames ->   20806 samples (zero tail 0): identical
+r24000_m_s16           24000 Hz 1 ch s16   31210 frames ->   20806 samples (zero tail 0): identical
+r24000_s_s16           24000 Hz 2 ch s16   31210 frames ->   20806 samples (zero tail 0): identical
+r24000_m_f32           24000 Hz 1 ch f32   31210 frames ->   20806 samples (zero tail 0): identical
+r24000_s_f32           24000 Hz 2 ch f32   31210 frames ->   20806 samples (zero tail 0): identical
+r32000_m_s16           32000 Hz 1 ch s16   41611 frames ->   20806 samples (zero tail 0): identical
+r32000_s_s16           32000 Hz 2 ch s16   41611 frames ->   20806 samples (zero tail 0): identical
+r32000_m_f32           32000 Hz 1 ch f32   41611 frames ->   20806 samples (zero tail 0): identical
+r32000_s_f32           32000 Hz 2 ch f32   41611 frames ->   20806 samples (zero tail 0): identical
+r44100_m_s16           44100 Hz 1 ch s16   57342 frames ->   20804 samples (zero tail 0): identical
+r44100_s_s16           44100 Hz 2 ch s16   57342 frames ->   20804 samples (zero tail 0): identical
+r44100_m_f32           44100 Hz 1 ch f32   57342 frames ->   20804 samples (zero tail 0): identical
+r44100_s_f32           44100 Hz 2 ch f32   57342 frames ->   20804 samples (zero tail 0): identical
+r44100_s_u8            44100 Hz 2 ch u8    57342 frames ->   20804 samples (zero tail 0): identical
+r44100_s_s24           44100 Hz 2 ch s24   57342 frames ->   20804 samples (zero tail 0): identical
+r44100_s_s32           44100 Hz 2 ch s32   57342 frames ->   20804 samples (zero tail 0): identical
+r48000_m_s16           48000 Hz 1 ch s16   62413 frames ->   20805 samples (zero tail 0): identical
+r48000_s_s16           48000 Hz 2 ch s16   62413 frames ->   20805 samples (zero tail 0): identical
+r48000_m_f32           48000 Hz 1 ch f32   62413 frames ->   20805 samples (zero tail 0): identical
+r48000_s_f32           48000 Hz 2 ch f32   62413 frames ->   20805 samples (zero tail 0): identical
+r48000_m_u8            48000 Hz 1 ch u8    62413 frames ->   20805 samples (zero tail 0): identical
+r48000_m_s24           48000 Hz 1 ch s24   62413 frames ->   20805 samples (zero tail 0): identical
+r48000_m_s32           48000 Hz 1 ch s32   62413 frames ->   20805 samples (zero tail 0): identical
+r48000_c6_s16_ext      48000 Hz 6 ch s16   48011 frames ->   16004 samples (zero tail 0): identical
+r44100_m_f32_hot       44100 Hz 1 ch f32   44103 frames ->   16001 samples (zero tail 0): identical
+r48000_m_s16_n1        48000 Hz 1 ch s16       1 frames ->       1 samples (zero tail 0): identical
+r48000_m_s16_n2        48000 Hz 1 ch s16       2 frames ->       1 samples (zero tail 0): identical
+r48000_m_s16_n3        48000 Hz 1 ch s16       3 frames ->       2 samples (zero tail 1): identical
+r48000_m_s16_n4        48000 Hz 1 ch s16       4 frames ->       2 samples (zero tail 0): identical
+r48000_m_s16_n5        48000 Hz 1 ch s16       5 frames ->       2 samples (zero tail 0): identical
+r44100_m_s16_n1        44100 Hz 1 ch s16       1 frames ->       1 samples (zero tail 0): identical
+r44100_m_s16_n2        44100 Hz 1 ch s16       2 frames ->       1 samples (zero tail 0): identical
+r44100_m_s16_n7        44100 Hz 1 ch s16       7 frames ->       2 samples (zero tail 0): identical
+r8000_m_s16_n1          8000 Hz 1 ch s16       1 frames ->       2 samples (zero tail 0): identical
+r8000_m_s16_n2          8000 Hz 1 ch s16       2 frames ->       4 samples (zero tail 0): identical
+r8000_m_s16_n3          8000 Hz 1 ch s16       3 frames ->       6 samples (zero tail 0): identical
+r16000_m_s16_n1        16000 Hz 1 ch s16       1 frames ->       1 samples (zero tail 0): identical
+r48000_s_s16_list      48000 Hz 2 ch s16   24005 frames ->    8002 samples (zero tail 0): identical
+r48000_m_s16_trunc     48000 Hz 1 ch s16   30000 frames ->   10001 samples (zero tail 1): identical
+jfk_48k                48000 Hz 1 ch s16  528000 frames ->  176001 samples (zero tail 1): identical
+bench_44k1_s_60s       44100 Hz 2 ch s16 2646000 frames ->  960000 samples (zero tail 0): identical
+resampler: 55/55 files, 1955875 samples bit-identical to whisper-cli's read_audio_data (3 files end in the length rule's zero tail)
+ok
+test oracle_resample_discriminates ... discriminator: low-pass order 2 instead of 4 -> 45/50 resampled files differ
+discriminator: low-pass order 6 instead of 4 -> 45/50 resampled files differ
+discriminator: stereo mixdown as L + R -> 8/8 stereo s16 files differ
+discriminator: stereo mixdown as L only -> 8/8 stereo s16 files differ
+discriminator: output length = samples the resampler made (no zero tail) -> 3/55 files differ
+ok
+test oracle_resample_streaming_equals_whole ... streaming: 55/55 files pushed in random 1..9000-byte pieces equal the reference bit for bit
+ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+## 4d. encoder conv1 and ggml_vec_dot_f16 (0.0.6): the conv graph's nodes through the scheduler's eval callback
+test oracle_conv1_bit_exact ... oracle_conv1 (55296000 f32 values: 3 nodes x 384 x 3000 x 2 thread counts per input):
+  chirp       | mul_mat: 0 differ (max 0 ULP) | + bias: 0 differ (max 0 ULP) | gelu: 0 differ (max 0 ULP)
+  jfk         | mul_mat: 0 differ (max 0 ULP) | + bias: 0 differ (max 0 ULP) | gelu: 0 differ (max 0 ULP)
+  jfk_x3      | mul_mat: 0 differ (max 0 ULP) | + bias: 0 differ (max 0 ULP) | gelu: 0 differ (max 0 ULP)
+  min_len     | mul_mat: 0 differ (max 0 ULP) | + bias: 0 differ (max 0 ULP) | gelu: 0 differ (max 0 ULP)
+  noise_loud  | mul_mat: 0 differ (max 0 ULP) | + bias: 0 differ (max 0 ULP) | gelu: 0 differ (max 0 ULP)
+  odd_len     | mul_mat: 0 differ (max 0 ULP) | + bias: 0 differ (max 0 ULP) | gelu: 0 differ (max 0 ULP)
+  short       | mul_mat: 0 differ (max 0 ULP) | + bias: 0 differ (max 0 ULP) | gelu: 0 differ (max 0 ULP)
+  silence     | mul_mat: 0 differ (max 0 ULP) | + bias: 0 differ (max 0 ULP) | gelu: 0 differ (max 0 ULP)
+ok
+test oracle_conv1_discriminators ... oracle_conv1_discriminates: im2col kept in f32 (no f16 rounding): 1151932 of 1152000 values differ on jfk (max 1914962176 ULP)
+oracle_conv1_discriminates: one f32 accumulator: 1068048 of 1152000 values differ on jfk (max 163968 ULP)
+  (719399 of 720000 im2col inputs on jfk change when rounded to f16)
+ok
+test oracle_conv1_im2col_bit_exact ... oracle_conv1_im2col: 8 inputs, 5760000 f16 values identical
+ok
+test oracle_vec_dot_f16_discriminators ... oracle_vec_dot_f16_discriminates: one f32 accumulator in index order: 1265 / 1436 dots differ
+oracle_vec_dot_f16_discriminates: the tail added in f32, not double: 211 / 1436 dots differ
+oracle_vec_dot_f16_discriminates: the accumulators reduced in sequence: 680 / 1436 dots differ
+ok
+test oracle_vec_dot_f16_kernel ... oracle_vec_dot_f16: 1436 / 1436 dots identical (303 distinct lengths, 1..=1536); the reference's ISA here: avx2 yes fma yes f16c yes avx512f no
+ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.57s
+## 4e. encoder conv2 and the positional embedding (0.0.7): both schedulers' nodes through their eval callbacks
+test oracle_conv2_bit_exact ... oracle_conv2 (27648000 f32 values: 3 nodes x 384 x 1500 x 2 thread counts per input):
+  chirp       | mul_mat: 0 differ (max 0 ULP) | + bias: 0 differ (max 0 ULP) | gelu: 0 differ (max 0 ULP)
+  jfk         | mul_mat: 0 differ (max 0 ULP) | + bias: 0 differ (max 0 ULP) | gelu: 0 differ (max 0 ULP)
+  jfk_x3      | mul_mat: 0 differ (max 0 ULP) | + bias: 0 differ (max 0 ULP) | gelu: 0 differ (max 0 ULP)
+  min_len     | mul_mat: 0 differ (max 0 ULP) | + bias: 0 differ (max 0 ULP) | gelu: 0 differ (max 0 ULP)
+  noise_loud  | mul_mat: 0 differ (max 0 ULP) | + bias: 0 differ (max 0 ULP) | gelu: 0 differ (max 0 ULP)
+  odd_len     | mul_mat: 0 differ (max 0 ULP) | + bias: 0 differ (max 0 ULP) | gelu: 0 differ (max 0 ULP)
+  short       | mul_mat: 0 differ (max 0 ULP) | + bias: 0 differ (max 0 ULP) | gelu: 0 differ (max 0 ULP)
+  silence     | mul_mat: 0 differ (max 0 ULP) | + bias: 0 differ (max 0 ULP) | gelu: 0 differ (max 0 ULP)
+ok
+test oracle_conv2_discriminators ... oracle_conv2_discriminates: conv2 with stride 1: 423936 of 576000 MUL_MAT values differ on jfk (max 2152923401 ULP)
+oracle_conv2_discriminates: one f32 accumulator: 544848 of 576000 MUL_MAT values differ on jfk (max 63488 ULP)
+oracle_conv2_discriminates: im2col kept in f32: chirp: no conv2 input changes when rounded to f16 (not discriminable)
+oracle_conv2_discriminates: im2col kept in f32: jfk: no conv2 input changes when rounded to f16 (not discriminable)
+oracle_conv2_discriminates: im2col kept in f32: jfk_x3: no conv2 input changes when rounded to f16 (not discriminable)
+oracle_conv2_discriminates: im2col kept in f32 (no f16 rounding): min_len: 3 conv2 inputs >= 10 change when rounded; 384 of 576000 MUL_MAT values differ (max 912896 ULP)
+oracle_conv2_discriminates: im2col kept in f32 (no f16 rounding): noise_loud: 2 conv2 inputs >= 10 change when rounded; 767 of 576000 MUL_MAT values differ (max 416000 ULP)
+oracle_conv2_discriminates: im2col kept in f32 (no f16 rounding): odd_len: 2 conv2 inputs >= 10 change when rounded; 384 of 576000 MUL_MAT values differ (max 95072 ULP)
+oracle_conv2_discriminates: im2col kept in f32: short: no conv2 input changes when rounded to f16 (not discriminable)
+oracle_conv2_discriminates: im2col kept in f32 (no f16 rounding): silence: 1 conv2 inputs >= 10 change when rounded; 383 of 576000 MUL_MAT values differ (max 27392 ULP)
+oracle_conv2_discriminates: positions added before the transpose (to embd_conv's layout): 575247 of 576000 encoder-input values differ on jfk (max 2141518848 ULP)
+oracle_conv2_discriminates: positions one frame late (another e_pe view offset): 510942 of 576000 encoder-input values differ on jfk (max 2130690048 ULP)
+oracle_conv2_discriminates: GELU before the bias: 575992 of 576000 encoder-input values differ on jfk (max 2146205702 ULP)
+ok
+test oracle_conv2_im2col_bit_exact ... oracle_conv2_im2col: 8 inputs, 13824000 f16 values identical (conv2's input, voaice's conv1, = the node on every input)
+ok
+test oracle_positions_bit_exact ... oracle_positions (27648000 f32 values: 384 x 1500, 2 paths x 3 thread counts per input; + cont):
+  chirp       | cont: 0 differ | 1t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP) | 2t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP) | 4t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP)
+  jfk         | cont: 0 differ | 1t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP) | 2t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP) | 4t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP)
+  jfk_x3      | cont: 0 differ | 1t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP) | 2t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP) | 4t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP)
+  min_len     | cont: 0 differ | 1t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP) | 2t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP) | 4t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP)
+  noise_loud  | cont: 0 differ | 1t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP) | 2t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP) | 4t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP)
+  odd_len     | cont: 0 differ | 1t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP) | 2t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP) | 4t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP)
+  short       | cont: 0 differ | 1t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP) | 2t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP) | 4t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP)
+  silence     | cont: 0 differ | 1t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP) | 2t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP) | 4t: conv2+pe 0 (max 0 ULP), stage from the mel 0 (max 0 ULP)
+ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.28s
+## 4f. the encoder's layer norms (0.0.8): every NORM, MUL and ADD node through the encoder scheduler's eval callback
+test oracle_attn_ln_0_from_mel ... oracle_attn_ln_0_from_mel (41472000 f32 values: 3 nodes x 384 x 1500 x 3 thread counts per input, from the WAV):
+  chirp       | 1t: input 0 differ, norm/mul/add 0 differ | 2t: input 0 differ, norm/mul/add 0 differ | 4t: input 0 differ, norm/mul/add 0 differ
+  jfk         | 1t: input 0 differ, norm/mul/add 0 differ | 2t: input 0 differ, norm/mul/add 0 differ | 4t: input 0 differ, norm/mul/add 0 differ
+  jfk_x3      | 1t: input 0 differ, norm/mul/add 0 differ | 2t: input 0 differ, norm/mul/add 0 differ | 4t: input 0 differ, norm/mul/add 0 differ
+  min_len     | 1t: input 0 differ, norm/mul/add 0 differ | 2t: input 0 differ, norm/mul/add 0 differ | 4t: input 0 differ, norm/mul/add 0 differ
+  noise_loud  | 1t: input 0 differ, norm/mul/add 0 differ | 2t: input 0 differ, norm/mul/add 0 differ | 4t: input 0 differ, norm/mul/add 0 differ
+  odd_len     | 1t: input 0 differ, norm/mul/add 0 differ | 2t: input 0 differ, norm/mul/add 0 differ | 4t: input 0 differ, norm/mul/add 0 differ
+  short       | 1t: input 0 differ, norm/mul/add 0 differ | 2t: input 0 differ, norm/mul/add 0 differ | 4t: input 0 differ, norm/mul/add 0 differ
+  silence     | 1t: input 0 differ, norm/mul/add 0 differ | 2t: input 0 differ, norm/mul/add 0 differ | 4t: input 0 differ, norm/mul/add 0 differ
+ok
+test oracle_norm_discriminators ... oracle_norm_discriminators (ADD-node values that differ, of 5184000 per input: 9 chains x 384 x 1500):
+  reading                                    chirp        jfk     jfk_x3    min_len noise_loud    odd_len      short    silence
+  sum in f32                               3857721    3874820    3773082    3788140    3856486    3773311    3818908    3764875
+  mean from the double sum                 1194463    1169306    1182358    1215664    1213572    1167444    1209770    1218977
+  one-pass variance                         857184     864097    1009664     781904     846184     730328     838939     715010
+  cvar without the 8-lane f32 reduce        185230     170722     120761     190392     193430     190618     196128     176891
+  eps outside the sqrt                     5104922    5140694    5147476    5121395    5121204    5094703    5102268    5119505
+  scale in double                           988805     963897     943686     984999     948956     966255    1001873     991080
+  divide by the root                       1008417    1003799    1019640     999714    1001560    1006889    1005351    1017886
+  mul + add fused (FMA)                    1630339    1546303    1476281    1621256    1642159    1618775    1637337    1621724
+  lane sum on every row (no proof)               0          0          0          0          0          0          0          0
+  the lane sum without the proof changes the ADD node on 0 of 8 inputs
+ok
+test oracle_norm_nodes_bit_exact ... oracle_norm_nodes (373248000 f32 values: 9 chains x 3 nodes x 384 x 1500 x 3 paths per input; rows whose sum is provably order-free 107845, rows in the reference's order 155):
+  chirp       | 9 chains x norm, mul, add (model, 1 and 4 threads): 0 differ
+  jfk         | 9 chains x norm, mul, add (model, 1 and 4 threads): 0 differ
+  jfk_x3      | 9 chains x norm, mul, add (model, 1 and 4 threads): 0 differ
+  min_len     | 9 chains x norm, mul, add (model, 1 and 4 threads): 0 differ
+  noise_loud  | 9 chains x norm, mul, add (model, 1 and 4 threads): 0 differ
+  odd_len     | 9 chains x norm, mul, add (model, 1 and 4 threads): 0 differ
+  short       | 9 chains x norm, mul, add (model, 1 and 4 threads): 0 differ
+  silence     | 9 chains x norm, mul, add (model, 1 and 4 threads): 0 differ
+ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.80s
+## 4g. the matrix products on activations (0.0.9): every block's products, biases, GELU, residuals and f16 copies
+test oracle_block0_from_mel ... oracle_block0_from_mel (the WAV -> mel -> conv stage -> attn_ln -> Q, K, V; out proj -> MLP from the recorded attention):
+  chirp       | 1t: input 0 values differ, 16 nodes 0 rows/values differ | 2t: input 0 values differ, 16 nodes 0 rows/values differ | 4t: input 0 values differ, 16 nodes 0 rows/values differ
+  jfk         | 1t: input 0 values differ, 16 nodes 0 rows/values differ | 2t: input 0 values differ, 16 nodes 0 rows/values differ | 4t: input 0 values differ, 16 nodes 0 rows/values differ
+  jfk_x3      | 1t: input 0 values differ, 16 nodes 0 rows/values differ | 2t: input 0 values differ, 16 nodes 0 rows/values differ | 4t: input 0 values differ, 16 nodes 0 rows/values differ
+  min_len     | 1t: input 0 values differ, 16 nodes 0 rows/values differ | 2t: input 0 values differ, 16 nodes 0 rows/values differ | 4t: input 0 values differ, 16 nodes 0 rows/values differ
+  noise_loud  | 1t: input 0 values differ, 16 nodes 0 rows/values differ | 2t: input 0 values differ, 16 nodes 0 rows/values differ | 4t: input 0 values differ, 16 nodes 0 rows/values differ
+  odd_len     | 1t: input 0 values differ, 16 nodes 0 rows/values differ | 2t: input 0 values differ, 16 nodes 0 rows/values differ | 4t: input 0 values differ, 16 nodes 0 rows/values differ
+  short       | 1t: input 0 values differ, 16 nodes 0 rows/values differ | 2t: input 0 values differ, 16 nodes 0 rows/values differ | 4t: input 0 values differ, 16 nodes 0 rows/values differ
+  silence     | 1t: input 0 values differ, 16 nodes 0 rows/values differ | 2t: input 0 values differ, 16 nodes 0 rows/values differ | 4t: input 0 values differ, 16 nodes 0 rows/values differ
+ok
+test oracle_matmul_discriminators ... oracle_matmul_discriminators (summed over the 4 blocks: rows of 6,000, or o_res values of 2,304,000; the two from_float readings differ from the reference only on NaN, which no input carries — oracle_mm_nan_split catches them):
+  reading                                              chirp        jfk     jfk_x3    min_len noise_loud    odd_len      short    silence
+  activations not rounded to f16 (q_add rows)           6000       6000       6000       6000       6000       6000       6000       6000
+  one f32 accumulator (q_add rows)                      6000       6000       6000       6000       6000       6000       6000       6000
+  accumulators reduced in sequence (q_add rows)         6000       6000       6000       6000       6000       6000       6000       6000
+  bias in the first accumulator (q_add rows)            6000       6000       6000       6000       6000       6000       6000       6000
+  residual before the bias (o_res values)             303923     292056     280967     303286     302347     306162     304410     307462
+  GELU from x, not the f16 table (gelu rows)            6000       6000       6000       6000       6000       6000       6000       6000
+  scalar bit trick for from_float (q_add rows)             0          0          0          0          0          0          0          0
+  from_float split ignored (q_add rows)                    0          0          0          0          0          0          0          0
+ok
+test oracle_matmul_nodes_bit_exact ... oracle_matmul_nodes (2304000 node rows compared by digest: 4 blocks x 16 nodes x 1500 frames x 3 paths per input — k_mm k_cpy v_mm v_add v_cpy q_mm q_add o_mm o_add o_res fc1_mm fc1_add gelu fc2_mm fc2_add mlp_res; o_res and mlp_res also value by value against the norm record):
+  chirp       | 4 blocks x 16 nodes (model, 1 and 4 threads): 0 differ
+  jfk         | 4 blocks x 16 nodes (model, 1 and 4 threads): 0 differ
+  jfk_x3      | 4 blocks x 16 nodes (model, 1 and 4 threads): 0 differ
+  min_len     | 4 blocks x 16 nodes (model, 1 and 4 threads): 0 differ
+  noise_loud  | 4 blocks x 16 nodes (model, 1 and 4 threads): 0 differ
+  odd_len     | 4 blocks x 16 nodes (model, 1 and 4 threads): 0 differ
+  short       | 4 blocks x 16 nodes (model, 1 and 4 threads): 0 differ
+  silence     | 4 blocks x 16 nodes (model, 1 and 4 threads): 0 differ
+ok
+test oracle_mm_nan_split ... oracle_mm_nan_split (12 rows x 384 outputs; 10 rows carry one NaN each, 2 none):
+  1 threads: model mul_mat 0, + bias 0, fast path 0 differ (the reference's own output differs from its 1-thread output in 0 values); scalar bit trick everywhere: 3456; row converter, split ignored: 0
+  2 threads: model mul_mat 0, + bias 0, fast path 0 differ (the reference's own output differs from its 1-thread output in 0 values); scalar bit trick everywhere: 3456; row converter, split ignored: 0
+  3 threads: model mul_mat 0, + bias 0, fast path 0 differ (the reference's own output differs from its 1-thread output in 0 values); scalar bit trick everywhere: 3456; row converter, split ignored: 0
+  4 threads: model mul_mat 0, + bias 0, fast path 0 differ (the reference's own output differs from its 1-thread output in 0 values); scalar bit trick everywhere: 3456; row converter, split ignored: 0
+  5 threads: model mul_mat 0, + bias 0, fast path 0 differ (the reference's own output differs from its 1-thread output in 1920 values); scalar bit trick everywhere: 1536; row converter, split ignored: 1920
+  6 threads: model mul_mat 0, + bias 0, fast path 0 differ (the reference's own output differs from its 1-thread output in 0 values); scalar bit trick everywhere: 3456; row converter, split ignored: 0
+  7 threads: model mul_mat 0, + bias 0, fast path 0 differ (the reference's own output differs from its 1-thread output in 1152 values); scalar bit trick everywhere: 2304; row converter, split ignored: 1152
+  8 threads: model mul_mat 0, + bias 0, fast path 0 differ (the reference's own output differs from its 1-thread output in 0 values); scalar bit trick everywhere: 3456; row converter, split ignored: 0
+ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 180.56s
+## 4h. flash attention and the whole encoder (v0.1.0): every node of the encoder graph through its eval callback, embd_enc
+test oracle_attention_discriminators ... oracle_attention_discriminators (every 25th frame and the last, all 6 heads, 4 blocks, by row digest):
+  probabilities through glibc expf                 caught on every input (rows differing of 244 per input: [244, 244, 244, 244, 244, 244, 244, 244])
+  rescale through ggml_v_expf                      caught on every input (rows differing of 244 per input: [235, 235, 238, 230, 231, 230, 226, 238])
+  no running max (global max, one pass)            caught on every input (rows differing of 244 per input: [237, 241, 242, 241, 234, 240, 236, 241])
+  kv_pad's 36 zero rows excluded                   caught on every input (rows differing of 244 per input: [244, 244, 244, 244, 244, 244, 244, 244])
+  scores without FMA                               caught on every input (rows differing of 244 per input: [244, 244, 244, 244, 244, 244, 244, 244])
+  output accumulated without FMA                   caught on every input (rows differing of 244 per input: [244, 244, 244, 244, 244, 244, 244, 244])
+  softmax sums in f32                              caught on every input (rows differing of 244 per input: [233, 225, 226, 215, 222, 223, 230, 221])
+  out / S instead of out * (1/S)                   caught on every input (rows differing of 244 per input: [244, 244, 244, 244, 244, 244, 244, 244])
+  the one-chunk path (Q f16, f16 dot, V in f16)    caught on every input (rows differing of 244 per input: [244, 244, 244, 244, 244, 244, 244, 244])
+  scale on Q before the dot (x1/8 exact)           indistinguishable, as predicted (rows differing of 244 per input: [0, 0, 0, 0, 0, 0, 0, 0])
+  the one-chunk model against the reference's own use_ref output (b<il>.fa_ref): as read (S = S*ms + vs) 0 rows differ, S = fma(S, ms, vs) 543 rows differ (of 1952)
+ok
+test oracle_attention_nodes_bit_exact ... oracle_attention_nodes_bit_exact (Q, K, V from attn_ln's recorded output, each = the record's digests; differing values of the FLASH_ATTN_EXT node, and model rows by digest):
+  chirp       | b0: fast 1t 0 4t 0 values, model 0 of 1500 rows | b1: fast 1t 0 4t 0 values, model 0 of 150 rows | b2: fast 1t 0 4t 0 values, model 0 of 150 rows | b3: fast 1t 0 4t 0 values, model 0 of 150 rows
+  jfk         | b0: fast 1t 0 4t 0 values, model 0 of 1500 rows | b1: fast 1t 0 4t 0 values, model 0 of 150 rows | b2: fast 1t 0 4t 0 values, model 0 of 150 rows | b3: fast 1t 0 4t 0 values, model 0 of 150 rows
+  jfk_x3      | b0: fast 1t 0 4t 0 values, model 0 of 1500 rows | b1: fast 1t 0 4t 0 values, model 0 of 150 rows | b2: fast 1t 0 4t 0 values, model 0 of 150 rows | b3: fast 1t 0 4t 0 values, model 0 of 150 rows
+  min_len     | b0: fast 1t 0 4t 0 values, model 0 of 1500 rows | b1: fast 1t 0 4t 0 values, model 0 of 150 rows | b2: fast 1t 0 4t 0 values, model 0 of 150 rows | b3: fast 1t 0 4t 0 values, model 0 of 150 rows
+  noise_loud  | b0: fast 1t 0 4t 0 values, model 0 of 1500 rows | b1: fast 1t 0 4t 0 values, model 0 of 150 rows | b2: fast 1t 0 4t 0 values, model 0 of 150 rows | b3: fast 1t 0 4t 0 values, model 0 of 150 rows
+  odd_len     | b0: fast 1t 0 4t 0 values, model 0 of 1500 rows | b1: fast 1t 0 4t 0 values, model 0 of 150 rows | b2: fast 1t 0 4t 0 values, model 0 of 150 rows | b3: fast 1t 0 4t 0 values, model 0 of 150 rows
+  short       | b0: fast 1t 0 4t 0 values, model 0 of 1500 rows | b1: fast 1t 0 4t 0 values, model 0 of 150 rows | b2: fast 1t 0 4t 0 values, model 0 of 150 rows | b3: fast 1t 0 4t 0 values, model 0 of 150 rows
+  silence     | b0: fast 1t 0 4t 0 values, model 0 of 1500 rows | b1: fast 1t 0 4t 0 values, model 0 of 150 rows | b2: fast 1t 0 4t 0 values, model 0 of 150 rows | b3: fast 1t 0 4t 0 values, model 0 of 150 rows
+  fast path: 36864000 values compared; model: 15600 frames x 6 heads
+ok
+test oracle_encoder_end_to_end ... oracle_encoder_end_to_end (the WAV -> voaice's mel -> conv stage -> 4 blocks with attention -> ln_post; every computed node of the encoder graph by row digest, then embd_enc whole from Encoder::encode_into):
+  chirp       | 1t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse) | 2t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse) | 4t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse)
+  jfk         | 1t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse) | 2t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse) | 4t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse)
+  jfk_x3      | 1t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse) | 2t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse) | 4t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse)
+  min_len     | 1t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse) | 2t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse) | 4t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse)
+  noise_loud  | 1t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse) | 2t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse) | 4t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse)
+  odd_len     | 1t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse) | 2t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse) | 4t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse)
+  short       | 1t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse) | 2t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse) | 4t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse)
+  silence     | 1t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse) | 2t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse) | 4t: 96 nodes, 0 differ (0 rows); embd_enc 0 values differ (0 on reuse)
+  2304 node comparisons, 3456000 rows
+ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 265.77s
+## 5. efficiency (only now): log-mel; wall = best of 10 calls, cpu = CPU ms per call (utime+stime, all threads,
+##    loop >= 1 s), heap = bytes live at the first call's peak (KiB; voaice's counting allocator, the reference's
+##    operator new counted), rss = VmHWM of the first call minus VmRSS before it (KiB; heap reuse can hide growth)
+0.0.1 rebuilt from tag v0.0.1 (8ecf659): its `voaice mel` times the mel call alone, 1 thread, best of 10
+wav         samples |   ref_1t  v001_1t    vo_1t |   ref_4t    vo_4t |  x_v001 | cpu_ref1  cpu_vo1 | cpu_ref4  cpu_vo4 | heap_r heap_v |  rss_r  rss_v
+chirp         40000 |    6.676    7.200    1.222 |    7.542    1.242 |   5.89x |    7.143    1.274 |   19.605    1.981 |   3068   1016 |   2780    128
+jfk          176000 |   28.044   28.300    4.833 |   16.845    3.670 |   5.86x |   38.846    5.348 |   66.136   11.150 |   3868   1282 |   3744   1096
+jfk_x3       528000 |   82.833   84.800   13.998 |   49.595    8.653 |   6.06x |   95.455   17.719 |  188.889   33.107 |   5925   1969 |   5840   1896
+min_len         201 |    0.939    1.000    0.189 |    1.325    0.234 |   5.29x |    0.806    0.203 |    2.394    0.202 |   2836    938 |   2676     68
+noise_loud    16000 |    3.053    3.500    0.604 |    3.080    0.605 |   5.79x |    3.472    0.631 |    7.300    0.647 |   2928    969 |   2720     64
+odd_len       12345 |    2.503    2.900    0.502 |    3.737    0.989 |   5.78x |    2.732    0.539 |   17.957    0.548 |   2908    962 |   2756    124
+short          4800 |    1.409    1.700    0.378 |    1.652    0.723 |   4.50x |    1.467    0.328 |    3.900    0.381 |   2860    947 |   2804     64
+silence       16000 |    2.911    3.500    0.592 |    2.857    0.591 |   5.91x |    3.077    0.635 |    6.846    0.638 |   2928    969 |   2888     64
+geometric mean of wall-time ratios over 8 inputs: voaice at 1 thread is 5.61x faster than 0.0.1 and 5.06x faster than the reference at 1 thread; at 4 threads, 4.58x faster than the reference at 4
+## 5b. efficiency (only now): f32<->f16 and GELU. init = the first GELU table build in a fresh process (best of
+##     5 processes; the reference's ggml_cpu_init also fills its quick-GELU and f32<-f16 tables and two 256-entry
+##     ones, voaice only the GELU table it needs); rows = best of 10 calls on 384x1500 values; gelu = the op on
+##     1536x1500 (the encoder MLP's size), 1 thread; the reference's through a ggml graph, whose two tensor copies
+##     are measured alone and taken off (gelu_net)
+reference: bench-f16-reference fp32_to_fp16_row_ms 0.077 fp16_to_fp32_row_ms 0.117 gelu_ms 11.849 gelu_copies_ms 2.447 n_row 576000 n_gelu 2304000
+voaice:    bench-f16 fp32_to_fp16_row_ms 0.075 fp16_to_fp32_row_ms 0.129 gelu_ms 2.738 gelu_scalar_ms 7.567 n_row 576000 n_gelu 2304000
+measure                         reference     voaice    ratio
+gelu table, first build (ms)        2.500      1.445    1.73x
+fp32_to_fp16 row 576k (ms)          0.077      0.075    1.03x
+fp16_to_fp32 row 576k (ms)          0.117      0.129    0.91x
+gelu op 2.3M, net (ms)              9.402      2.738    3.43x
+gelu op 2.3M, scalar path (ms)      9.402      7.567    1.24x
+## 6. efficiency (only now): the Ogg/Opus reader. crc = 16 MiB, best of 7, sliced-by-8 against one byte at a time;
+##    read = Reader::new + every packet + the end checks, best of 10 (mem: from a slice; file: open + read), cpu =
+##    CPU ms per read over >= 1 s; heap = bytes live at one read's peak (the counting allocator), reading from the file
+e_jfk_x3_m_6k_comp0     bytes 24617 pages 36 packets 1651 duration 1584000 crc_sliced_mib_s 1620 crc_bytewise_mib_s 358 crc_speedup 4.53 read_mem_ms 0.0421 read_mem_mib_s 558 read_mem_cpu_ms 0.0522 read_file_ms 0.1231 read_file_mib_s 191 read_file_cpu_ms 0.1267 heap_peak_bytes 66281 audio_s_per_cpu_s 632007
+e_jfk_m_2.5ms_24k       bytes 50156 pages 20 packets 4403 duration 528000 crc_sliced_mib_s 1650 crc_bytewise_mib_s 357 crc_speedup 4.62 read_mem_ms 0.0869 read_mem_mib_s 551 read_mem_cpu_ms 0.0896 read_file_ms 0.1385 read_file_mib_s 345 read_file_cpu_ms 0.1536 heap_peak_bytes 66289 audio_s_per_cpu_s 122738
+e_jfk_m_60ms_24k        bytes 34119 pages 14 packets 184 duration 528000 crc_sliced_mib_s 1621 crc_bytewise_mib_s 358 crc_speedup 4.52 read_mem_ms 0.0263 read_mem_mib_s 1236 read_mem_cpu_ms 0.0268 read_file_ms 0.0622 read_file_mib_s 523 read_file_cpu_ms 0.0644 heap_peak_bytes 66288 audio_s_per_cpu_s 410467
+sa_silence_60           bytes 7782 pages 63 packets 3001 duration 2880000 crc_sliced_mib_s 1603 crc_bytewise_mib_s 348 crc_speedup 4.60 read_mem_ms 0.0488 read_mem_mib_s 152 read_mem_cpu_ms 0.0522 read_file_ms 0.3492 read_file_mib_s 21 read_file_cpu_ms 0.2167 heap_peak_bytes 65499 audio_s_per_cpu_s 1148400
+sa_continuation         bytes 135850 pages 7 packets 9 duration 8228 crc_sliced_mib_s 1648 crc_bytewise_mib_s 358 crc_speedup 4.60 read_mem_ms 0.0897 read_mem_mib_s 1445 read_mem_cpu_ms 0.0927 read_file_ms 0.1212 read_file_mib_s 1069 read_file_cpu_ms 0.1321 heap_peak_bytes 135453 audio_s_per_cpu_s 1849
+e_picture_24k           bytes 68384 pages 4 packets 16 duration 14400 crc_sliced_mib_s 1586 crc_bytewise_mib_s 357 crc_speedup 4.45 read_mem_ms 0.0679 read_mem_mib_s 961 read_mem_cpu_ms 0.0699 read_file_ms 0.0860 read_file_mib_s 758 read_file_cpu_ms 0.0943 heap_peak_bytes 197958 audio_s_per_cpu_s 4295
+## 7. efficiency (only now): the resampler. One call = the whole read of a file (open, parse, convert, mix,
+##    resample, the vector out); wall = best of 10, cpu = CPU ms per call over >= 1 s, heap = bytes live at the first
+##    call's peak (voaice: the counting allocator; reference: malloc/calloc/realloc interposed), rss = VmHWM delta
+file                   in_s  samples |   ref_ms    vo_ms      x |  cpu_ref   cpu_vo | heap_r heap_v | rss_r rss_v | cpu_ms/as
+jfk_48k               11.00   176001 |    6.239    4.653  1.34x |    6.667    7.519 |    698    688 |  1272   904 |    0.684
+bench_44k1_s_60s      60.00   960000 |   42.423   19.913  2.13x |   44.783   28.649 |   3762   3750 |  4064  4096 |    0.477
+r48000_s_s16           1.30    20805 |    3.719    0.665  5.59x |    1.147    0.500 |     91     82 |   672   652 |    0.385
+r44100_s_s16           1.30    20804 |    0.983    0.709  1.39x |    0.951    0.513 |     91     82 |   688   604 |    0.395
+r22050_m_s16           1.30    20806 |    0.504    0.283  1.78x |    0.426    0.267 |     91     82 |   684   544 |    0.205
+r8000_s_s16            1.30    20814 |    0.466    0.368  1.27x |    0.361    0.183 |     91     82 |   628   560 |    0.141
+r16000_s_s16           1.30    20808 |    0.095    0.030  3.17x |    0.092    0.028 |     91     82 |   420   308 |    0.022
+r48000_c6_s16_ext      1.00    16004 |    1.222    0.578  2.11x |    1.200    0.608 |     72     63 |   644   544 |    0.608
+geometric mean over 8 files: voaice reads 2.07x faster than whisper-cli's read_audio_data (cpu_ms/as = voaice CPU ms per second of output audio)
+## 8. efficiency (only now): encoder conv1 (0.0.6), the first 30-s window of jfk (3000 frames, any input costs the
+##    same). wall = best of 10, cpu = CPU ms per call over >= 1 s; heap: voaice = bytes live at the first call's peak
+##    (its output allocated by that call, then reused, as the reference's graph keeps its tensors); the reference =
+##    the bytes of the graph's own tensors (im2col, the product, and for +gelu the add and gelu outputs), from
+##    ggml_nbytes; rss = VmHWM delta of the first call
+op           thr |   ref_ms    vo_ms      x |  cpu_ref   cpu_vo | mem_ref heap_vo |  rss_r  rss_v
+conv1          1 |   88.326   21.615  4.09x |   89.167   22.222 |    5907    4508 |   6088   4568
+conv1          2 |   46.629   14.392  3.24x |   99.500   27.910 |    5907    4516 |   6096   4724
+conv1          4 |   42.743   14.510  2.95x |  186.500   58.197 |    5907    4531 |   6112   4764
+conv1+b+gelu   1 |   94.907   24.053  3.95x |   94.545   24.634 |   14907    4508 |  15208   4504
+conv1+b+gelu   2 |   53.441   15.472  3.45x |  115.000   33.214 |   14907    4516 |  15216   4788
+conv1+b+gelu   4 |   47.770   15.806  3.02x |  210.000   63.455 |   14907    4531 |  15256   4828
+## 9. efficiency (only now): encoder conv2 and the conv stage (0.0.7), jfk's first 30-s window. conv2 = conv1's GELU
+##    output -> conv2 + bias + GELU (embd_conv); stage = the mel -> conv1 -> conv2 -> + positions (the encoder's
+##    input). wall = best of 10, cpu = CPU ms per call over >= 1 s; heap: voaice = bytes live at the first call's peak
+##    (its buffers allocated by that call, then reused); the reference = the bytes of the graph's own tensors (every
+##    node that is not a view: im2cols, products, adds, GELUs, the cont), from ggml_nbytes; rss = VmHWM delta
+op     thr |   ref_ms    vo_ms      x |  cpu_ref   cpu_vo | mem_ref heap_vo |  rss_r  rss_v
+conv2    1 |  172.398   32.331  5.33x |  175.000   46.667 |   10125    2443 |  10108   2252
+conv2    2 |  100.807   20.470  4.92x |  206.000   46.923 |   10125    2635 |  10108   2620
+conv2    4 |  101.058   24.292  4.16x |  397.000  105.455 |   10125    3020 |  10108   2988
+stage    1 |  270.935   62.299  4.35x |  275.000   64.375 |   29532    4693 |  29816   4504
+stage    2 |  155.718   38.633  4.03x |  327.000   81.739 |   29532    4885 |  29824   5092
+stage    4 |  152.379   42.172  3.61x |  634.000  169.048 |   29532    5270 |  29856   5500
+## 10. efficiency (only now): the encoder's layer norm (0.0.8) on jfk's encoder input ([1500, 384]; block 0's
+##    attn_ln weights). norm = the NORM node alone; chain = norm -> * w -> + b (the three nodes). wall = best of 10,
+##    cpu = CPU ms per call over >= 1 s; heap: voaice = bytes live at the first call's peak (its output, then reused);
+##    the reference = the bytes of the graph's non-view nodes (ggml_nbytes); rss = VmHWM delta
+op     thr |   ref_ms    vo_ms      x |  cpu_ref   cpu_vo | mem_ref heap_vo |  rss_r  rss_v
+norm     1 |   1.0048   0.4643  2.16x |   0.8594   0.4294 |    2250    2251 |   2248   1240
+norm     2 |   1.1515   0.4176  2.76x |   1.3293   0.4249 |    2250    2251 |   2248   1428
+norm     4 |   0.4099   0.3911  1.05x |   1.9027   0.4132 |    2250    2251 |   2252   1428
+chain    1 |   2.0103   0.4096  4.91x |   2.0711   0.5198 |    6750    2251 |   6804   1240
+chain    2 |   1.7843   0.4742  3.76x |   3.5097   0.4925 |    6750    2251 |   6804   1428
+chain    4 |   1.6623   0.4454  3.73x |   6.3514   0.4771 |    6750    2251 |   6808   1428
+## 11. efficiency (only now): block 0's products (0.0.9) on jfk (inputs computed beforehand from the WAV by each
+##    side: X = the encoder's input; q = Q + b and fc1 = fc1 + b + GELU on attn_ln_0(X); fc2 = fc2 + b on that GELU;
+##    qkv = attn_ln -> Q + b, K, V + b, K and V to f16; mlp = out proj + b + X -> mlp_ln -> fc1 + b -> GELU -> fc2 + b
+##    + residual, V's output standing in for the attention; block = qkv then mlp). wall = best of 10, cpu = CPU ms per
+##    call over >= 1 s; heap: voaice = bytes live at the first call's peak (outputs, then reused; the widened weights
+##    are held with the model, outside the call); the reference = the graph's non-view nodes + its work buffer
+op     thr |    ref_ms     vo_ms      x |   cpu_ref    cpu_vo | mem_ref heap_vo |  rss_r  rss_v
+q        1 |    55.598    10.615  5.24x |   55.5556   19.4000 |    5626    2444 |      4   2252
+q        2 |    31.743     9.689  3.28x |   79.6154   33.1667 |    5626    2638 |      0   2256
+q        4 |    34.983     7.908  4.42x |  123.1818   30.3191 |    5626    3025 |      0   2264
+fc1      1 |   229.117    50.272  4.56x |  251.0000   51.5000 |   28126    9482 |      4   9004
+fc1      2 |   135.707    30.495  4.45x |  283.0000   83.0435 |   28126    9964 |      0   9296
+fc1      4 |   138.950    32.762  4.24x |  549.0000  134.6154 |   28126   10927 |      0   9880
+fc2      1 |   212.007    42.365  5.00x |  216.0000   50.0000 |    9001    2737 |      0   2252
+fc2      2 |   125.114    26.215  4.77x |  269.0000   93.3333 |    9001    3223 |      0   2256
+fc2      4 |   121.661    33.833  3.60x |  503.0000  151.2500 |    9001    4195 |      0   2264
+qkv      1 |   168.794    32.586  5.18x |  171.0000   33.6667 |   19126    4790 |      4   4500
+qkv      2 |    96.873    21.133  4.58x |  209.0000   46.6667 |   19126    5080 |      0   4600
+qkv      4 |    92.441    23.529  3.93x |  402.0000   96.0000 |   19126    5659 |      0   4800
+mlp      1 |   498.608   110.314  4.52x |  630.0000  114.0000 |   51751    3601 |      0      0
+mlp      2 |   294.158    68.512  4.29x |  603.0000  134.2857 |   51751    4951 |      0   1060
+mlp      4 |   303.678    77.432  3.92x | 1380.0000  280.7692 |   51751    7651 |      0   3180
+block    1 |   667.383   140.137  4.76x |  676.0000  141.0000 |   69751   10351 |      4   9000
+block    2 |   402.637    96.431  4.18x |  878.0000  224.0000 |   69751   11701 |      0  10160
+block    4 |   418.832   102.288  4.09x | 1622.0000  380.0000 |   69751   14401 |      0  12480
+## 12. efficiency (only now): block 0's attention (v0.1.0) on jfk (Q, K, V computed beforehand from the WAV by each
+##    side), then THE WHOLE ENCODER: the mel (computed beforehand, as whisper's state holds it) -> conv1 -> conv2 ->
+##    positions -> 4 blocks -> ln_post = embd_enc (voaice: Encoder::encode_into; the reference: whisper_encode_with_state,
+##    its conv graph then its encoder graph). wall = best of 10, cpu = CPU ms per call over >= 1 s (attention) or
+##    >= 2 s (encoder); heap: voaice = bytes live at the first call's peak (its buffers between stages, allocated by
+##    that call and then reused; the widened weights are held with the model, outside the call); the reference =
+##    attention: the node's output + the K/V buffers + the work buffer; encoder: the two schedulers' compute buffers +
+##    kv_pad (allocated by whisper_init_state); rss = VmHWM delta of the first call. digest = 64-bit FNV-1a of embd_enc
+op      thr |    ref_ms     vo_ms      x |   cpu_ref    cpu_vo | mem_ref heap_vo |  rss_r  rss_v | digests
+attn      1 |   150.824    91.932  1.64x |  158.0000   92.7273 |    4651    3049 |      0   2312 | -
+attn      2 |    94.684    64.059  1.48x |  196.0000  160.0000 |    4747    3079 |      0   2248 | -
+attn      4 |    89.727    70.238  1.28x |  345.4545  265.8333 |    4939    3139 |      0   2248 | -
+encode    1 |  3993.836  1038.439  3.85x | 4250.0000 1149.0000 |   29398   17869 |  35040  16532 | 50d38ec85f2778b9 = 50d38ec85f2778b9
+encode    2 |  2435.875   798.569  3.05x | 5910.0000 2005.0000 |   29398   19219 |  34988  18280 | 50d38ec85f2778b9 = 50d38ec85f2778b9
+encode    4 |  2377.625   791.064  3.01x | 9908.0000 2729.0000 |   29398   21919 |  35080  21008 | 50d38ec85f2778b9 = 50d38ec85f2778b9
+load after the measurements: 3.47 2.48 2.12
+## transcripts recorded (not yet reproduced by voaice.rs: the encoder is v0.1.0's, the decoder is v0.2.0's)
+chirp:  (whistling) 
+jfk:  And so my fellow Americans ask not what your country can do for you  ask what you can do for your country. 
+jfk_x3:  And so my fellow Americans ask not what your country can do for you  ask what you can do for your country  And so my fellow Americans ask not what your country can do for you  ask what you can do for your country  And so my fellow Americans ask not what your country can do for you  for you ask what you can do for your country. 
+min_len: 
+noise_loud: 
+odd_len:  [BLANK_AUDIO] 
+short: 
+silence:  [BLANK_AUDIO] 
+GATE PASSED

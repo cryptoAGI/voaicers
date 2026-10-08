@@ -58,6 +58,19 @@
 #      two halves and whole (qkv = attn_ln -> Q, K, V; mlp = out proj -> MLP with V standing in for the attention) — each
 #      side in a fresh process (`voaice bench-mm`, `whisper_oracle --bench-mm`: the same ops as a ggml graph, which the
 #      record shows equal to the scheduler's nodes), at 1, 2 and nproc threads
+#   4h. (v0.1.0) flash attention and the WHOLE encoder: every node of the encoder graph read through its eval callback
+#      (`whisper_oracle --encoder`: one digest per row of every computed node, attention's inputs and kv_pad's padding
+#      rows checked, embd_enc whole after unobserved runs at 1, 2 and 4 threads, the attention node recomputed by the
+#      standalone graph at 1..8 threads and by the use_ref path); voaice's attention fed Q, K, V it computes from the
+#      recorded attn_ln input (each checked against the record) and compared value by value at 1 and 4 threads, the
+#      model on every frame of block 0 and every 10th of blocks 1-3; then the whole encoder from voaice's own mel at
+#      1, 2 and 4 threads, every node by digest and embd_enc value by value (tests/attention.rs); discriminators (glibc
+#      expf for the probabilities, ggml_v_expf for the rescale, no running max, kv_pad's zero rows excluded, no FMA in
+#      the scores or the output, the softmax sums in f32, a division by S, the one-chunk path — itself checked against
+#      the reference's use_ref output — and Q scaled before the dot, which ×1/8 makes indistinguishable)
+#   12. (v0.1.0) its efficiency, only after 4h passed: block 0's attention, and THE WHOLE ENCODER (the mel ->
+#      embd_enc: `voaice bench-encode` against `whisper_oracle --bench-encode`, i.e. whisper_encode_with_state, the
+#      digest of each side's embd_enc printed and compared), each in a fresh process, at 1, 2 and nproc threads
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
@@ -128,6 +141,12 @@ testing/oracle/bin/whisper_oracle --mm-nan "$model" .oracle/matmul 2>&1 | tee -a
 log "(the matmul record took $(( $(date +%s) - t0 )) s: each input encoded three times, every encoder node observed at 1 and 4 threads, and not observed; $(du -sh .oracle/matmul | cut -f1) of digests and attention outputs)"
 ff=$(nfn ggml_cpu_fp32_to_fp16 0x200); mm=$(objdump -d --no-show-raw-insn "$lib" | sed -n '/<ggml_compute_forward_mul_mat>:/,/^$/p')
 log "libggml-cpu's ggml_cpu_fp32_to_fp16 (mul_mat's from_float): $(echo "$ff" | grep -c vcvtps2ph) vcvtps2ph; ggml_compute_forward_mul_mat: $(echo "$mm" | grep -c 'call') calls, $(echo "$mm" | grep -cE 'vfn?m(add|sub)') FMA (the dot is ggml_vec_dot_f16 through the traits); GGML_CPU_REPACK $(awk -F= '/^GGML_CPU_REPACK:/{print $2}' upstream/whisper.cpp/build/CMakeCache.txt) (no f16 repack: $(nm -D --defined-only "$lib" | grep -c 'repack.*ggml_type1EE') f16 traits)"
+rm -rf .oracle/encoder
+t0=$(date +%s)
+testing/oracle/bin/whisper_oracle --encoder "$model" .oracle/encoder .audio/*.wav 2>&1 | tee -a "$out"
+log "(the encoder record took $(( $(date +%s) - t0 )) s: each input encoded five times — observed at 1 and 4 threads, not observed at 1, 2, 4 — and each attention node recomputed at 1..8 threads and by use_ref; $(du -sh .oracle/encoder | cut -f1) of digests and embd_enc)"
+fa=$(objdump -d --no-show-raw-insn -C "$lib" | sed -n '/<ggml_compute_forward_flash_attn_ext_tiled(.*)>:$/,/^$/p'); sm=$(nfn ggml_vec_soft_max_f32 0x300)
+log "libggml-cpu's ggml_compute_forward_flash_attn_ext_tiled (the path whisper's encoder takes): $(echo "$fa" | grep -c 'vfmadd231ps') vfmadd231ps (simd_gemm's chains), $(echo "$fa" | grep -c 'vmaxss') vmaxss (the tile max), $(echo "$fa" | grep -c 'call.*<expf@plt>') calls of glibc expf, $(echo "$fa" | grep -c 'call.*<fmaxf@plt>') of fmaxf, $(echo "$fa" | grep -c 'call.*<ggml_vec_soft_max_f32@plt>') of ggml_vec_soft_max_f32, $(echo "$fa" | grep -c 'vcvtps2ph') vcvtps2ph (Q is not converted), $(echo "$fa" | grep -c 'vaddsd') vaddsd (S += the double sum); ggml_vec_soft_max_f32: $(echo "$sm" | grep -cE 'vfn?madd') FMA (ggml_v_expf), $(echo "$sm" | grep -c vaddsd) vaddsd, $(echo "$sm" | grep -c 'call.*expf') call of expf (the n % 8 tail); expf from $(objdump -T "$lib" | awk '$NF=="expf"{print $(NF-1)}')"
 log "this CPU: $(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -xE 'avx|avx2|fma|f16c|avx512f' | paste -sd' ') (production: Zen 3, the same extensions; its library is not the one checked here)"
 
 log "## 4. voaice.rs"
@@ -194,6 +213,13 @@ cargo test --release --test matmul -- --ignored --nocapture --test-threads=1 2>&
   | grep -vE "^\s*(Compiling|Finished|Running)|^$|^running" > "$step" || true
 tee -a "$out" < "$step"
 grep -q "test result: ok. 4 passed" "$step" || { log "FAIL: the matmul oracle comparisons did not all pass"; exit 1; }
+
+log "## 4h. flash attention and the whole encoder (v0.1.0): every node of the encoder graph through its eval callback, embd_enc"
+step=.oracle/attention_step.log
+cargo test --release --test attention -- --ignored --nocapture --test-threads=1 2>&1 \
+  | grep -vE "^\s*(Compiling|Finished|Running)|^$|^running" > "$step" || true
+tee -a "$out" < "$step"
+grep -q "test result: ok. 3 passed" "$step" || { log "FAIL: the attention / encoder oracle comparisons did not all pass"; exit 1; }
 
 nt=$(nproc)
 log "## 5. efficiency (only now): log-mel; wall = best of 10 calls, cpu = CPU ms per call (utime+stime, all threads,"
@@ -355,6 +381,34 @@ for what in q fc1 fc2 qkv mlp block; do
       "$(echo "$r" | field rss_peak_delta_kb)" "$(echo "$v" | field rss_peak_delta_kb)")"
   done
 done
-log "## transcripts recorded (not yet reproduced by voaice.rs: encoder and decoder are later stages)"
+log "## 12. efficiency (only now): block 0's attention (v0.1.0) on jfk (Q, K, V computed beforehand from the WAV by each"
+log "##    side), then THE WHOLE ENCODER: the mel (computed beforehand, as whisper's state holds it) -> conv1 -> conv2 ->"
+log "##    positions -> 4 blocks -> ln_post = embd_enc (voaice: Encoder::encode_into; the reference: whisper_encode_with_state,"
+log "##    its conv graph then its encoder graph). wall = best of 10, cpu = CPU ms per call over >= 1 s (attention) or"
+log "##    >= 2 s (encoder); heap: voaice = bytes live at the first call's peak (its buffers between stages, allocated by"
+log "##    that call and then reused; the widened weights are held with the model, outside the call); the reference ="
+log "##    attention: the node's output + the K/V buffers + the work buffer; encoder: the two schedulers' compute buffers +"
+log "##    kv_pad (allocated by whisper_init_state); rss = VmHWM delta of the first call. digest = 64-bit FNV-1a of embd_enc"
+log "$(printf '%-7s %3s | %9s %9s %6s | %9s %9s | %7s %7s | %6s %6s | %s' op thr ref_ms vo_ms x cpu_ref cpu_vo mem_ref heap_vo rss_r rss_v digests)"
+for what in attn encode; do
+  for th in 1 2 "$nt"; do
+    r=$(testing/oracle/bin/whisper_oracle --bench-"$what" "$model" .audio/jfk.wav "$th")
+    v=$(target/release/voaice bench-"$what" "$model" .audio/jfk.wav --threads "$th")
+    rw=$(echo "$r" | field wall_best_ms); vw=$(echo "$v" | field wall_best_ms)
+    dg="-"
+    if [ "$what" = encode ]; then
+      rd=$(echo "$r" | field embd_enc_digest); vd=$(echo "$v" | field embd_enc_digest)
+      [ "$rd" = "$vd" ] || { log "FAIL: embd_enc digests differ in the benchmark ($rd vs $vd)"; exit 1; }
+      dg="$vd = $rd"
+    fi
+    log "$(printf '%-7s %3s | %9.3f %9.3f %5.2fx | %9s %9s | %7s %7s | %6s %6s | %s' "$what" "$th" \
+      "$rw" "$vw" "$(awk -v a="$rw" -v b="$vw" 'BEGIN{print a/b}')" \
+      "$(echo "$r" | field cpu_ms_per_call)" "$(echo "$v" | field cpu_ms_per_call)" \
+      "$(echo "$r" | field op_mem_kb)" "$(echo "$v" | field heap_peak_kb)" \
+      "$(echo "$r" | field rss_peak_delta_kb)" "$(echo "$v" | field rss_peak_delta_kb)" "$dg")"
+  done
+done
+log "load after the measurements: $(cut -d' ' -f1-3 /proc/loadavg)"
+log "## transcripts recorded (not yet reproduced by voaice.rs: the encoder is v0.1.0's, the decoder is v0.2.0's)"
 for d in .oracle/tiny.en/*/; do log "$(basename "$d"): $(tr '\n' ' ' < "$d/transcript.txt")"; done
 log "GATE PASSED"

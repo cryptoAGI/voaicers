@@ -200,6 +200,41 @@ What this holds for: this laptop's native libggml-cpu (Zen+, AVX2 + FMA + F16C, 
 compared); production's own library was not run; `base.en` (n_state 512, 2,048 hidden) not compared; the attention's
 output came from the reference (v0.1.0 computes it).
 
+### Flash attention and the whole encoder (v0.1.0) — `tests/attention.rs` against every node of the encoder graph and `embd_enc`
+
+whisper's graph sends the encoder's attention down ggml's **tiled** flash-attention path
+(`ggml_compute_forward_flash_attn_ext_tiled`, testing/attention/NOTES.md): Q stays f32; K and V are 0.0.9's f16 copies in
+`kv_pad`, which has 1,536 rows (`GGML_PAD(1500, 256)`), the last 36 the +0 the buffer was cleared to — attended, with
+no mask; each score is one f32 FMA chain over the head's 64 dimensions, then × 0.125; the online softmax goes by tiles
+of 64 keys, a new tile max rescaling the output and the sum by **glibc's `expf`**, the probabilities by **ggml's own
+8-lane `ggml_v_expf`** summed eight at a time in f32 then in double; the output accumulates in f32 by FMA chains, and is
+multiplied by 1/S at the end. `whisper_oracle --encoder` observes every node of the encoder graph through the eval
+callback on `sched_encode` (0.0.9's keys, plus the norm chains, the positional ADD and FLASH_ATTN_EXT) and records one
+digest per row of each computed node (97), and `embd_enc` whole (read from `whisper_state::embd_enc` after unobserved
+runs at 1, 2 and 4 threads). When the scheduler asks about each FLASH_ATTN_EXT node it copies the node's Q and the whole
+`kv_pad` K and V: their types, shapes, strides and op params are checked against what whisper builds, and the padding
+rows are checked to be +0. The standalone attention graph (what `--bench-attn` times) is run on those inputs at 1..8
+threads, and once with `cplan.use_ref` — the one-chunk path, ggml's other reading — recorded as `b<il>.fa_ref.d64`.
+Self-checks, all yes on all 8 inputs: the inputs as built; the padding +0 in every block; 1 vs 4 threads identical
+(every digest and every attention output); `embd_enc` observed = unobserved, and identical at 1, 2 and 4 threads; the
+last node = `embd_enc`; the standalone graph = the node at 1..8 threads. The `use_ref` path changes 2,303,363–2,303,984
+of the 2,304,000 values of each block's attention: whisper's encoder output depends on which path ggml takes.
+
+| oracle | compares | result (v0.1.0) |
+|---|---|---|
+| `oracle_attention_nodes_bit_exact` | every block's FLASH_ATTN_EXT node, fed Q, K and V that voaice computes from attn_ln's recorded input (each checked against the record's q_add, k_cpy and v_cpy digests first): the fast path at 1 and 4 threads value by value against 0.0.9's whole record of the node; the model on every frame of block 0 and every 10th frame of blocks 1–3, by digest | **0 values differ** of 36,864,000 (8 inputs × 4 blocks × 2 thread counts); the model **0 rows differ** of 15,600 frames (× 6 heads) |
+| `oracle_encoder_end_to_end` | the whole encoder from the WAV: voaice's mel → conv stage → 4 blocks (norms, products, attention, MLP) → ln_post, at 1, 2 and 4 threads; every node the record names (96 per run: all but the CONT, which voaice's conv stage folds into its positional add) by row digest; then `Encoder::encode_into` (no taps, caller-owned buffers, called twice) against `embd_enc` value by value | **0 nodes differ** in 2,304 node comparisons (3,456,000 rows); `embd_enc` **0 values differ** of 576,000 on every input at every thread count, and again when the buffers are reused |
+| `oracle_attention_discriminators` | the model with one reading changed, on every 25th frame and the last (61 frames × 6 heads) of all 4 blocks of every input, by row digest | of 244 rows per input: glibc `expf` for the probabilities **244**; `ggml_v_expf` for the rescale **226–238**; no running max (the global max, one pass) **234–242**; kv_pad's 36 zero rows excluded **244**; scores without FMA **244**; the output accumulated without FMA **244**; the softmax sums in f32 **215–233**; out / S **244**; the one-chunk path **244** — each rejected on every input. **Q scaled before the dot: 0 on every input** — × 1/8 is exact, so this reading cannot be told apart from the reference's, as predicted |
+| `oracle_attention_discriminators` (the one-chunk model) | voaice's model of the one-chunk path against **the reference's own `use_ref` output** | as read from the source and the binary (`S = S·ms + vs` in two roundings: GCC splits the update by branch, `vmulss` then `vaddss`) **0 rows differ** of 1,952; with `S = fma(S, ms, vs)` 543 differ — the record decided a reading the source alone left open |
+
+What this holds for: this laptop's native libggml-cpu (Zen+, AVX2 + FMA + F16C, no AVX-512: `ggml_v_expf`'s 8-lane
+AVX2 form, `simd_gemm`'s 6 × 16 kernel); glibc 2.35's `expf` as its ifunc picks it on this CPU (`__expf_fma`), called
+through the same symbol by both sides. Production's Zen 3 library and glibc were not run. An AVX-512 build takes
+`ggml_v_expf`'s 16-lane form and `soft_max`'s `_mm512_reduce_add_ps` (another pairing) — not compared. `base.en`
+(n_state 512, 8 heads) not compared. Non-finite activations through attention are not checked: the kernel makes the
+same operations, but the max tree's choice among NaNs and FMA NaN payloads were not compared; the encoder never
+produces them from audio.
+
 ## Efficiency — measured only after the oracles pass
 
 (0.0.4) Step 6 of the gate measures the Ogg/Opus reader after 4b passed: Ogg's CRC on 16 MiB sliced-by-8 against the
@@ -265,6 +300,18 @@ threads. The reference's memory is its graph's non-view nodes plus the work buff
 voaice's the heap live at the first call's peak. voaice holds its weights widened to f32 (2× the f16 bytes) with the
 model, outside the measured call.
 
+Step 12 (v0.1.0) times block 0's attention on jfk (Q, K and V computed beforehand by each side from the WAV; the
+reference as the standalone graph the record shows equal to the node, its K and V in a zeroed 1,536-row f16 buffer as
+kv_pad; `whisper_oracle --bench-attn` / `voaice bench-attn`), and **the whole encoder**: the mel (computed beforehand,
+as whisper's state holds it) → `embd_enc`, the reference through `whisper_encode_with_state` itself (its conv graph,
+then its encoder graph, on its own schedulers; `whisper_oracle --bench-encode`), voaice through
+`Encoder::encode_into` with an `EncoderBuffers` kept between calls (`voaice bench-encode`), at 1, 2 and nproc threads.
+Each side prints the 64-bit FNV-1a digest of the `embd_enc` it measured, and the gate stops if they differ. The
+reference's memory for the encoder is its two schedulers' compute buffers plus `kv_pad` (allocated by
+`whisper_init_state`, not by the call); voaice's the heap live at the first call's peak (its buffers between stages,
+allocated by that call). Both hold their weights outside the call: the reference f16 (the model), voaice widened to f32
+(2× the bytes) for the products.
+
 ## The test inputs
 
 Eight WAVs, generated by `testing/make_audio.py` and pinned by sha256 in `testing/pins/audio.sha256`: JFK (11 s,
@@ -292,6 +339,10 @@ result (`embd_conv` is bit-identical with and without the callback, on all 8 inp
   thread) — **for finite activations**. A NaN in an activation row converts by `vcvtps2ph` or by the bit trick
   depending on where the thread split puts it, so the products' NaN payloads differ between thread counts whose
   split points are not multiples of 4 (at 5 and 7 threads against 1, on the constructed rows of `--mm-nan`).
+- Flash attention (v0.1.0) is bit-identical at 1..8 threads (the standalone graph against the scheduler's node), and
+  `embd_enc` at 1, 2 and 4 threads: the tiled kernel's rows are independent (each score and each output element is
+  one FMA chain; the softmax state is per row), so neither the chunking nor the tiles' composition moves a bit. The
+  encoder is the first whole stage voaice reproduces **at any thread count**.
 - `whisper_full` at 1 thread is identical run to run.
 - At 4 threads against 1, token ids and text are the same, but every token's probability differs in its bits, and
   on JFK the token timestamps move. The transcript oracle is therefore pinned at **1 thread**; a bit-exact transcript

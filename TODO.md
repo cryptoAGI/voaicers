@@ -33,7 +33,9 @@ whisper.cpp (upstream/PIN) in the same run; only then is its speed measured.
       rest by per-chunk digest); the GELU table; the op on 1,495,192 values and on all 2³². Discriminators:
       round-half-away (rejected) and the unfused GELU (rejected: 1 table entry, `0xBFFF`).
 - [x] im2col's inlined scalar copy: observed through conv1's IM2COL node in 0.0.6 (5,760,000 / 5,760,000).
-- [ ] Not observed yet: flash attention's inlined copy (checked when its node is, through the scheduler callback).
+- [x] Flash attention's conversions (v0.1.0): the tiled path whisper's encoder takes converts **nothing** to f16 (Q stays
+      f32, K and V are only widened); the one-chunk path's `from_float` of Q (the row converter) was checked through the
+      reference's own `use_ref` output (0 of 1,952 sampled rows differ).
 
 ## Done in 0.0.4 — the streaming Ogg/Opus reader (`src/ogg.rs`)
 - [x] Pages from any `std::io::Read`, one page buffer (65,307 bytes) allocated once and reused; a packet inside a page
@@ -151,14 +153,42 @@ whisper.cpp (upstream/PIN) in the same run; only then is its speed measured.
       siblings); the weights are held widened to f32 (7.1 MB per block, 2× the f16 bytes) because the f16-in-kernel
       variant measured ~30 % slower here — revisit on a core with more FMA than conversion throughput (Zen 3).
 
-## Next: v0.1.0 — the whole encoder (see docs/ROADMAP.md)
-- [ ] Flash attention (`ggml_compute_forward_flash_attn_ext_f16`, ops.cpp ~8440): per (frame, head) Q converted by
-      the K type's `from_float` (Q f32 → f16, the row converter), `kq_vec_dot` = `ggml_vec_dot_f16(64)` per key, `s · scale`
-      (1/√64), the online softmax with `expf` and V accumulated **in f16** (`ggml_vec_scale_f16`, `ggml_vec_mad_f16`)
-      when V is f16; read which path (tiled or one-row) this build takes for 1,500 queries. Check what the 36 padding
-      rows of `kv_pad` (n_ctx_pad = 1536, no mask) hold: they are attended to.
-- [ ] Then the four blocks chained (0.0.8's norms, 0.0.9's products, attention), `ln_post`, and `embd_enc` bit-exact
-      against `whisper_encode_with_state` at a stated thread count.
+## Done: v0.1.0 — the whole encoder, the first milestone (CHANGELOG.md, testing/attention/NOTES.md)
+- [x] Read from the pin and the binary **which** flash-attention kernel whisper's encoder runs: not the one-chunk path
+      this file used to describe (Q → f16, `ggml_vec_dot_f16` scores, V accumulated in f16 — that is `use_ref`'s path),
+      but `ggml_compute_forward_flash_attn_ext_tiled`: Q f32, K and V widened from the f16 `kv_pad`, scores as f32 FMA
+      chains (`simd_gemm`) × 1/8, tiles of 64 keys, the tile max (`vmaxss` chain), `fmaxf`, glibc `expf(Mold − Mnew)` for
+      the rescale, `ggml_vec_soft_max_f32` (ggml's own 8-lane `ggml_v_expf`, the f32 pairing, a double sum) for the
+      probabilities, `S = (float)((double)S + sum)`, the output accumulated in f32 by FMA chains, × 1/S.
+- [x] **kv_pad's 36 padding rows** (n_ctx_pad = 1536, no mask): `whisper_kv_cache_init` clears the buffer, the CPYs write
+      rows 0..1499 only, so they are +0 for the life of the state — checked in every block's record — and attended:
+      each scores exactly +0, adds `exp(0 − M)` to S and nothing to the output. Excluding them is a discriminator
+      (244 / 244 sampled rows differ).
+- [x] Oracle (`whisper_oracle --encoder`, tests/attention.rs): every computed node of the encoder graph by row digest,
+      `embd_enc` whole, attention's inputs and padding checked, the reference identical at 1..8 threads; voaice's
+      attention 0 differ (36,864,000 values), the whole encoder from voaice's own mel 0 differ at 1, 2, 4 threads (every
+      node, and `embd_enc` value by value); nine discriminators caught, Q-scaled-first indistinguishable as predicted.
+- [x] Faster, bits unchanged: K transposed and V widened once per head per call (the reference re-packs K for every
+      query tile), the softmax on the tile in registers (two passes, so no vector is live across glibc's `expf`; the
+      sums of eight rows at once), the rescale folded into the output product's load, query tiles of 60 (whisper's
+      1,500 frames = 25 whole tiles of 10 register blocks), threads by query tiles behind a per-head barrier; the
+      encoder pipeline with caller-owned buffers (`Encoder::encode_into`, `EncoderBuffers`).
+- [ ] Not covered: production's own libggml-cpu (Zen 3) and glibc were not run (`expf` is glibc's ifunc choice on each
+      CPU); an AVX-512 build (`ggml_v_expf`'s 16-lane form, `_mm512_reduce_add_ps`'s pairing); `base.en` (8 heads,
+      n_state 512); `audio_ctx` ≠ 0 (a shorter n_ctx: another padding, 0 < 1536 − n_ctx); non-finite activations through
+      attention (the same operations, but NaN payloads and the max tree's choice among NaNs not compared).
+- [ ] Efficiency left: attention is at ~70 % of this core's FMA throughput (65 ms of FMAs in ~90 ms); `ggml_v_expf` is
+      ~11 ms of it at its own op count; the padding keys' scores and products (2.3 % of the FMAs) could be skipped
+      for rows with finite Q (a +0 score is known), with a guard; at 2 threads the whole encoder gains 1.37×, at 4
+      none (2 cores; SMT siblings share the FMA pipes).
+
+## Next: 0.1.1 — cross-attention K and V (see docs/ROADMAP.md, the second decade)
+- [ ] `whisper_build_graph_cross`: per decoder layer `mul_mat(cross_attn_k_w, embd_enc)` → `ggml_scale(·, 64^−0.25)`,
+      `mul_mat(cross_attn_v_w, embd_enc) + cross_attn_v_b`, both CPY'd to f16 into `kv_cross` at `il·n_ctx_pad` (flash
+      attention's layout). Read the SCALE node's arithmetic (a multiply by `pow(64, −0.25)` computed in float — not a power of two, so it rounds), and what
+      `kv_cross`'s padding rows hold.
+- [ ] Oracle: the eval callback on `sched_cross` (layout probe: its offset), every node by row digest; the `kv_cross`
+      buffer whole (with its padding), from voaice's own `embd_enc`, 8 inputs, 1 and 4 threads.
 
 ## Then, in order
 
@@ -171,7 +201,7 @@ whisper.cpp (upstream/PIN) in the same run; only then is its speed measured.
       libwhisper and compiled for baseline x86-64) depend on the host's ISA: record the VPS's `/proc/cpuinfo` flags and
       make the oracle build reproduce them (`-march=` of the VPS), or build both and keep one oracle per ISA.
 
-### Stage 3 — encoder (plan; no code yet)
+### Stage 3 — encoder (done in v0.1.0; the plan as it was written, kept with the readings that turned out right or wrong)
 Graph (`whisper_build_graph_conv` + `whisper_build_graph_encoder`, src/whisper.cpp:1976–2270), ggml CPU backend:
 
 | step | ggml op | what must be matched |
@@ -182,7 +212,7 @@ Graph (`whisper_build_graph_conv` + `whisper_build_graph_encoder`, src/whisper.c
 | conv2 | same, stride 2 → [384, 1500] | as conv1 |
 | + positional | `ggml_add(e_pe view, cont(transpose(cur)))` | exact (one add) — done in 0.0.7 |
 | ×4 blocks | `ggml_norm` (eps 1e-5) → `*w + b` → Q,K,V `mul_mat` (f16 weights) + biases | norm: done in 0.0.8 (double sum in order, cvar's 8-lane f32 pairing, `1/sqrtf`, MUL and ADD unfused); the products: done in 0.0.9 (`from_float` split by thread, then the f16 dot; K has no bias) |
-| attention | **flash_attn = true** (whisper-cli default): K,V copied to the f16 `kv_pad` cache, `ggml_flash_attn_ext(Q, K, V, scale 1/√64)` | online softmax order, Q→f16 conversion, `expf` vs ggml's own exp, V accumulation in f16 or f32 — read `ggml_compute_forward_flash_attn_ext_f16` |
+| attention | **flash_attn = true** (whisper-cli default): K,V copied to the f16 `kv_pad` cache, `ggml_flash_attn_ext(Q, K, V, scale 1/√64)` | done in v0.1.0: the tiled kernel (Q f32, FMA-chain scores, tiles of 64 keys, glibc `expf` rescale, ggml's `ggml_v_expf` probabilities, f32 output), kv_pad's 36 zero rows attended |
 | out proj, residual, MLP | `mul_mat` + bias, add, norm, `mul_mat` (384→1536), GELU, `mul_mat`, add | done in 0.0.9 (fed the recorded attention output) |
 | ln_post | norm, `*w + b` | done in 0.0.8 (fed the recorded input) |
 
@@ -205,7 +235,7 @@ still does all the arithmetic, the oracle only observes. Kernel-level oracles, a
 table), `ggml_cpu_fp32_to_fp16` / `ggml_vec_dot_f16` are reachable through `ggml_get_type_traits_cpu`.
 
 Order of work: GELU table → f32↔f16 conversions (both done in 0.0.3) → `vec_dot_f16` on sampled real rows → conv1 (both done in 0.0.6) → conv2 + positions (0.0.7) → one block
-(norm, attention, MLP) → all four → `embd_enc` bit-exact on the 8 test inputs.
+(norm, attention, MLP) → all four → `embd_enc` bit-exact on the 8 test inputs — **all done in v0.1.0**.
 
 ### Stage 4 — decoder (plan)
 Cross-attention K/V (`whisper_build_graph_cross`: `mul_mat` of `embd_enc` by each layer's cross K/V, scaled by

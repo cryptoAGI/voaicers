@@ -13,8 +13,8 @@ Built the way [bankml](https://github.com/cryptoAGI/bankml) was built against ll
   <img src="https://img.shields.io/badge/Rust-000000?style=flat-square&logo=rust&logoColor=white" alt="Rust">
   <img src="https://img.shields.io/badge/dependencies-0-56D364?style=flat-square" alt="zero dependencies">
   <img src="https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-2563EB?style=flat-square" alt="MIT OR Apache-2.0">
-  <img src="https://img.shields.io/badge/log--mel-bit--exact%20vs%20whisper.cpp%20(ggml%200.16.0)-39D3C7?style=flat-square" alt="log-mel bit-exact">
-  <img src="https://img.shields.io/badge/status-0.0.9%20%C2%B7%20loader%2C%20front%20end%2C%20f16%20%2B%20GELU%2C%20resampler%2C%20encoder%20conv1%20%2B%20conv2%20%2B%20positions%20%2B%20layer%20norm%20%2B%20products%20%2B%20MLP%20bit--exact%2C%20Ogg%2FOpus%20reader%3B%20no%20transcript%20yet-F59E0B?style=flat-square" alt="status">
+  <img src="https://img.shields.io/badge/encoder-bit--exact%20vs%20whisper.cpp%20(ggml%200.16.0)-39D3C7?style=flat-square" alt="encoder bit-exact">
+  <img src="https://img.shields.io/badge/status-v0.1.0%20%C2%B7%20the%20whole%20encoder%20bit--exact%20vs%20whisper.cpp%20(mel%20%E2%86%92%20embd__enc)%2C%20~4%C3%97%20faster%3B%20decoder%20next%20(v0.2.0)-0ECB81?style=flat-square" alt="status">
   <a href="https://github.com/cryptoAGI/voaicers/releases/latest"><img src="https://img.shields.io/github/v/release/cryptoAGI/voaicers?style=flat-square&label=release&color=0ECB81" alt="latest release"></a>
 </p>
 
@@ -27,19 +27,23 @@ mindX's production speech-to-text is whisper.cpp built against ggml 0.16.0, runn
 *a result counts only when an oracle has checked it, and the oracle is the reference's own compiled library run on
 the same input, compared by bit pattern.* Speed is measured only after that.
 
-**0.0.9 does not transcribe yet.** It is the first three stages, the front end optimized (0.0.2) with its bits unchanged,
-the first two encoder kernels (0.0.3): the f32 ↔ f16 conversions and GELU, (0.0.4) the streaming Ogg/Opus reader
-that will bring `.opus` input to them without a WAV on disk, (0.0.5) the audio reader whisper-cli itself runs:
-any WAV to 16 kHz mono f32 through miniaudio's conversions, mixdown and resampler, bit for bit, and (0.0.6) the
-encoder's first layer: ggml's f16 dot product in its AVX float order and conv1 with its bias and GELU, checked node by
-node against the reference's own scheduler, and (0.0.7) the rest of the conv stage: conv2, its bias and GELU
-(`embd_conv`), and the positional embedding the encoder adds first — voaice now computes the encoder's input bit for bit,
-and (0.0.8) the encoder's layer norms: all nine `norm → · w → + b` chains, checked against every NORM, MUL and ADD
-node of the reference's encoder graph (blocks 1–3 and `ln_post` from the reference's recorded input to them, since
-attention and the MLP are not ported yet; block 0's from voaice's own mel), and (0.0.9) the matrix products on
-activations: every block's Q, K, V (and K's and V's f16 copies for flash attention), the out projection and the MLP,
-with their biases, GELU and residuals, checked against every such node of the encoder graph — what is left of the
-encoder is flash attention itself (v0.1.0).
+**v0.1.0 is the first milestone: the whole encoder, bit-exact.** From voaice's own log-mel spectrogram to `embd_enc`
+— conv1, conv2, the positions, four blocks of layer norm → Q, K, V → **flash attention** → out projection → MLP, then
+`ln_post` — every value is the one the pinned whisper.cpp computes, checked against every node of its encoder graph
+and against `embd_enc` itself on 8 inputs at 1, 2 and 4 threads, and the whole encoder runs **about four times as
+fast as whisper.cpp's at one thread** (3.85–4.04×; three times at two and four threads) in less memory. It does not
+transcribe yet: **the decoder is next (v0.2.0)**, then the transcript loop (v0.3.0).
+
+It got there one increment at a time: the front end optimized (0.0.2) with its bits unchanged, the first two encoder
+kernels (0.0.3): the f32 ↔ f16 conversions and GELU, (0.0.4) the streaming Ogg/Opus reader that will bring `.opus`
+input without a WAV on disk, (0.0.5) the audio reader whisper-cli itself runs: any WAV to 16 kHz mono f32 through
+miniaudio's conversions, mixdown and resampler, bit for bit, (0.0.6) ggml's f16 dot product in its AVX float order and
+conv1 with its bias and GELU, checked node by node against the reference's own scheduler, (0.0.7) conv2 (`embd_conv`)
+and the positional embedding — the encoder's input, (0.0.8) the encoder's nine layer norms, (0.0.9) the matrix
+products on activations: Q, K, V and their f16 copies, the out projection and the MLP, and (v0.1.0) flash attention —
+ggml's **tiled** kernel, which is the one whisper's graph takes (Q in f32; the f16 `kv_pad` cache with its 36 zero
+padding rows attended; the online softmax with glibc's `expf` for the rescale and ggml's own 8-lane `ggml_v_expf` for
+the probabilities; the output in f32) — and the encoder chained end to end.
 
 | stage | what | oracle result (this machine, 2026-10-07) |
 |---|---|---|
@@ -54,6 +58,7 @@ encoder is flash attention itself (v0.1.0).
 | 7 | encoder conv2 + bias + GELU (`embd_conv`) and the positional embedding (0.0.7): stride-2 im2col to f16, 1,152-long f16 dots, then `e_pe + cont(transpose(·))` — the encoder's input; then faster: no im2col held, a 4 × 3 register block over a permuted column layout, conv1 → conv2 through an f16 buffer, the transpose and the add fused into the epilogue | both schedulers' **own nodes** (the conv graph's, and the encoder graph's first four through its eval callback): im2col **13,824,000 / 13,824,000** f16 values; the product, + bias and GELU **0 differ** at 1 and 4 threads (27,648,000 values); CONT **0 differ**; the positional ADD **0 differ** from voaice's own mel at 1, 2 and 4 threads (27,648,000); stride 1, one accumulator, positions before the transpose, positions a frame late, GELU before the bias — all caught; im2col in f32 caught on the 4 inputs where it can be (below) |
 | 8 | the encoder's layer norms (0.0.8): `ggml_norm` (the row summed in double in order, `mean` in f32, cvar's 8-lane f32 pairing, `1/sqrtf(var + 1e-5)`), then `· w` and `+ b` as two roundings — nine chains; then faster: the three nodes in one pass per row, the double sums in vector lanes only where the row proves every order exact | every NORM, MUL and ADD node of the encoder graph (all 127 nodes observed through its eval callback), each fed its recorded input: **0 differ** in 373,248,000 values on 8 inputs, at 1 and 4 threads and by the model; block 0 from voaice's own mel **0 differ** at 1, 2 and 4 threads; the sum in f32, the mean from the double, a one-pass variance, cvar without its f32 reduce, eps outside the sqrt, the scale in double, a division, mul + add fused — each caught on every input |
 | 9 | the matrix products on activations (0.0.9): `mul_mat`'s f32 → f16 `from_float` (each of the reference's threads converting its element range of every row), then the f16 dot; Q, K (no bias), V and their f16 CPYs (the scalar bit trick), the out projection + bias + residual, fc1 + bias, GELU, fc2 + bias + residual; then faster: the norms fused into the conversion, one conversion for Q, K and V, a 4 × 3 register block over 64-frame panels, the MLP a panel at a time | all 16 product-side nodes of all 4 blocks through the encoder graph's eval callback, recorded as a digest per row: **0 differ** in 2,304,000 rows (1,382,400,000 values) on 8 inputs, by the model and at 1 and 4 threads; block 0 from voaice's own mel **0 differ** at 1, 2 and 4 threads; NaN-bearing rows at 1..8 threads **0 differ** — and the reference's own NaN output changes with its thread count (5 and 7 threads); no f16 rounding, one accumulator, a sequential reduce, the bias in the accumulator, the residual before the bias, GELU without its table — each caught on every input; the scalar converter and the split ignored caught on the NaN rows |
+| 10 | **v0.1.0 — flash attention and the whole encoder**: ggml's tiled flash-attention kernel (f32 FMA-chain scores × 1/8 over the 1,536-row f16 `kv_pad` with its 36 +0 rows attended; tiles of 64 keys; glibc `expf` for the rescale, ggml's 8-lane `ggml_v_expf` for the probabilities, summed in f32 then double; the output in f32), then the encoder chained: mel → conv stage → 4 blocks → `ln_post` = `embd_enc`; then faster: K and V widened once per head, the softmax on the tile in registers, caller-owned buffers | every node of the encoder graph through its eval callback (97 digested per input) and `embd_enc` whole: from voaice's own mel **0 differ** at 1, 2 and 4 threads on 8 inputs (2,304 node comparisons, 3,456,000 rows; `embd_enc` 576,000 values each); attention **0 differ** in 36,864,000 values; the reference itself identical at 1..8 threads; glibc `expf` for the probabilities, `ggml_v_expf` for the rescale, no running max, the padding rows excluded, no FMA in the scores or the output, the sums in f32, a division, the one-chunk path — each caught on every input (the one-chunk model itself matches the reference's own `use_ref` output); Q scaled first is indistinguishable (×1/8 is exact), as predicted |
 
 Efficiency, measured only after the oracles passed in the same gate run (0.0.2, this laptop, 4 CPUs at load ≈ 7.6,
 so ±20 % is noise): the mel is **6.1× faster than 0.0.1** (rebuilt from its tag in the same run) and **6.8× faster
@@ -106,13 +111,23 @@ second). At four threads voaice is no faster than at two on this 2-core laptop. 
 (7.1 MB a block, outside the measured call). Record: [`testing/results/0.0.9.txt`](testing/results/0.0.9.txt); the
 CHANGELOG lists a rerun.
 
+**v0.1.0, the milestone, after its oracles** (same laptop, load 1.5 → 3.5): **the whole encoder, mel → `embd_enc`, takes
+1,038 ms against whisper.cpp's 3,994 at one thread (3.85×; 987 against 3,983 in a rerun, 4.04×)**, 3.05–3.14× at two
+threads and 2.95–3.01× at four, at **a quarter of the CPU time** (1,149 against 4,250 CPU-ms at one thread) and in
+**17,869 KiB of heap against the 29,398 KiB** of compute buffers and cache whisper allocates for it; the `embd_enc`
+both sides measured is the same to the bit (digest `50d38ec85f2778b9` on jfk). Block 0's attention alone: 91.9 against
+150.8 ms (1.64×), near this core's FMA throughput. voaice holds the products' weights widened to f32 (28 MB for the
+four blocks, outside the call). Record: [`testing/results/0.1.0.txt`](testing/results/0.1.0.txt); the CHANGELOG has the
+rerun and the breakdown.
+
 **A determinism note on the reference itself:** whisper.cpp's transcript depends on its thread count. At 1 thread it
 is identical run to run; at 4 threads the token ids and text stay the same but every token's probability differs in
 its bits, and on JFK the token timestamps move. The transcript oracle is therefore pinned at 1 thread, and a
 bit-exact transcript will mean "bit-exact at a stated thread count".
 
-The encoder, decoder and the transcript loop are not written. Their plan, with the ggml ops, their float order and
-how the oracle will check each, is in [TODO.md](TODO.md).
+The encoder is done (v0.1.0) and is exact at any thread count: the reference's own encoder output does not depend on
+it. The decoder and the transcript loop are not written; their plan — the second decade, 0.1.1 → v0.2.0, one
+increment at a time — is in [docs/ROADMAP.md](docs/ROADMAP.md) and [TODO.md](TODO.md).
 
 ## The reference
 
@@ -192,6 +207,9 @@ target/release/voaice norm models/ggml-tiny.en.bin in.wav [out.f32] [--threads N
 target/release/voaice bench-norm models/ggml-tiny.en.bin in.wav norm|chain [--threads N]   # the NORM node, or norm -> * w -> + b
 target/release/voaice qkv models/ggml-tiny.en.bin in.wav [q.f32] [--threads N]   # (0.0.9) block 0's attention inputs: Q f32, K and V f16
 target/release/voaice bench-mm models/ggml-tiny.en.bin in.wav q|fc1|fc2|qkv|mlp|block [--threads N]   # block 0's products
+target/release/voaice encode models/ggml-tiny.en.bin in.wav [out.f32] [--threads N]   # (v0.1.0) the whole encoder: embd_enc 1500 x 384, sha256 + digest
+target/release/voaice bench-attn models/ggml-tiny.en.bin in.wav [--threads N]     # block 0's flash attention: wall, CPU, heap, RSS
+target/release/voaice bench-encode models/ggml-tiny.en.bin in.wav [--threads N]   # the whole encoder, mel -> embd_enc
 ```
 
 Input: `voaice mel` still takes 16-bit PCM, mono, 16 kHz WAV; `voaice resample` (0.0.5) takes any PCM 8/16/24/32-bit
@@ -203,7 +221,7 @@ Disk: the reference checkout and build are about 160 MB in `upstream/` (gitignor
 
 ```
 Cargo.toml  rust-toolchain.toml      zero dependencies; Rust 1.99.0 pinned like bankml
-src/        sha256.rs model.rs wav.rs mel.rs f16.rs gelu.rs conv.rs norm.rs matmul.rs ogg.rs resample.rs measure.rs lib.rs main.rs
+src/        sha256.rs model.rs wav.rs mel.rs f16.rs gelu.rs conv.rs norm.rs matmul.rs attention.rs encoder.rs ogg.rs resample.rs measure.rs lib.rs main.rs
 tests/oracle.rs                      the oracle comparisons (#[ignore]: need the model and a recorded oracle)
 testing/oracle/                      build.sh, layout_probe.cpp, whisper_oracle.cpp, resample_oracle.cpp (0.0.5)
 tests/resample.rs                    (0.0.5) the resampler against whisper-cli's libcommon.a (#[ignore]: needs the record)
@@ -217,6 +235,8 @@ tests/norm.rs                        (0.0.8) the nine layer norms against every 
 testing/norm/NOTES.md                (0.0.8) ggml_norm read from the pin and the binary, the oracle, the order-free sum
 tests/matmul.rs                      (0.0.9) every block's products, biases, GELU, residuals and f16 copies (#[ignore])
 testing/matmul/NOTES.md              (0.0.9) mul_mat's from_float split read from the pin, the compact oracle, the NaN finding
+tests/attention.rs                   (v0.1.0) flash attention and the whole encoder against every node and embd_enc (#[ignore])
+testing/attention/NOTES.md           (v0.1.0) which kernel whisper takes, kv_pad's padding, the use_ref finding, the speed steps
 tests/opus.rs                        (0.0.4) the Ogg/Opus oracle comparisons, offline against the recorded reference
 testing/make_audio.py                the 8 test WAVs, pinned in testing/pins/audio.sha256
 testing/opus/                        oracle.sh record|check, reference.py, mutate.py; 35 pinned .opus files + answers
@@ -272,10 +292,14 @@ go up 0.0.1 at a time, with a milestone at every tenth step. The order of work:
   ([record](testing/results/0.0.9.txt)).
 - [ ] **Stage 0b:** pin `ggml-base.en.bin` (production's default model). Record the VPS's ISA so the oracle
   reproduces production's native ggml-cpu kernels (Zen 3, AVX2 + FMA).
-- [ ] **Stage 3, the encoder (0.1.0):** ~~the GELU f16 table, f32↔f16 conversion~~ (0.0.3), ~~`vec_dot_f16` in AVX2
-  lane order, conv1~~ (0.0.6), ~~conv2 through im2col, the positions~~ (0.0.7), ~~layer norm~~ (0.0.8), ~~the products and the MLP~~ (0.0.9), flash attention, four blocks, then `embd_enc` bit-exact. Each intermediate is observed through ggml's scheduler callback.
-- [ ] **Stage 4, the decoder (0.2.0):** cross-attention, the f16 KV cache, and all 51,864 logits bit-exact per
-  step through `whisper_get_logits_from_state`.
+- [x] **v0.1.0 — MILESTONE, the whole encoder:** flash attention (ggml's tiled kernel, the one whisper takes; kv_pad's
+  zero rows attended), four blocks and `ln_post`: every node of the encoder graph and `embd_enc` bit-exact from
+  voaice's own mel at 1, 2 and 4 threads; the encoder 3.85–4.04× whisper.cpp at one thread
+  ([record](testing/results/0.1.0.txt)).
+- [ ] **Stage 4, the decoder (0.1.1 → v0.2.0):** cross-attention K/V (0.1.1), the decoder's input (0.1.2), the
+  self-attention products and the f16 KV cache (0.1.3), self- and cross-attention (0.1.4, 0.1.5), the MLP (0.1.6),
+  the logits (0.1.7), the incremental step (0.1.8), fast (0.1.9) — all 51,864 logits bit-exact per step through
+  `whisper_get_logits_from_state` (v0.2.0; [docs/ROADMAP.md](docs/ROADMAP.md)).
 - [ ] **Stage 5, the transcript (0.3.0):** the greedy loop, logit filters, timestamp rules, 30-second seek.
   `transcript.tsv` must be identical: token ids, `t0`/`t1`, and the f32 bits of `p`.
 - [ ] **0.4.0:** `voaice transcribe --json` in whisper-cli's shape, plus a library entry point for voaice's call

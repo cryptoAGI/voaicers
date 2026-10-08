@@ -17,6 +17,9 @@
 //   whisper_oracle --matmul <model.bin> <outdir> <wav ...>  (0.0.9) every block's products, biases, GELU, residuals, see record_matmul
 //   whisper_oracle --mm-nan <model.bin> <outdir>            (0.0.9) from_float on NaN-bearing rows at 1..8 threads, see record_mm_nan
 //   whisper_oracle --bench-mm <model.bin> <wav> <threads> q|fc1|fc2|qkv|mlp|block   (0.0.9) their time, see bench_mm
+//   whisper_oracle --encoder <model.bin> <outdir> <wav ...> (v0.1.0) flash attention and the whole encoder, see record_encoder
+//   whisper_oracle --bench-attn <model.bin> <wav> <threads>    (v0.1.0) block 0's attention, see bench_attn
+//   whisper_oracle --bench-encode <model.bin> <wav> <threads>  (v0.1.0) whisper_encode_with_state, mel -> embd_enc
 //
 // --bench-mel measures the reference's whisper_pcm_to_mel_with_state the way `voaice bench-mel` measures voaice's,
 // in a fresh process each: the heap bytes live at the first call's peak (operator new counted, below), peak RSS of
@@ -1647,7 +1650,299 @@ static int bench_mm(const char * model_path, const char * wav, int threads, cons
     return 0;
 }
 
+// ---- v0.1.0: flash attention and the whole encoder, observed in the shipped library ----------------------------------
+// --encoder <model.bin> <outdir> <wav ...> writes, per wav, <outdir>/<stem>/ (compact: per-row digests, not tensors):
+//   embd_enc.f32       whisper_state::embd_enc (layout probe) after an unobserved whisper_encode_with_state at 1 thread:
+//                      f32 [384, 1500] frame-major, the encoder's output; also computed at 2 and 4 threads and compared
+//   enc.d64            for EVERY computed node of the encoder graph (views, reshapes, permutes and transposes are not
+//                      computed and are left out), in the order the scheduler ran them, one 64-bit FNV-1a digest per
+//                      row (row = ne0 f32 values; a CPY into kv_pad: 384 f16; FLASH_ATTN_EXT: 384 = 64 x 6 heads)
+//   enc.tsv            one line per digested node: index in the graph, key, op, type, row length, rows, offset (in
+//                      u64) into enc.d64. Keys: pe_add, attn_ln_<il>.{norm,mul,add}, mlp_ln_<il>.*, ln_post.*, and
+//                      0.0.9's b<il>.<key> (k_mm, k_cpy, v_mm, v_add, v_cpy, q_mm, q_add, fa, o_mm, ..., mlp_res)
+//   b<il>.fa_ref.d64   the same FLASH_ATTN_EXT recomputed by the shipped CPU backend with cplan.use_ref = true (the
+//                      one-chunk path: Q converted to f16, ggml_vec_dot_f16 scores, V accumulated in f16), row digests:
+//                      the reference's own other reading, which whisper's graph does not take
+//   encoder.tsv        the self-checks: every FLASH_ATTN_EXT reads Q f32 (a permuted view of q_add), K and V f16 views
+//                      of kv_pad with ne [64, 1536, 6] and strides [2, 768, 128], no mask, no sinks, scale 0.125, max_bias
+//                      and softcap 0, default precision; kv_pad's rows 1500..1535 all +0 (K and V, every block, read
+//                      when the scheduler asks about the node); 1 vs 4 threads every node identical; embd_enc observed ==
+//                      unobserved, and 1 = 2 = 4 threads unobserved; the last node == embd_enc; the standalone
+//                      flash-attention graph (what --bench-attn times) == the scheduler's node at 1..8 threads; how
+//                      many values the use_ref path changes
+static const char * FA_REF = "fa_ref";
+struct encoder_capture {
+    mm_capture mm;                                       // 0.0.9's node keys (and the products' input digests)
+    std::vector<std::string> tsv;                        // enc.tsv
+    std::vector<uint64_t> digests;                       // enc.d64
+    std::map<std::string, std::vector<uint64_t>> by_key; // key -> row digests (for the 1 vs 4 comparison)
+    int norm_seen = 0, norm_state = 0, n_layer = 0, n_state = 0, n_ctx = 0, idx = 0;
+    std::string chain;
+    bool fa_shape = true, pad_zero = true;
+    std::vector<std::vector<uint8_t>> fa_q, fa_k, fa_v, fa_out;   // per block: q_add, kv_pad.k and .v whole, the node
+    std::vector<uint8_t> last;
+};
+static bool encoder_cb(ggml_tensor * t, bool ask, void * ud) {
+    auto & c = *static_cast<encoder_capture *>(ud);
+    mm_cb(t, ask, &c.mm);
+    if (ask) {
+        if (t->op == GGML_OP_FLASH_ATTN_EXT) {               // its inputs, every earlier node computed
+            const ggml_tensor * q = t->src[0], * k = t->src[1], * v = t->src[2];
+            float op[3];
+            std::memcpy(op, t->op_params, sizeof op);
+            const int32_t prec = t->op_params[3];
+            bool ok = q->type == GGML_TYPE_F32 && q->view_src && q->view_src->type == GGML_TYPE_F32 &&
+                      q->ne[0] == 64 && q->ne[1] == c.n_ctx && q->ne[2] == c.n_state / 64 && q->nb[1] == (size_t)c.n_state * 4 && q->nb[2] == 64 * 4;
+            for (const ggml_tensor * x : {k, v})
+                ok = ok && x->type == GGML_TYPE_F16 && x->view_src && x->ne[0] == 64 && x->ne[1] == 1536 && x->ne[2] == c.n_state / 64 &&
+                     x->nb[0] == 2 && x->nb[1] == (size_t)c.n_state * 2 && x->nb[2] == 128 && x->view_offs == 0 &&
+                     ggml_nelements(x->view_src) == (int64_t)1536 * c.n_state;
+            ok = ok && t->src[3] == nullptr && t->src[4] == nullptr && op[0] == 0.125f && op[1] == 0.0f && op[2] == 0.0f && prec == GGML_PREC_DEFAULT;
+            c.fa_shape = c.fa_shape && ok;
+            c.fa_q.push_back(tensor_bytes(q->view_src));
+            c.fa_k.push_back(tensor_bytes(k->view_src));
+            c.fa_v.push_back(tensor_bytes(v->view_src));
+            for (const std::vector<uint8_t> * b : {&c.fa_k.back(), &c.fa_v.back()})
+                for (size_t i = (size_t)c.n_ctx * c.n_state * 2; i < b->size(); i++) c.pad_zero = c.pad_zero && (*b)[i] == 0;
+        }
+        return true;
+    }
+    const int idx = c.idx++;
+    if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE)
+        return true;
+    // the key: a norm chain's node, 0.0.9's key, the positional add (the first ADD), or the node's index
+    std::string key;
+    auto it = c.mm.key.find(t);
+    if (it != c.mm.key.end()) key = "b" + it->second;
+    else if (t->op == GGML_OP_NORM) {
+        const int k = c.norm_seen++;
+        c.chain = k == 2 * c.n_layer ? "ln_post" : std::string(k % 2 ? "mlp_ln_" : "attn_ln_") + std::to_string(k / 2);
+        key = c.chain + ".norm"; c.norm_state = 1;
+    } else if (c.norm_state == 1 && t->op == GGML_OP_MUL) { key = c.chain + ".mul"; c.norm_state = 2; }
+    else if (c.norm_state == 2 && t->op == GGML_OP_ADD) { key = c.chain + ".add"; c.norm_state = 0; }
+    else if (t->op == GGML_OP_ADD && c.norm_seen == 0) key = "pe_add";
+    else key = "n" + std::to_string(idx);
+    const int64_t row = t->op == GGML_OP_CPY ? c.n_state : t->op == GGML_OP_FLASH_ATTN_EXT ? t->ne[0] * t->ne[1] : t->ne[0];
+    std::vector<uint64_t> d = row_digests(t, row);
+    if (t->op == GGML_OP_FLASH_ATTN_EXT) c.fa_out.push_back(tensor_bytes(t));
+    char line[256];
+    std::snprintf(line, sizeof line, "%d\t%s\t%s\t%s\t%lld\t%zu\t%zu", idx, key.c_str(), ggml_op_desc(t), ggml_type_name(t->type),
+                  (long long)row, d.size(), c.digests.size());
+    c.tsv.push_back(line);
+    c.digests.insert(c.digests.end(), d.begin(), d.end());
+    c.by_key[key] = d;
+    c.last = tensor_bytes(t);
+    return true;
+}
+
+// flash attention alone as whisper builds it, as a standalone graph on the shipped CPU backend (what --bench-attn times):
+// Q = permute(reshape_3d(q [384, n_ctx] f32, 64, 6, n_ctx), 0, 2, 1, 3); K, V = view_3d of a [1536 x 384] f16 buffer
+struct fa_graph {
+    ggml_context * ctx; ggml_tensor * q, * k, * v, * out; ggml_cgraph * gf;
+    std::vector<uint8_t> work;
+    fa_graph(int n_state, int n_ctx, int n_pad) {
+        ggml_init_params p = { (size_t)32 << 20, nullptr, false };
+        ctx = ggml_init(p);
+        check(ctx != nullptr, "ggml_init failed");
+        const int nh = n_state / 64;
+        q = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state, n_ctx);
+        k = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, (int64_t)n_state * n_pad);
+        v = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, (int64_t)n_state * n_pad);
+        ggml_tensor * Q = ggml_permute(ctx, ggml_reshape_3d(ctx, q, 64, nh, n_ctx), 0, 2, 1, 3);
+        ggml_tensor * K = ggml_view_3d(ctx, k, 64, n_pad, nh, 2 * n_state, 2 * 64, 0);
+        ggml_tensor * V = ggml_view_3d(ctx, v, 64, n_pad, nh, 2 * n_state, 2 * 64, 0);
+        out = ggml_flash_attn_ext(ctx, Q, K, V, nullptr, 1.0f / sqrtf(64.0f), 0.0f, 0.0f);
+        gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, out);
+    }
+    void set(const std::vector<uint8_t> & qb, const std::vector<uint8_t> & kb, const std::vector<uint8_t> & vb) {
+        check(qb.size() == ggml_nbytes(q) && kb.size() == ggml_nbytes(k) && vb.size() == ggml_nbytes(v), "fa graph input size");
+        std::memcpy(q->data, qb.data(), qb.size()); std::memcpy(k->data, kb.data(), kb.size()); std::memcpy(v->data, vb.data(), vb.size());
+    }
+    void run(int threads, bool use_ref = false) {
+        ggml_cplan cp = ggml_graph_plan(gf, threads, nullptr);
+        if (work.size() < cp.work_size) work.resize(cp.work_size);
+        cp.work_data = work.data();
+        cp.use_ref = use_ref;
+        check(ggml_graph_compute(gf, &cp) == GGML_STATUS_SUCCESS, "graph compute failed");
+        check(cp.n_threads == threads, "the plan did not take the thread count");
+    }
+    ~fa_graph() { ggml_free(ctx); }
+};
+
+static ggml_tensor * state_embd_enc(whisper_state * st, int n_state) {
+    ggml_tensor * ee = *reinterpret_cast<ggml_tensor **>((char *)st + VOAICE_OFF_STATE_EMBD_ENC);
+    check(ee != nullptr && ee->type == GGML_TYPE_F32 && ee->ne[0] == n_state, "layout check failed: embd_enc");
+    return ee;
+}
+
+static int record_encoder(const char * model_path, const std::string & outdir, int nwav, char ** wavs) {
+    if (mkdir(outdir.c_str(), 0755) != 0 && errno != EEXIST) die("cannot create outdir (its parent must exist)");
+    whisper_context * ctx = load_quiet(model_path);
+    auto & tensors = model_tensors(ctx);
+    const int n_ctx = whisper_model_n_audio_ctx(ctx), n_state = whisper_model_n_audio_state(ctx), n_layer = whisper_model_n_audio_layer(ctx);
+    for (int a = 0; a < nwav; a++) {
+        std::string path = wavs[a];
+        std::string stem = path.substr(path.find_last_of('/') + 1);
+        stem = stem.substr(0, stem.find_last_of('.'));
+        const std::string dir = outdir + "/" + stem;
+        mkdir(dir.c_str(), 0755);
+        std::vector<float> pcm = read_wav(path.c_str());
+        encoder_capture caps[2];
+        std::vector<uint8_t> obs_enc, unobs[3];
+        const int threads[5] = {1, 4, 1, 2, 4};
+        for (int k = 0; k < 5; k++) {              // k = 0, 1: observed at 1 and 4 threads; k = 2..4: not observed, 1, 2, 4
+            whisper_state * st = whisper_init_state(ctx);
+            check(st != nullptr, "whisper_init_state failed");
+            check(whisper_pcm_to_mel_with_state(ctx, st, pcm.data(), (int)pcm.size(), 1) == 0, "pcm_to_mel failed");
+            state_sched(st, VOAICE_OFF_STATE_SCHED_CONV);
+            ggml_backend_sched_t se = state_sched(st, VOAICE_OFF_STATE_SCHED_ENCODE);
+            if (k < 2) {
+                for (auto & kv : tensors) caps[k].mm.names[kv.second] = kv.first;
+                caps[k].mm.n_layer = caps[k].n_layer = n_layer;
+                caps[k].mm.n_state = caps[k].n_state = n_state;
+                caps[k].n_ctx = n_ctx;
+                ggml_backend_sched_set_eval_callback(se, encoder_cb, &caps[k]);
+            }
+            check(whisper_encode_with_state(ctx, st, 0, threads[k]) == 0, "whisper_encode failed");
+            std::vector<uint8_t> e = tensor_bytes(state_embd_enc(st, n_state));
+            if (k == 0) obs_enc = e; else if (k >= 2) unobs[k - 2] = e;
+            whisper_free_state(st);
+        }
+        encoder_capture & c = caps[0];
+        const encoder_capture & d = caps[1];
+        check((int)c.fa_out.size() == n_layer && c.norm_seen == 2 * n_layer + 1, "the encoder graph did not show n_layer attentions and 2 x n_layer + 1 norms");
+        const bool thr = c.digests == d.digests && c.tsv == d.tsv && c.fa_out == d.fa_out;
+        const bool enc_eq = obs_enc == unobs[0], enc_thr = unobs[0] == unobs[1] && unobs[0] == unobs[2], last_eq = c.last == obs_enc;
+        write_bin(dir + "/embd_enc.f32", (const float *)unobs[0].data(), unobs[0].size() / 4);
+        write_bin(dir + "/enc.d64", c.digests.data(), c.digests.size());
+        FILE * nf = std::fopen((dir + "/enc.tsv").c_str(), "w");
+        for (auto & l : c.tsv) std::fprintf(nf, "%s\n", l.c_str());
+        std::fclose(nf);
+        // the standalone graph against the scheduler's node at 1..8 threads; then the use_ref path, 1 thread
+        bool alone = true;
+        size_t ref_values = 0, ref_rows = 0;
+        for (int il = 0; il < n_layer; il++) {
+            fa_graph g(n_state, n_ctx, 1536);
+            g.set(c.fa_q[il], c.fa_k[il], c.fa_v[il]);
+            for (int th = 1; th <= 8; th++) { g.run(th); alone = alone && same(g.out, c.fa_out[il]); }
+            g.run(1, true);
+            std::vector<uint64_t> rd = row_digests(g.out, n_state);
+            write_bin(dir + "/b" + std::to_string(il) + "." + FA_REF + ".d64", rd.data(), rd.size());
+            const float * x = (const float *)g.out->data, * y = (const float *)c.fa_out[il].data();
+            for (size_t i = 0; i < (size_t)n_state * n_ctx; i++) ref_values += std::memcmp(x + i, y + i, 4) != 0;
+            const std::vector<uint64_t> & sd = c.by_key.at("b" + std::to_string(il) + ".fa");
+            for (size_t r = 0; r < rd.size(); r++) ref_rows += rd[r] != sd[r];
+        }
+        FILE * m = std::fopen((dir + "/encoder.tsv").c_str(), "w");
+        std::fprintf(m, "n_ctx\t%d\nn_state\t%d\nn_layer\t%d\nnodes_digested\t%zu\nfa_inputs_as_whisper_builds_them\t%s\n"
+                        "kv_pad_rows_1500_1535_all_zero\t%s\nthreads_1_vs_4_bit_identical\t%s\nembd_enc_observed_eq_unobserved\t%s\n"
+                        "embd_enc_1_2_4_threads_identical\t%s\nlast_node_eq_embd_enc\t%s\nstandalone_fa_eq_sched_1_to_8_threads\t%s\n"
+                        "use_ref_values_differing\t%zu\nuse_ref_rows_differing\t%zu\n",
+                     n_ctx, n_state, n_layer, c.tsv.size(), c.fa_shape ? "yes" : "NO", c.pad_zero ? "yes" : "NO", thr ? "yes" : "NO",
+                     enc_eq ? "yes" : "NO", enc_thr ? "yes" : "NO", last_eq ? "yes" : "NO", alone ? "yes" : "NO", ref_values, ref_rows);
+        std::fclose(m);
+        std::fprintf(stderr, "whisper_oracle: %s: %zu encoder nodes digested; attention inputs as built: %s; kv_pad padding +0: %s; "
+                             "1 vs 4 threads identical: %s; embd_enc observed = unobserved: %s, 1 = 2 = 4 threads: %s, = last node: %s; "
+                             "standalone attention = scheduler at 1..8 threads: %s; use_ref changes %zu values (%zu rows)\n",
+                     stem.c_str(), c.tsv.size(), c.fa_shape ? "yes" : "NO", c.pad_zero ? "yes" : "NO", thr ? "yes" : "NO",
+                     enc_eq ? "yes" : "NO", enc_thr ? "yes" : "NO", last_eq ? "yes" : "NO", alone ? "yes" : "NO", ref_values, ref_rows);
+    }
+    whisper_free(ctx);
+    return 0;
+}
+
+// --bench-attn <model.bin> <wav> <threads>: block 0's flash attention through the standalone graph above, its Q, K, V
+// computed beforehand from <wav> by the standalone graphs of 0.0.7 - 0.0.9 (K and V into a zeroed 1536-row f16 buffer, as
+// kv_pad), in a fresh process. wall = best of 10, cpu = CPU ms per compute over >= 1 s, mem = the node's output + the
+// K/V buffers + the work buffer, rss = VmHWM delta of the first compute.
+static int bench_attn(const char * model_path, const char * wav, int threads) {
+    whisper_context * ctx = load_quiet(model_path);
+    auto & tensors = model_tensors(ctx);
+    whisper_state * st = whisper_init_state(ctx);
+    std::vector<float> pcm = read_wav(wav);
+    check(whisper_pcm_to_mel_with_state(ctx, st, pcm.data(), (int)pcm.size(), 1) == 0, "pcm_to_mel failed");
+    auto & mel = *reinterpret_cast<mel_mirror *>((char *)st + VOAICE_OFF_STATE_MEL);
+    const int n_ctx = whisper_model_n_audio_ctx(ctx), n_state = whisper_model_n_audio_state(ctx);
+    std::vector<uint8_t> X, Q, K((size_t)1536 * n_state * 2, 0), V((size_t)1536 * n_state * 2, 0);
+    {
+        conv2_graph s(tensors, 2 * n_ctx, whisper_model_n_mels(ctx), true);
+        s.set(mel.data, mel.n_len);
+        s.run(threads);
+        X.assign((const uint8_t *)s.out->data, (const uint8_t *)s.out->data + ggml_nbytes(s.out));
+    }
+    {
+        mm_graph g(tensors, 0, "qkv", n_state, n_ctx);
+        mm_graph::set(g.in, X);
+        g.run(threads);
+        ggml_tensor * q = g.node.at("q_add"), * k = g.node.at("k_cpy"), * v = g.node.at("v_cpy");
+        Q.assign((const uint8_t *)q->data, (const uint8_t *)q->data + ggml_nbytes(q));
+        std::memcpy(K.data(), k->data, ggml_nbytes(k));
+        std::memcpy(V.data(), v->data, ggml_nbytes(v));
+    }
+    fa_graph g(n_state, n_ctx, 1536);
+    g.set(Q, K, V);
+    g.run(threads);
+    const size_t op_bytes = ggml_nbytes(g.out) + K.size() + V.size() + g.work.size();
+    const long before = status_kb("VmRSS:");
+    const bool reset = reset_peak_rss();
+    g.run(threads);
+    const long peak = reset ? status_kb("VmHWM:") : -1;
+    double best = 1e30;
+    for (int r = 0; r < 10; r++) { const double t = now_ms(); g.run(threads); best = std::min(best, now_ms() - t); }
+    const double c0 = cpu_seconds(), w0 = now_ms();
+    int reps = 0;
+    while (reps < 10 || now_ms() - w0 < 1000.0) { g.run(threads); reps++; }
+    const double c1 = cpu_seconds();
+    std::printf("bench-attn-reference threads %d wall_best_ms %.4f cpu_ms_per_call %.4f cpu_reps %d op_mem_kb %zu rss_peak_delta_kb %ld\n",
+                threads, best, (c1 - c0) * 1000.0 / reps, reps, (op_bytes + 1023) / 1024, peak >= 0 ? peak - before : -1);
+    whisper_free_state(st);
+    whisper_free(ctx);
+    return 0;
+}
+
+// --bench-encode <model.bin> <wav> <threads>: the WHOLE encoder as whisper runs it, whisper_encode_with_state (the conv
+// graph, then the encoder graph: mel -> embd_enc), on the state after whisper_pcm_to_mel_with_state, in a fresh process.
+// wall = best of 10, cpu = CPU ms per call over >= 1 s; mem = the two schedulers' compute buffers + kv_pad (the bytes
+// the state holds for the encoder besides the model; allocated by whisper_init_state); rss = VmHWM delta of the first call.
+static int bench_encode(const char * model_path, const char * wav, int threads) {
+    whisper_context * ctx = load_quiet(model_path);
+    whisper_state * st = whisper_init_state(ctx);
+    std::vector<float> pcm = read_wav(wav);
+    check(whisper_pcm_to_mel_with_state(ctx, st, pcm.data(), (int)pcm.size(), 1) == 0, "pcm_to_mel failed");
+    const int n_state = whisper_model_n_audio_state(ctx);
+    size_t bytes = (size_t)2 * 1536 * n_state * 2;   // kv_pad.k and .v (f16)
+    for (size_t off : {(size_t)VOAICE_OFF_STATE_SCHED_CONV, (size_t)VOAICE_OFF_STATE_SCHED_ENCODE}) {
+        ggml_backend_sched_t s = state_sched(st, off);
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(s); i++) bytes += ggml_backend_sched_get_buffer_size(s, ggml_backend_sched_get_backend(s, i));
+    }
+    const long before = status_kb("VmRSS:");
+    const bool reset = reset_peak_rss();
+    check(whisper_encode_with_state(ctx, st, 0, threads) == 0, "whisper_encode failed");
+    const long peak = reset ? status_kb("VmHWM:") : -1;
+    double best = 1e30;
+    for (int r = 0; r < 10; r++) {
+        const double t = now_ms();
+        check(whisper_encode_with_state(ctx, st, 0, threads) == 0, "whisper_encode failed");
+        best = std::min(best, now_ms() - t);
+    }
+    const double c0 = cpu_seconds(), w0 = now_ms();
+    int reps = 0;
+    while (reps < 5 || now_ms() - w0 < 2000.0) { check(whisper_encode_with_state(ctx, st, 0, threads) == 0, "whisper_encode failed"); reps++; }
+    const double c1 = cpu_seconds();
+    const std::vector<uint8_t> e = tensor_bytes(state_embd_enc(st, n_state));
+    std::printf("bench-encode-reference threads %d wall_best_ms %.4f cpu_ms_per_call %.4f cpu_reps %d op_mem_kb %zu rss_peak_delta_kb %ld embd_enc_digest %016llx\n",
+                threads, best, (c1 - c0) * 1000.0 / reps, reps, (bytes + 1023) / 1024, peak >= 0 ? peak - before : -1,
+                (unsigned long long)digest32((const float *)e.data(), e.size() / 4));
+    whisper_free_state(st);
+    whisper_free(ctx);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    if (argc >= 4 && std::strcmp(argv[1], "--encoder") == 0) return record_encoder(argv[2], argv[3], argc - 4, argv + 4);
+    if (argc == 5 && std::strcmp(argv[1], "--bench-attn") == 0) return bench_attn(argv[2], argv[3], std::atoi(argv[4]));
+    if (argc == 5 && std::strcmp(argv[1], "--bench-encode") == 0) return bench_encode(argv[2], argv[3], std::atoi(argv[4]));
     if (argc >= 4 && std::strcmp(argv[1], "--matmul") == 0) return record_matmul(argv[2], argv[3], argc - 4, argv + 4);
     if (argc == 4 && std::strcmp(argv[1], "--mm-nan") == 0) return record_mm_nan(argv[2], argv[3]);
     if (argc == 6 && std::strcmp(argv[1], "--bench-mm") == 0) return bench_mm(argv[2], argv[3], std::atoi(argv[4]), argv[5]);

@@ -17,6 +17,9 @@
 //!   voaice bench-norm <model.bin> <in.wav> norm|chain [--threads N]   (0.0.8) the NORM node, or norm -> * w -> + b: heap, wall, CPU, RSS
 //!   voaice qkv  <model.bin> <in.wav> [q.f32] [--threads N]     (0.0.9) block 0's attention inputs from the WAV: attn_ln -> Q + b, K and V + b as f16
 //!   voaice bench-mm <model.bin> <in.wav> q|fc1|fc2|qkv|mlp|block [--threads N]   (0.0.9) block 0's products: heap, wall, CPU, RSS
+//!   voaice encode <model.bin> <in.wav> [out.f32] [--threads N]  (v0.1.0) the whole encoder: the WAV -> mel -> embd_enc (sha256, digest)
+//!   voaice bench-attn <model.bin> <in.wav> [--threads N]        (v0.1.0) block 0's flash attention: heap, wall, CPU, RSS
+//!   voaice bench-encode <model.bin> <in.wav> [--threads N]      (v0.1.0) the whole encoder, mel -> embd_enc: heap, wall, CPU, RSS
 //!   voaice vclone check <file.voaice>...                   recompute each identity's vprint and compare every field
 //!   voaice vclone print <8 metrics>                         the dvscope/1 print of eight values (vprint.py's twin)
 //!   voaice vclone log <events.jsonl>                        verify a forge log's chain and say whether it is mintable
@@ -25,7 +28,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::process::ExitCode;
-use voaice::{conv, f16, gelu, matmul, measure, mel, model::Model, norm, ogg, resample, sha256, vclone, wav};
+use voaice::{attention, conv, encoder, f16, gelu, matmul, measure, mel, model::Model, norm, ogg, resample, sha256, vclone, wav};
 
 /// The system allocator, counting live heap bytes and their peak, so `bench-mel` can report the heap a call needs
 /// (std only: a `GlobalAlloc` wrapper, no crate). Thread stacks are mapped, not allocated, and are not counted.
@@ -368,6 +371,35 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("bench-mm") if args.len() == 4 && ["q", "fc1", "fc2", "qkv", "mlp", "block"].contains(&args[3].as_str()) => bench_mm(&args[1], &args[2], &args[3], threads),
+        Some("encode") if args.len() == 3 || args.len() == 4 => {
+            let m = Model::load_pinned(Path::new(&args[1]))?;
+            let pcm = wav::read(Path::new(&args[2]))?;
+            let t = mel::Tables::new();
+            let mel = mel::MelPlan::new(&t, &m.filters, m.filters_n_mel as usize, m.filters_n_fft as usize)?.run(&pcm, threads)?;
+            let enc = encoder::Encoder::new(&m)?;
+            drop(m);
+            let mut buf = encoder::EncoderBuffers::default();
+            let mut e = vec![0.0f32; enc.n_ctx * enc.n_state];
+            let start = std::time::Instant::now();
+            enc.encode_into(&mel.data, mel.n_len, 0, threads, &mut buf, &mut e);
+            let took = start.elapsed();
+            let eb: Vec<u8> = e.iter().flat_map(|v| v.to_le_bytes()).collect();
+            println!(
+                "embd_enc {} x {} frame-major f32, sha256 {}, digest {:016x}, {:.3} ms at {threads} thread(s) (mel -> conv -> {} blocks -> ln_post)",
+                enc.n_ctx,
+                enc.n_state,
+                sha256::hex(&sha256::digest(&eb)),
+                digest32(&e),
+                took.as_secs_f64() * 1e3,
+                enc.blocks.len()
+            );
+            if let Some(out) = args.get(3) {
+                std::fs::write(out, &eb).map_err(|e| format!("{out}: {e}"))?;
+            }
+            Ok(())
+        }
+        Some("bench-attn") if args.len() == 3 => bench_attn(&args[1], &args[2], threads),
+        Some("bench-encode") if args.len() == 3 => bench_encode(&args[1], &args[2], threads),
         Some("opus") if args.len() == 3 && args[1] == "info" => opus_info(&args[2]),
         Some("bench-opus") if args.len() == 2 => bench_opus(&args[1]),
         Some("resample") if args.len() == 2 || args.len() == 3 => {
@@ -431,7 +463,7 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("voaice {} (reference: whisper.cpp 080bbbe8, ggml 0.16.0)", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        _ => Err("usage: voaice info <model.bin> | voaice mel <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-mel <model.bin> <in.wav> [--threads N] | voaice bench-f16 init|rows | voaice conv1 <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-conv1 <model.bin> <in.wav> conv1|gelu [--threads N] | voaice conv <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-conv <model.bin> <in.wav> conv2|stage [--threads N] | voaice norm <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-norm <model.bin> <in.wav> norm|chain [--threads N] | voaice qkv <model.bin> <in.wav> [q.f32] [--threads N] | voaice bench-mm <model.bin> <in.wav> q|fc1|fc2|qkv|mlp|block [--threads N] | voaice opus info <file.opus> | voaice bench-opus <file.opus> | voaice resample <in.wav> [out.f32] | voaice bench-resample <in.wav> | voaice vclone check <file.voaice>... | voaice vclone print <8 metrics> | voaice vclone log <events.jsonl> | voaice version".into()),
+        _ => Err("usage: voaice info <model.bin> | voaice mel <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-mel <model.bin> <in.wav> [--threads N] | voaice bench-f16 init|rows | voaice conv1 <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-conv1 <model.bin> <in.wav> conv1|gelu [--threads N] | voaice conv <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-conv <model.bin> <in.wav> conv2|stage [--threads N] | voaice norm <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-norm <model.bin> <in.wav> norm|chain [--threads N] | voaice qkv <model.bin> <in.wav> [q.f32] [--threads N] | voaice bench-mm <model.bin> <in.wav> q|fc1|fc2|qkv|mlp|block [--threads N] | voaice encode <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-attn <model.bin> <in.wav> [--threads N] | voaice bench-encode <model.bin> <in.wav> [--threads N] | voaice opus info <file.opus> | voaice bench-opus <file.opus> | voaice resample <in.wav> [out.f32] | voaice bench-resample <in.wav> | voaice vclone check <file.voaice>... | voaice vclone print <8 metrics> | voaice vclone log <events.jsonl> | voaice version".into()),
     }
 }
 
@@ -516,6 +548,92 @@ fn bench_mm(model: &str, wavp: &str, what: &str, threads: usize) -> Result<(), S
         heap_peak.unwrap_or(0).div_ceil(1024),
         opt(bm.rss_peak_delta_kb.map(|v| v.to_string()))
     );
+    Ok(())
+}
+
+/// The oracle's digest32: 64-bit FNV-1a over the f32 bits packed two to a u64 word (little-endian), so `voaice encode`
+/// and `whisper_oracle --bench-encode` print comparable digests of `embd_enc`.
+fn digest32(x: &[f32]) -> u64 {
+    x.as_chunks::<2>().0.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, p| {
+        (h ^ (p[0].to_bits() as u64 | (p[1].to_bits() as u64) << 32)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// One line in `bench-*`'s shape.
+fn bench_line(name: &str, threads: usize, bm: &measure::Bench, heap: usize, extra: &str) {
+    let opt = |v: Option<String>| v.unwrap_or_else(|| "n/a".into());
+    println!(
+        "{name} threads {threads} wall_best_ms {:.4} cpu_ms_per_call {} cpu_reps {} heap_peak_kb {} rss_peak_delta_kb {}{extra}",
+        bm.wall_best_ms,
+        opt(bm.cpu_ms_per_call.map(|c| format!("{c:.4}"))),
+        bm.cpu_reps,
+        heap.div_ceil(1024),
+        opt(bm.rss_peak_delta_kb.map(|v| v.to_string()))
+    );
+}
+
+/// `voaice bench-attn <model> <wav>` — the same measurement as `whisper_oracle --bench-attn`: block 0's flash
+/// attention on Q, K, V computed beforehand from the WAV; its output and the widened K/V scratch allocated by the
+/// first call and kept (as the reference's graph keeps its tensors and work buffer).
+fn bench_attn(model: &str, wavp: &str, threads: usize) -> Result<(), String> {
+    let m = Model::load_pinned(Path::new(model))?;
+    let pcm = wav::read(Path::new(wavp))?;
+    let t = mel::Tables::new();
+    let mel = mel::MelPlan::new(&t, &m.filters, m.filters_n_mel as usize, m.filters_n_fft as usize)?.run(&pcm, 1)?;
+    let n_ctx = m.hparams.n_audio_ctx as usize;
+    let x = conv::ConvStage::new(&m)?.run(&mel.data, mel.n_len, 0, 2 * n_ctx, threads);
+    let b = matmul::Block::new(&m, 0)?;
+    drop(m);
+    let (mut q, mut k16, mut v16) = (vec![0.0f32; x.len()], vec![0u16; x.len()], vec![0u16; x.len()]);
+    b.qkv_into(&x, threads, &mut q, &mut k16, &mut v16, matmul::QkvTaps::default());
+    let a = attention::Attention::new(b.q.n, attention::n_kv_pad(n_ctx))?;
+    let (mut out, mut scratch): (Vec<f32>, Vec<f32>) = Default::default();
+    let mut heap_peak = None;
+    let bm = measure::bench(
+        || {
+            let live = LIVE.load(Relaxed);
+            PEAK.store(live, Relaxed);
+            if out.is_empty() {
+                out = vec![0.0; q.len()];
+            }
+            a.run_into(&q, &k16, &v16, threads, &mut scratch, &mut out);
+            heap_peak.get_or_insert(PEAK.load(Relaxed) - live);
+        },
+        10,
+        1.0,
+    );
+    bench_line("bench-attn", threads, &bm, heap_peak.unwrap_or(0), "");
+    Ok(())
+}
+
+/// `voaice bench-encode <model> <wav>` — the same measurement as `whisper_oracle --bench-encode`: the whole encoder
+/// from the mel (computed beforehand, as the reference's state holds it) to `embd_enc`. The buffers between stages are
+/// allocated by the first call and kept (an [`encoder::EncoderBuffers`] the caller owns); the widened weights are held
+/// with the model, outside the call, as the reference's f16 weights are.
+fn bench_encode(model: &str, wavp: &str, threads: usize) -> Result<(), String> {
+    let m = Model::load_pinned(Path::new(model))?;
+    let pcm = wav::read(Path::new(wavp))?;
+    let t = mel::Tables::new();
+    let mel = mel::MelPlan::new(&t, &m.filters, m.filters_n_mel as usize, m.filters_n_fft as usize)?.run(&pcm, 1)?;
+    let enc = encoder::Encoder::new(&m)?;
+    drop(m);
+    let mut buf = encoder::EncoderBuffers::default();
+    let mut out: Vec<f32> = Vec::new();
+    let mut heap_peak = None;
+    let bm = measure::bench(
+        || {
+            let live = LIVE.load(Relaxed);
+            PEAK.store(live, Relaxed);
+            if out.is_empty() {
+                out = vec![0.0; enc.n_ctx * enc.n_state];
+            }
+            enc.encode_into(&mel.data, mel.n_len, 0, threads, &mut buf, &mut out);
+            heap_peak.get_or_insert(PEAK.load(Relaxed) - live);
+        },
+        10,
+        2.0,
+    );
+    bench_line("bench-encode", threads, &bm, heap_peak.unwrap_or(0), &format!(" embd_enc_digest {:016x}", digest32(&out)));
     Ok(())
 }
 
