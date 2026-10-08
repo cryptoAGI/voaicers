@@ -16,7 +16,27 @@ whisper.cpp (upstream/PIN) in the same run; only then is its speed measured.
 - [x] The gate measures efficiency after the oracles: wall, CPU (`/proc/self/stat`), heap (counting allocators on
       both sides), RSS (`VmHWM`), at 1 and nproc threads, and 0.0.1 rebuilt from its tag in the same run.
 
-## Next: 0.0.3 — the streaming Ogg/Opus reader (see docs/ROADMAP.md for the decade to v0.1.0)
+## Done in 0.0.3 — f32 ↔ f16 and the GELU table (pulled ahead: the encoder's order of work starts here)
+- [x] `src/f16.rs`: the conversions this F16C build of ggml-cpu actually runs, read from the source and the binary.
+      `GGML_CPU_FP32_TO_FP16` is **not** `_cvtss_sh` on x86 — simd-mappings.h defines only the `COMPUTE_` macro for
+      F16C, so the kernels' macro falls through to ggml-impl.h's portable bit trick (NaN → `sign | 0x7E00`; GCC
+      contracted it into an FMA in libggml-cpu, which is exact there). `ggml_cpu_fp32_to_fp16` (mul_mat's and flash
+      attention's `from_float`, confirmed equal to the type traits' pointer) runs `vcvtps2ph` on blocks of 8 and 4
+      (NaN quieted, top payload bits kept) and the bit trick on the last `n % 4`. f16 → f32: the table (portable
+      `ggml_compute_fp16_to_fp32`) and `vcvtph2ps` agree on all 65,536.
+- [x] `src/gelu.rs`: `ggml_table_gelu_f16` as `ggml_cpu_init` fills it — `(0.5·x)·(tanhf((S·x)·fma(A·x, x, 1)) + 1)`,
+      glibc `tanhf`, then the portable f16 — and `ggml_vec_gelu_f32` (`x <= -10` → +0, `x >= 10` → x, else the
+      table at the portable f16 index; NaN takes the table path). Faster than the reference: the table held widened
+      (one lookup), AVX2 + F16C eight lanes with the NaN lanes re-indexed and one gather.
+- [x] Oracle (`whisper_oracle --f16`, tests `oracle_f16_*`, `oracle_f32_to_f16_*`, `oracle_gelu_*`): all 65,536 f16
+      patterns four ways; all 2³² f32 patterns three ways (the 1,429,656-value boundary set compared value by value, the
+      rest by per-chunk digest); the GELU table; the op on 1,495,192 values and on all 2³². Discriminators:
+      round-half-away (rejected) and the unfused GELU (rejected: 1 table entry, `0xBFFF`).
+- [ ] Not observed yet: the inlined scalar copies inside im2col and flash attention themselves (the same macro; the
+      oracle sees the row tail's copy, the table-init's copy and the GELU op's copy). They are checked when their
+      nodes are, through the scheduler callback (0.0.6 onward).
+
+## Next: 0.0.4 — the streaming Ogg/Opus reader (see docs/ROADMAP.md for the decade to v0.1.0)
 - [ ] Pages (capture pattern, version, header type, granule, serial, sequence, CRC-32 0x04C11DB7 unreflected, lacing),
       packets across pages, `OpusHead` (version, channels, pre-skip, input rate, gain, mapping) and `OpusTags`; the
       exact duration = last granule − pre-skip; bounded memory (one page at a time). Share the page format with
@@ -67,7 +87,7 @@ still does all the arithmetic, the oracle only observes. Kernel-level oracles, a
 `ggml_table_gelu_f16` is an **exported symbol** of `libggml-cpu.so` (dump all 65,536 entries and compare to the port's
 table), `ggml_cpu_fp32_to_fp16` / `ggml_vec_dot_f16` are reachable through `ggml_get_type_traits_cpu`.
 
-Order of work: GELU table → f32↔f16 conversions → `vec_dot_f16` on sampled real rows → conv1 → conv2 → one block
+Order of work: GELU table → f32↔f16 conversions (both done in 0.0.3) → `vec_dot_f16` on sampled real rows → conv1 → conv2 → one block
 (norm, attention, MLP) → all four → `embd_enc` bit-exact on the 8 test inputs.
 
 ### Stage 4 — decoder (plan)

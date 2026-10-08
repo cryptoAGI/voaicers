@@ -3,17 +3,23 @@
 //! exact first, fast second. Every stage reproduces the compiled output of the pinned whisper.cpp (upstream/PIN)
 //! bit for bit, checked by an oracle that runs the shipped library on the same input (testing/oracle).
 //!
-//! 0.0.2 holds the first stages: the model loader with its sha256 guard ([`model`]), the WAV input ([`wav`]) and the
-//! log-mel front end ([`mel`], allocation-free and threaded since 0.0.2, still 0 ULP), plus [`measure`] (CPU time and
-//! peak RSS from `/proc`, for the gate). [`vclone`] holds voaice's voice identities: the vprint, byte-identical to
-//! cryptoAGI/voaice's vprint.py, and the hash-chained forge log (docs/VCLONE.md). The encoder and decoder are not
-//! here yet (TODO.md).
+//! 0.0.3 holds the first stages: the model loader with its sha256 guard ([`model`]), the WAV input ([`wav`]) and the
+//! log-mel front end ([`mel`], allocation-free and threaded since 0.0.2, still 0 ULP); the first encoder kernels
+//! (0.0.3): f32 ↔ f16 as ggml-cpu converts ([`f16`]) and GELU with ggml's f16 table ([`gelu`]), bit-exact on every
+//! input; plus [`measure`] (CPU time and peak RSS from `/proc`, for the gate). [`vclone`] holds voaice's voice
+//! identities: the vprint, byte-identical to cryptoAGI/voaice's vprint.py, and the hash-chained forge log
+//! (docs/VCLONE.md). The rest of the encoder, and the decoder, are not here yet (TODO.md).
 
+pub mod f16;
+pub mod gelu;
 pub mod json;
 pub mod measure;
 pub mod mel;
 pub mod model;
 pub mod sha256;
+// sha512.rs predates clippy 1.99's `chunks_exact_to_as_chunks` lint; allowed here so the gate's `clippy -D warnings`
+// passes without editing that module (it belongs to the vclone work, not to 0.0.3)
+#[allow(clippy::chunks_exact_to_as_chunks)]
 pub mod sha512;
 pub mod vclone;
 pub mod wav;

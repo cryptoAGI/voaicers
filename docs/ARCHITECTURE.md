@@ -5,7 +5,7 @@ has one job, a public surface small enough to read, and an oracle that compares 
 library. A new stage is added beside the old ones, never inside them, and it ships only when its own oracle passes
 in the release gate.
 
-## The modules (0.0.2)
+## The modules (0.0.3)
 
 | module | job | public surface | proven by |
 |---|---|---|---|
@@ -13,9 +13,11 @@ in the release gate.
 | `src/model.rs` | the ggml whisper model file: hparams, mel filterbank, vocab and special tokens, every tensor's name/type/shape/offset; the sha256 **pin** that refuses an unknown file | `Model`, `Hparams`, `Pin`, `Tensor`, `Dtype`, `Specials`, `expected_tensors()` | `oracle_model_hparams_tensors_vocab_filters`, `guard_refuses_a_modified_model` |
 | `src/wav.rs` | 16-bit PCM mono 16 kHz WAV → f32, refusing anything else (no silent resampling) | `read()`, `parse()` | `oracle_pcm_input_identical` |
 | `src/mel.rs` | whisper's log-mel front end, in whisper.cpp's own arithmetic order (its radix-2 FFT, mixed f32/f64 band sum, libm symbols); since 0.0.2 allocation-free per frame (a `MelPlan` holds the invariants), SIMD across independent lanes only, threaded by frames | `Tables`, `MelPlan`, `Mel`, `log_mel_spectrogram()`, `log_mel_spectrogram_threads()` | `oracle_mel_bit_exact` (0 ULP), `oracle_mel_threads_bit_identical`, `oracle_mel_discriminates_fused_fft` |
+| `src/f16.rs` | (0.0.3) f32 ↔ f16 exactly as ggml-cpu converts on an F16C build: the portable bit trick (`GGML_CPU_FP32_TO_FP16` — im2col, GELU, row tails), the `vcvtps2ph` row of `ggml_cpu_fp32_to_fp16` (mul_mat, flash attention) and a software model of it; f16 → f32 (the table, `vcvtph2ps`). They differ only on NaN, and the rows keep the reference's NaN bits by position | `fp16_to_fp32()`, `fp32_to_fp16()`, `fp32_to_fp16_f16c()`, `fp32_to_fp16_row()`, `fp16_to_fp32_row()` | `oracle_f16_to_f32_all_65536`, `oracle_f32_to_f16_boundary_set`, `oracle_f32_to_f16_every_pattern` (all 2³²), `oracle_f16_discriminates_round_half_away` |
+| `src/gelu.rs` | (0.0.3) `ggml_gelu` as the encoder runs it: `ggml_table_gelu_f16` built as `ggml_cpu_init` builds it (glibc `tanhf`, GCC's FMA in `A·x·x + 1`), the op's ±10 clamps and f16 index; held widened to f32 for one lookup, eight lanes at once with AVX2 + F16C | `Gelu` (`new`, `row`, `row_scalar`, `f16`), `gelu_f32()`, `table_with()` | `oracle_gelu_table_all_65536`, `oracle_gelu_op` (all 2³²), `oracle_gelu_table_discriminates_unfused` |
 | `src/measure.rs` | CPU seconds, RSS and its peak from `/proc` (no libc binding), and the `bench` loop the gate uses | `cpu_seconds()`, `rss_kb()`, `peak_rss_kb()`, `reset_peak_rss()`, `bench()` | unit test; its numbers are only read after the oracles pass |
 | `src/lib.rs` | the crate root, and `ulp_distance()` every oracle reports in | `ulp_distance()` | — |
-| `src/main.rs` | the CLI: `voaice info · mel · bench-mel · version`; a counting allocator for `bench-mel`'s heap peak | — | the gate runs it |
+| `src/main.rs` | the CLI: `voaice info · mel · bench-mel · bench-f16 · version`; a counting allocator for `bench-mel`'s heap peak | — | the gate runs it |
 
 The pattern each module follows is the one bankml uses: **a pure function of its inputs, the same float operations
 in the same order as the reference, and no hidden state.** That is what makes a module testable alone, and what

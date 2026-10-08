@@ -6,6 +6,8 @@
 //
 //   whisper_oracle <model.bin> <outdir> [wav ...]
 //   whisper_oracle --bench-mel <model.bin> <wav> <threads>
+//   whisper_oracle --f16 <outdir>                 (0.0.3) the f32<->f16 conversions and GELU of the shipped libggml*
+//   whisper_oracle --bench-f16 <what>             (0.0.3) one measurement of them, see bench_f16
 //
 // --bench-mel measures the reference's whisper_pcm_to_mel_with_state the way `voaice bench-mel` measures voaice's,
 // in a fresh process each: the heap bytes live at the first call's peak (operator new counted, below), peak RSS of
@@ -26,13 +28,34 @@
 //     transcript.tsv       whisper_full (greedy, see params below) — per token: segment, index, id, t0, t1,
 //                          p as f32 bits, text as hex; per segment: t0, t1, text
 //
+// --f16 writes (0.0.3; nothing of whisper is loaded, only libggml-base / libggml-cpu are called):
+//   f16_to_f32.{base,table,cpu_row,cpu_tail}.u32  all 65,536 f16 patterns widened by ggml_fp16_to_fp32 (libggml-base),
+//                          read from ggml_table_f32_f16 (exported; filled by ggml_cpu_init), by ggml_cpu_fp16_to_fp32
+//                          over the whole array (its F16C blocks) and one value per call (its scalar tail)
+//   f32_inputs.u32         the boundary set: every f16 value, its f32 neighbours, every halfway point between adjacent
+//                          f16 values and its neighbours, the overflow and underflow edges, subnormals, infinities,
+//                          NaN payloads, +-10 and its neighbours, then 2^20 xorshift patterns (a multiple of 8)
+//   f32_to_f16.{base,cpu_row,cpu_tail}.u16  those inputs narrowed by ggml_fp32_to_fp16 (libggml-base), by
+//                          ggml_cpu_fp32_to_fp16 over the whole array (F16C blocks) and three values per call (the
+//                          scalar tail, i.e. ggml-cpu's own inlined GGML_CPU_FP32_TO_FP16)
+//   f32_to_f16.{base,cpu_row,cpu_tail}.digest  ALL 2^32 f32 patterns, narrowed the same three ways: per chunk of
+//                          65,536 (chunk c = the high 16 bits), a 64-bit FNV-1a over the outputs packed four to a
+//                          u64 (65,536 u64 little-endian per file)
+//   gelu_table.u16         ggml_table_gelu_f16, all 65,536 entries (exported)
+//   gelu.u32               ggml_gelu on f32_inputs then all 65,536 f16 values widened, through a ggml graph computed
+//                          by the shipped CPU backend (ggml_graph_compute_with_ctx, 1 thread)
+//   gelu.digest            ggml_gelu on ALL 2^32 f32 patterns, per chunk of 65,536, outputs packed two to a u64
+//   f16.tsv                counts, F16C present, from_float of F16 == ggml_cpu_fp32_to_fp16, gelu 1 vs 4 threads
+//
 // The internals (mel, filters, tensor map) are read at offsets the layout probe computed from the same source with
 // the same compiler (layout.h); each offset is self-checked against a public getter before use.
 #include "whisper.h"
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "layout.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -45,6 +68,12 @@
 #include <atomic>
 #include <malloc.h>
 #include <new>
+#include <chrono>
+#include <algorithm>
+
+// exported data symbols of libggml-cpu.so (nm -D: B), filled by ggml_cpu_init
+extern "C" ggml_fp16_t ggml_table_gelu_f16[1 << 16];
+extern "C" float ggml_table_f32_f16[1 << 16];
 
 // ---- mirrors of the internal structs at the probed offsets (standard-layout prefixes) --------------------------
 struct mel_mirror     { int n_len; int n_len_org; int n_mel; std::vector<float> data; };
@@ -249,7 +278,215 @@ static int bench_mel(const char * model_path, const char * wav, int threads) {
     return 0;
 }
 
+
+// ---- 0.0.3: f32 <-> f16 and GELU, as the shipped libggml-base / libggml-cpu compute them ------------------------
+template <class T> static void write_bin(const std::string & path, const T * data, size_t n) {
+    FILE * f = std::fopen(path.c_str(), "wb");
+    if (!f) die(("cannot write " + path).c_str());
+    if (std::fwrite(data, sizeof(T), n, f) != n) die("short write");
+    std::fclose(f);
+}
+static float bits_f32(uint32_t u) { float x; std::memcpy(&x, &u, 4); return x; }
+// 64-bit FNV-1a over u64 words: the f16 outputs four to a word, the f32 outputs two (little-endian packing)
+static uint64_t digest16(const uint16_t * y, size_t n) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i + 4 <= n; i += 4) {
+        uint64_t w = (uint64_t)y[i] | (uint64_t)y[i+1] << 16 | (uint64_t)y[i+2] << 32 | (uint64_t)y[i+3] << 48;
+        h = (h ^ w) * 0x100000001b3ULL;
+    }
+    return h;
+}
+static uint64_t digest32(const float * y, size_t n) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i + 2 <= n; i += 2) {
+        uint64_t w = (uint64_t)f32_bits(y[i]) | (uint64_t)f32_bits(y[i+1]) << 32;
+        h = (h ^ w) * 0x100000001b3ULL;
+    }
+    return h;
+}
+
+// the boundary set (see the header); built from integer arithmetic only, so no conversion under test shapes it
+static std::vector<uint32_t> f32_inputs() {
+    std::vector<uint32_t> v;
+    auto with_neighbours = [&](uint32_t u) {
+        v.push_back(u);
+        if ((u & 0x7FFFFFFF) != 0) v.push_back(u - 1);                          // toward zero (stays the same sign)
+        if (((u + 1) & 0x7F800000) != 0x7F800000) v.push_back(u + 1);         // away from zero, still finite
+    };
+    auto exact = [](uint32_t h) -> double {    // the exact value of a finite f16
+        const int e = (h >> 10) & 31; const double m = h & 0x3FF;
+        const double a = e == 0 ? std::ldexp(m, -24) : std::ldexp(1024 + m, e - 25);
+        return (h & 0x8000) ? -a : a;
+    };
+    auto f32bits = [](double d) { float f = (float)d; if ((double)f != d) die("an input is not exact in f32"); return f32_bits(f); };
+    for (uint32_t h = 0; h < 0x10000; h++) {
+        if ((h & 0x7C00) == 0x7C00) continue;                                   // inf and NaN: below
+        with_neighbours(f32bits(exact(h)));
+        const uint32_t mag = h & 0x7FFF;
+        const double next = mag == 0x7BFF ? ((h & 0x8000) ? -65536.0 : 65536.0) // past the largest: the overflow edge
+                                          : exact(h + 1);
+        with_neighbours(f32bits((exact(h) + next) / 2));                       // the tie (exact: 11 bits in 24)
+    }
+    const uint32_t specials[] = {
+        0x00000000, 0x00000001, 0x00000002, 0x00000003, 0x00400000, 0x007FFFFF, 0x00800000, 0x00800001, // subnormals
+        0x33000000, 0x32FFFFFF, 0x33000001, 0x33800000, 0x33C00000, 0x2F800000, 0x0D800000,             // underflow
+        0x477FEFFF, 0x477FF000, 0x477FF001, 0x47800000, 0x7F7FFFFF, 0x501502F9,                         // overflow
+        0x7F800000,                                                                                      // inf
+        0x7F800001, 0x7F800FFF, 0x7F801000, 0x7F802000, 0x7FA00000, 0x7FBFFFFF, 0x7FC00000, 0x7FC00001,  // NaNs
+        0x7FDFE000, 0x7FFFE000, 0x7FFFFFFF, 0x7F8FFFFF, 0x7FB00001,
+    };
+    for (uint32_t u : specials) { v.push_back(u); v.push_back(u | 0x80000000); }
+    for (int k = -20; k <= 20; k++) {                                           // +-10, the GELU clamps
+        v.push_back((uint32_t)((int64_t)0x41200000 + k)); v.push_back((uint32_t)((int64_t)0xC1200000 + k));
+    }
+    uint64_t x = 0x9E3779B97F4A7C15ULL;                                         // xorshift64
+    for (int i = 0; i < (1 << 20); i++) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; v.push_back((uint32_t)x); }
+    while (v.size() % 8) v.push_back(0);
+    return v;
+}
+
+// a ggml graph of one op, gelu, over n f32 values: what the encoder's ggml_gelu runs, by the shipped CPU backend
+struct gelu_graph {
+    ggml_context * ctx; ggml_tensor * in; ggml_tensor * out; ggml_cgraph * gf;
+    explicit gelu_graph(int64_t n) {
+        ggml_init_params p = { (size_t)n * 8 + ggml_graph_overhead() + (16u << 20), nullptr, false };
+        ctx = ggml_init(p);
+        check(ctx != nullptr, "ggml_init failed");
+        in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        out = ggml_gelu(ctx, in);
+        gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, out);
+    }
+    void run(const float * x, float * y, int threads) {
+        std::memcpy(in->data, x, ggml_nbytes(in));
+        check(ggml_graph_compute_with_ctx(ctx, gf, threads) == GGML_STATUS_SUCCESS, "graph compute failed");
+        std::memcpy(y, out->data, ggml_nbytes(out));
+    }
+    ~gelu_graph() { ggml_free(ctx); }
+};
+
+static int record_f16(const std::string & outdir) {
+    if (mkdir(outdir.c_str(), 0755) != 0 && errno != EEXIST) die("cannot create outdir (its parent must exist)");
+    ggml_cpu_init();
+    const int n16 = 1 << 16;
+
+    // f16 -> f32, all 65,536 patterns, four ways
+    std::vector<uint16_t> all(n16);
+    for (int i = 0; i < n16; i++) all[i] = (uint16_t)i;
+    std::vector<float> w(n16);
+    for (int i = 0; i < n16; i++) w[i] = ggml_fp16_to_fp32(all[i]);
+    write_bin(outdir + "/f16_to_f32.base.u32", w.data(), n16);
+    write_bin(outdir + "/f16_to_f32.table.u32", ggml_table_f32_f16, n16);
+    ggml_cpu_fp16_to_fp32(all.data(), w.data(), n16);
+    write_bin(outdir + "/f16_to_f32.cpu_row.u32", w.data(), n16);
+    for (int i = 0; i < n16; i++) ggml_cpu_fp16_to_fp32(&all[i], &w[i], 1);
+    write_bin(outdir + "/f16_to_f32.cpu_tail.u32", w.data(), n16);
+
+    // f32 -> f16 on the boundary set, three ways
+    const std::vector<uint32_t> in_bits = f32_inputs();
+    const size_t n = in_bits.size();
+    std::vector<float> in(n);
+    for (size_t i = 0; i < n; i++) in[i] = bits_f32(in_bits[i]);
+    write_bin(outdir + "/f32_inputs.u32", in_bits.data(), n);
+    std::vector<uint16_t> h(n);
+    for (size_t i = 0; i < n; i++) h[i] = ggml_fp32_to_fp16(in[i]);
+    write_bin(outdir + "/f32_to_f16.base.u16", h.data(), n);
+    ggml_cpu_fp32_to_fp16(in.data(), h.data(), (int64_t)n);
+    write_bin(outdir + "/f32_to_f16.cpu_row.u16", h.data(), n);
+    for (size_t i = 0; i < n; i += 3) ggml_cpu_fp32_to_fp16(&in[i], &h[i], (int64_t)std::min<size_t>(3, n - i));
+    write_bin(outdir + "/f32_to_f16.cpu_tail.u16", h.data(), n);
+
+    // the GELU table, and the op on the boundary set followed by every f16 value widened
+    write_bin(outdir + "/gelu_table.u16", ggml_table_gelu_f16, n16);
+    std::vector<float> gx(in);
+    for (int i = 0; i < n16; i++) gx.push_back(ggml_table_f32_f16[i]);
+    std::vector<float> g1(gx.size()), g4(gx.size());
+    {
+        gelu_graph g((int64_t)gx.size());
+        g.run(gx.data(), g1.data(), 1);
+        g.run(gx.data(), g4.data(), 4);
+    }
+    write_bin(outdir + "/gelu.u32", g1.data(), g1.size());
+    const bool gelu_threads_agree = std::memcmp(g1.data(), g4.data(), g1.size() * 4) == 0;
+
+    // every f32 pattern: 65,536 chunks of 65,536, digested per chunk
+    std::vector<uint64_t> d_base(n16), d_row(n16), d_tail(n16), d_gelu(n16);
+    {
+        const int per = 16;                         // gelu in graphs of 16 chunks (2^20 values) to amortize the setup
+        gelu_graph g((int64_t)n16 * per);
+        std::vector<float> x((size_t)n16 * per), y((size_t)n16 * per);
+        std::vector<uint16_t> o(n16);
+        for (int c0 = 0; c0 < n16; c0 += per) {
+            for (int c = c0; c < c0 + per; c++) {
+                float * xc = &x[(size_t)(c - c0) * n16];
+                for (int i = 0; i < n16; i++) xc[i] = bits_f32((uint32_t)c << 16 | (uint32_t)i);
+                for (int i = 0; i < n16; i++) o[i] = ggml_fp32_to_fp16(xc[i]);
+                d_base[c] = digest16(o.data(), n16);
+                ggml_cpu_fp32_to_fp16(xc, o.data(), n16);
+                d_row[c] = digest16(o.data(), n16);
+                for (int i = 0; i < n16; i += 3) ggml_cpu_fp32_to_fp16(xc + i, o.data() + i, std::min(3, n16 - i));
+                d_tail[c] = digest16(o.data(), n16);
+            }
+            g.run(x.data(), y.data(), 1);
+            for (int c = c0; c < c0 + per; c++) d_gelu[c] = digest32(&y[(size_t)(c - c0) * n16], n16);
+        }
+    }
+    write_bin(outdir + "/f32_to_f16.base.digest", d_base.data(), n16);
+    write_bin(outdir + "/f32_to_f16.cpu_row.digest", d_row.data(), n16);
+    write_bin(outdir + "/f32_to_f16.cpu_tail.digest", d_tail.data(), n16);
+    write_bin(outdir + "/gelu.digest", d_gelu.data(), n16);
+
+    const bool from_float = ggml_get_type_traits_cpu(GGML_TYPE_F16)->from_float == (ggml_from_float_t)ggml_cpu_fp32_to_fp16;
+    int same_base_tail = 0, same_base_row = 0;
+    for (int c = 0; c < n16; c++) { same_base_tail += d_base[c] == d_tail[c]; same_base_row += d_base[c] == d_row[c]; }
+    FILE * f = std::fopen((outdir + "/f16.tsv").c_str(), "w");
+    std::fprintf(f, "f32_inputs\t%zu\ngelu_inputs\t%zu\nf16c\t%s\nfrom_float_f16_is_ggml_cpu_fp32_to_fp16\t%s\n"
+                    "gelu_threads_1_vs_4_bit_identical\t%s\nchunks_base_eq_cpu_tail\t%d\nchunks_base_eq_cpu_row\t%d\n",
+                 n, gx.size(), __builtin_cpu_supports("f16c") ? "yes" : "no", from_float ? "yes" : "NO",
+                 gelu_threads_agree ? "yes" : "NO", same_base_tail, same_base_row);
+    std::fclose(f);
+    std::fprintf(stderr, "whisper_oracle: f16: 65536 f16 widened 4 ways; %zu f32 narrowed 3 ways; all 2^32 f32 digested "
+                         "(chunks where libggml-base == ggml-cpu tail: %d, == ggml-cpu row: %d of 65536); gelu table; "
+                         "gelu op on %zu values (1 vs 4 threads identical: %s) and on all 2^32\n",
+                 n, same_base_tail, same_base_row, gx.size(), gelu_threads_agree ? "yes" : "NO");
+    return 0;
+}
+
+// --bench-f16 <what>, one line, in a fresh process:
+//   init   the wall time of the first ggml_cpu_init (it builds the GELU, quick-GELU and f32<-f16 tables, and two
+//          256-entry ones); nothing before it initializes ggml-cpu
+//   rows   ggml_cpu_fp32_to_fp16 and ggml_cpu_fp16_to_fp32 on 384 x 1500 values (one encoder activation), and the
+//          GELU op on 1536 x 1500 (the encoder's MLP) through a graph at 1 thread; best of 10 each
+static double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+static int bench_f16(const char * what) {
+    if (std::strcmp(what, "init") == 0) {
+        const double t0 = now_ms();
+        ggml_cpu_init();
+        std::printf("bench-f16-reference init_ms %.3f\n", now_ms() - t0);
+        return 0;
+    }
+    if (std::strcmp(what, "rows") != 0) die("--bench-f16 init | rows");
+    ggml_cpu_init();
+    const int n = 384 * 1500, ng = 1536 * 1500;
+    std::vector<float> x(ng), y(ng);
+    std::vector<uint16_t> h(n);
+    uint64_t s = 1;
+    for (int i = 0; i < ng; i++) { s = s * 6364136223846793005ULL + 1442695040888963407ULL; x[i] = (float)((int64_t)(s >> 11) % 2000001 - 1000000) * 1e-5f; }
+    auto best = [](auto && f) { f(); double b = 1e30; for (int r = 0; r < 10; r++) { const double t = now_ms(); f(); b = std::min(b, now_ms() - t); } return b; };
+    const double to16 = best([&] { ggml_cpu_fp32_to_fp16(x.data(), h.data(), n); });
+    const double to32 = best([&] { ggml_cpu_fp16_to_fp32(h.data(), y.data(), n); });
+    gelu_graph g(ng);
+    const double gelu = best([&] { g.run(x.data(), y.data(), 1); });
+    // the graph run includes two memcpy of the tensor (in and out); measured alone so it can be taken off
+    const double copies = best([&] { std::memcpy(g.in->data, x.data(), (size_t)ng * 4); std::memcpy(y.data(), g.out->data, (size_t)ng * 4); });
+    std::printf("bench-f16-reference fp32_to_fp16_row_ms %.3f fp16_to_fp32_row_ms %.3f gelu_ms %.3f gelu_copies_ms %.3f n_row %d n_gelu %d\n",
+                to16, to32, gelu, copies, n, ng);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    if (argc == 3 && std::strcmp(argv[1], "--f16") == 0) return record_f16(argv[2]);
+    if (argc == 3 && std::strcmp(argv[1], "--bench-f16") == 0) return bench_f16(argv[2]);
     if (argc == 5 && std::strcmp(argv[1], "--bench-mel") == 0) return bench_mel(argv[2], argv[3], std::atoi(argv[4]));
     if (argc < 3) die("usage: whisper_oracle <model.bin> <outdir> [wav ...]");
     const std::string outdir = argv[2];

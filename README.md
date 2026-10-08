@@ -14,7 +14,7 @@ Built the way [bankml](https://github.com/cryptoAGI/bankml) was built against ll
   <img src="https://img.shields.io/badge/dependencies-0-56D364?style=flat-square" alt="zero dependencies">
   <img src="https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-2563EB?style=flat-square" alt="MIT OR Apache-2.0">
   <img src="https://img.shields.io/badge/log--mel-bit--exact%20vs%20whisper.cpp%20(ggml%200.16.0)-39D3C7?style=flat-square" alt="log-mel bit-exact">
-  <img src="https://img.shields.io/badge/status-0.0.2%20%C2%B7%20loader%20%2B%20front%20end%206%C3%97%20faster%2C%200%20ULP%3B%20no%20transcript%20yet-F59E0B?style=flat-square" alt="status">
+  <img src="https://img.shields.io/badge/status-0.0.3%20%C2%B7%20loader%2C%20front%20end%2C%20f16%20%2B%20GELU%20bit--exact%3B%20no%20transcript%20yet-F59E0B?style=flat-square" alt="status">
   <a href="https://github.com/cryptoAGI/voaicers/releases/latest"><img src="https://img.shields.io/github/v/release/cryptoAGI/voaicers?style=flat-square&label=release&color=0ECB81" alt="latest release"></a>
 </p>
 
@@ -27,13 +27,16 @@ mindX's production speech-to-text is whisper.cpp built against ggml 0.16.0, runn
 *a result counts only when an oracle has checked it, and the oracle is the reference's own compiled library run on
 the same input, compared by bit pattern.* Speed is measured only after that.
 
-**0.0.2 does not transcribe yet.** It is the first three stages, the front end now optimized (0.0.2) with its bits unchanged:
+**0.0.3 does not transcribe yet.** It is the first three stages, the front end optimized (0.0.2) with its bits unchanged,
+and the first two encoder kernels (0.0.3): the f32 ↔ f16 conversions and GELU.
 
 | stage | what | oracle result (this machine, 2026-10-07) |
 |---|---|---|
 | 0 | the oracle harness: links the pinned `libwhisper.so` and records what it computes | built; self-checking (below) |
 | 1 | the model loader + sha256 guard | **167 / 167 tensors** byte-identical to what whisper's loader holds (sha256 each, 77,110,272 bytes); hparams, filterbank (80×201, bit-exact), **51,864 / 51,864** vocab strings |
 | 2 | the log-mel front end — allocation-free, threaded (0.0.2) | **2,316,640 / 2,316,640** f32 values bit-exact over 8 inputs, **max 0 ULP**; at 2, 3, 4 and 8 threads identical to 1 thread (9,266,560 values); the fused-FFT discriminator still rejected (25,242 values differ) |
+| 3a | f32 ↔ f16 as ggml-cpu converts (0.0.3): the portable bit trick, the F16C row, f16 → f32 | **65,536 / 65,536** f16 patterns four ways; **all 4,294,967,296 f32 patterns** three ways (1,429,656 boundary values compared one by one, the rest by per-chunk digest); round-half-away rejected |
+| 3b | GELU (0.0.3): `ggml_table_gelu_f16` and the op with its ±10 clamps | **65,536 / 65,536** table entries; the op on 1,495,192 values and on all 2³² f32 patterns; the unfused GELU rejected (it differs in one entry) |
 
 Efficiency, measured only after the oracles passed in the same gate run (0.0.2, this laptop, 4 CPUs at load ≈ 7.6,
 so ±20 % is noise): the mel is **6.1× faster than 0.0.1** (rebuilt from its tag in the same run) and **6.8× faster
@@ -42,6 +45,14 @@ JFK ×3: 24.9 ms against 198.8), at **one sixth of the reference's CPU time** (J
 **one third of its heap** (JFK 1,282 KiB — exactly the 80×4,100 output — against 3,868; the 30-s padded copy of the
 audio is gone). At 4 threads it is 5.9× the reference at 4. Full record:
 [`testing/results/0.0.2.txt`](testing/results/0.0.2.txt) (0.0.1's: [`0.0.1.txt`](testing/results/0.0.1.txt)).
+
+0.0.3, in its own gate run after its oracles (same laptop, 1-minute load 7.4 at the start, falling from about 30,
+so ±20 % is noise and more): the GELU op on 1,536 × 1,500 values (the encoder MLP's size) takes **6.0 ms against the
+reference's 26.0** at one thread (**4.3×**; an earlier run of the same gate, at a higher load, measured 6.2 against 18.4,
+2.96×). The gain is the table held widened to f32 (one lookup instead of two) and eight lanes with a gather. The
+f32↔f16 rows run the same `vcvtps2ph`/`vcvtph2ps` as the reference, so their 1.24× and 1.07× are noise (0.90× and
+1.01× in the earlier run); the GELU table builds in 2.5 ms against `ggml_cpu_init`'s 3.2, which also fills tables
+voaice does not need. Record: [`testing/results/0.0.3.txt`](testing/results/0.0.3.txt).
 
 **A determinism note on the reference itself:** whisper.cpp's transcript depends on its thread count. At 1 thread it
 is identical run to run; at 4 threads the token ids and text stay the same but every token's probability differs in
@@ -115,6 +126,7 @@ testing/release_gate.sh                                # the gate: reference, pi
 target/release/voaice info models/ggml-tiny.en.bin     # refuses any file that is not pinned, and says why
 target/release/voaice mel  models/ggml-tiny.en.bin in.wav [out.f32] [--threads N]
 target/release/voaice bench-mel models/ggml-tiny.en.bin in.wav [--threads N]   # heap, wall, CPU, RSS
+target/release/voaice bench-f16 init|rows                                     # the GELU table's build; f16 rows, GELU
 ```
 
 Input: 16-bit PCM, mono, 16 kHz WAV; anything else is refused, not converted (resampling is a later stage).
@@ -124,7 +136,7 @@ Disk: the reference checkout and build are about 160 MB in `upstream/` (gitignor
 
 ```
 Cargo.toml  rust-toolchain.toml      zero dependencies; Rust 1.99.0 pinned like bankml
-src/        sha256.rs model.rs wav.rs mel.rs measure.rs lib.rs main.rs
+src/        sha256.rs model.rs wav.rs mel.rs f16.rs gelu.rs measure.rs lib.rs main.rs
 tests/oracle.rs                      the oracle comparisons (#[ignore]: need the model and a recorded oracle)
 testing/oracle/                      build.sh, layout_probe.cpp, whisper_oracle.cpp
 testing/make_audio.py                the 8 test WAVs, pinned in testing/pins/audio.sha256
@@ -157,13 +169,15 @@ go up 0.0.1 at a time, with a milestone at every tenth step. The order of work:
   against whisper.cpp at ggml 0.16.0.
 - [x] **0.0.2:** the mel optimised: no allocations, optional threads, CPU and memory measured, bits unchanged
   (6.1× faster than 0.0.1, 6.8× the reference at one thread, a third of its heap; [record](testing/results/0.0.2.txt)).
-- [ ] **0.0.3–0.0.9:** the streaming Ogg/Opus reader, the resampler whisper-cli uses, conv1, the GELU table, conv2 +
-  positions, layer norm, the f16 dot in AVX2 lane order — one per step, each bit-exact ([plan](docs/ROADMAP.md)).
+- [x] **0.0.3:** f32 ↔ f16 and GELU, the first encoder kernels: every f16 and every f32 bit pattern converted as
+  ggml-cpu converts it (the portable bit trick and the F16C row), the GELU table 65,536 / 65,536 and the op on all
+  2³² inputs; the GELU op 4.3× the reference at one thread (3.0× in an earlier run: noisy host), the rows at parity (the same `vcvtps2ph`) ([record](testing/results/0.0.3.txt)).
+- [ ] **0.0.4–0.0.9:** the streaming Ogg/Opus reader, the resampler whisper-cli uses, conv1, conv2 + positions, layer
+  norm, the f16 dot in AVX2 lane order — one per step, each bit-exact ([plan](docs/ROADMAP.md)).
 - [ ] **Stage 0b:** pin `ggml-base.en.bin` (production's default model). Record the VPS's ISA so the oracle
   reproduces production's native ggml-cpu kernels (Zen 3, AVX2 + FMA).
-- [ ] **Stage 3, the encoder (0.1.0):** the GELU f16 table (the exported `ggml_table_gelu_f16`), f32↔f16
-  conversion, `vec_dot_f16` in AVX2 lane order, conv1 and conv2 through im2col, layer norm, flash attention, four
-  blocks, then `embd_enc` bit-exact. Each intermediate is observed through ggml's scheduler callback.
+- [ ] **Stage 3, the encoder (0.1.0):** ~~the GELU f16 table, f32↔f16 conversion~~ (0.0.3), `vec_dot_f16` in AVX2
+  lane order, conv1 and conv2 through im2col, layer norm, flash attention, four blocks, then `embd_enc` bit-exact. Each intermediate is observed through ggml's scheduler callback.
 - [ ] **Stage 4, the decoder (0.2.0):** cross-attention, the f16 KV cache, and all 51,864 logits bit-exact per
   step through `whisper_get_logits_from_state`.
 - [ ] **Stage 5, the transcript (0.3.0):** the greedy loop, logit filters, timestamp rules, 30-second seek.

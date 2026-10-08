@@ -5,11 +5,14 @@
 # Steps, each must pass:
 #   1. the reference: upstream/whisper.cpp at upstream/PIN's commit, built; the oracle harness built against it
 #   2. the inputs: the model's sha256 equals its pin; the test audio equals testing/pins/audio.sha256
-#   3. the record: the shipped library's model view, mel and transcripts (testing/oracle/bin/whisper_oracle)
+#   3. the record: the shipped library's model view, mel and transcripts (testing/oracle/bin/whisper_oracle); and
+#      (0.0.3) libggml-base / libggml-cpu's f32<->f16 conversions and GELU, on every f16 and every f32 pattern
 #   4. voaice.rs: cargo build, unit tests, clippy, then the oracle comparisons (bit patterns, never tolerances)
 #   5. efficiency, only after 4 passed: the mel's wall time (best of 10), CPU time per call, heap and RSS peaks, voaice
 #      against the reference (each in a fresh process: `voaice bench-mel`, `whisper_oracle --bench-mel`), at 1 thread
-#      and at N = nproc threads, and against 0.0.1's code path rebuilt from its tag in the same run
+#      and at N = nproc threads, and against 0.0.1's code path rebuilt from its tag in the same run; then (0.0.3) the
+#      GELU table's build, the f32<->f16 rows and the GELU op against the reference's (`voaice bench-f16`,
+#      `whisper_oracle --bench-f16`)
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
@@ -43,6 +46,10 @@ python3 testing/make_audio.py | tee -a "$out"
 log "## 3. record (the shipped libwhisper.so, in process)"
 rm -rf .oracle/tiny.en
 testing/oracle/bin/whisper_oracle "$model" .oracle/tiny.en .audio/*.wav 2>&1 | tee -a "$out"
+rm -rf .oracle/f16
+t0=$(date +%s)
+testing/oracle/bin/whisper_oracle --f16 .oracle/f16 2>&1 | tee -a "$out"
+log "(the f16 record took $(( $(date +%s) - t0 )) s: all 2^32 f32 patterns, three conversions and the GELU op, one thread)"
 
 log "## 4. voaice.rs"
 cargo build --release 2>&1 | tail -1 | tee -a "$out"
@@ -50,7 +57,7 @@ cargo clippy --release --all-targets -q -- -D warnings 2>&1 | tee -a "$out"
 cargo test --release 2>&1 | grep -E "^test result" | tee -a "$out"
 cargo test --release --test oracle -- --ignored --nocapture --test-threads=1 2>&1 \
   | grep -vE "^\s*(Compiling|Finished|Running)|^$|^running" | tee -a "$out"
-grep -q "test result: ok. 6 passed" "$out" || { log "FAIL: the oracle comparisons did not all pass"; exit 1; }
+grep -q "test result: ok. 13 passed" "$out" || { log "FAIL: the oracle comparisons did not all pass"; exit 1; }
 
 nt=$(nproc)
 log "## 5. efficiency (only now): log-mel; wall = best of 10 calls, cpu = CPU ms per call (utime+stime, all threads,"
@@ -94,6 +101,27 @@ for d in .oracle/tiny.en/*/; do
 done
 rm -rf "$old"
 log "$(awk -v a="$sum_l001" -v b="$sum_lref" -v c="$sum_lrefn" -v k="$k" -v nt="$nt" 'BEGIN{printf "geometric mean of wall-time ratios over %d inputs: voaice at 1 thread is %.2fx faster than 0.0.1 and %.2fx faster than the reference at 1 thread; at %d threads, %.2fx faster than the reference at %d", k, exp(a/k), exp(b/k), nt, exp(c/k), nt}')"
+log "## 5b. efficiency (only now): f32<->f16 and GELU. init = the first GELU table build in a fresh process (best of"
+log "##     5 processes; the reference's ggml_cpu_init also fills its quick-GELU and f32<-f16 tables and two 256-entry"
+log "##     ones, voaice only the GELU table it needs); rows = best of 10 calls on 384x1500 values; gelu = the op on"
+log "##     1536x1500 (the encoder MLP's size), 1 thread; the reference's through a ggml graph, whose two tensor copies"
+log "##     are measured alone and taken off (gelu_net)"
+ri=1e30; vi=1e30
+for _ in 1 2 3 4 5; do
+  ri=$(awk -v a="$ri" -v b="$(testing/oracle/bin/whisper_oracle --bench-f16 init | field init_ms)" 'BEGIN{print (b<a)?b:a}')
+  vi=$(awk -v a="$vi" -v b="$(target/release/voaice bench-f16 init | field init_ms)" 'BEGIN{print (b<a)?b:a}')
+done
+rr=$(testing/oracle/bin/whisper_oracle --bench-f16 rows); vr=$(target/release/voaice bench-f16 rows)
+log "reference: $rr"
+log "voaice:    $vr"
+gnet=$(awk -v a="$(echo "$rr" | field gelu_ms)" -v b="$(echo "$rr" | field gelu_copies_ms)" 'BEGIN{printf "%.3f", a-b}')
+log "$(printf '%-30s %10s %10s %8s' measure reference voaice ratio)"
+row() { log "$(awk -v n="$1" -v a="$2" -v b="$3" 'BEGIN{printf "%-30s %10.3f %10.3f %7.2fx", n, a, b, a/b}')"; }
+row "gelu table, first build (ms)" "$ri" "$vi"
+row "fp32_to_fp16 row 576k (ms)" "$(echo "$rr" | field fp32_to_fp16_row_ms)" "$(echo "$vr" | field fp32_to_fp16_row_ms)"
+row "fp16_to_fp32 row 576k (ms)" "$(echo "$rr" | field fp16_to_fp32_row_ms)" "$(echo "$vr" | field fp16_to_fp32_row_ms)"
+row "gelu op 2.3M, net (ms)" "$gnet" "$(echo "$vr" | field gelu_ms)"
+row "gelu op 2.3M, scalar path (ms)" "$gnet" "$(echo "$vr" | field gelu_scalar_ms)"
 log "## transcripts recorded (not yet reproduced by voaice.rs: encoder and decoder are later stages)"
 for d in .oracle/tiny.en/*/; do log "$(basename "$d"): $(tr '\n' ' ' < "$d/transcript.txt")"; done
 log "GATE PASSED"

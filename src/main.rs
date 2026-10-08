@@ -4,6 +4,7 @@
 //!   voaice info  <model.bin>                                verify the pin, print the model summary
 //!   voaice mel   <model.bin> <in.wav> [out] [--threads N]   the log-mel spectrogram: shape and sha256 (and raw f32 to `out`)
 //!   voaice bench-mel <model.bin> <in.wav> [--threads N]     the mel's heap peak, wall (best of 10), CPU per call, peak RSS
+//!   voaice bench-f16 init|rows                             (0.0.3) the GELU table's build; f32<->f16 rows and the GELU op
 //!   voaice vclone check <file.voaice>...                   recompute each identity's vprint and compare every field
 //!   voaice vclone print <8 metrics>                         the dvscope/1 print of eight values (vprint.py's twin)
 //!   voaice vclone log <events.jsonl>                        verify a forge log's chain and say whether it is mintable
@@ -12,7 +13,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::process::ExitCode;
-use voaice::{measure, mel, model::Model, sha256, vclone, wav};
+use voaice::{f16, gelu, measure, mel, model::Model, sha256, vclone, wav};
 
 /// The system allocator, counting live heap bytes and their peak, so `bench-mel` can report the heap a call needs
 /// (std only: a `GlobalAlloc` wrapper, no crate). Thread stacks are mapped, not allocated, and are not counted.
@@ -139,13 +140,63 @@ fn run(args: &[String]) -> Result<(), String> {
             );
             Ok(())
         }
+        Some("bench-f16") if args.len() == 2 => bench_f16(&args[1]),
         Some("vclone") => vclone_cmd(&args[1..]),
         Some("version") => {
             println!("voaice {} (reference: whisper.cpp 080bbbe8, ggml 0.16.0)", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        _ => Err("usage: voaice info <model.bin> | voaice mel <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-mel <model.bin> <in.wav> [--threads N] | voaice vclone check <file.voaice>... | voaice vclone print <8 metrics> | voaice vclone log <events.jsonl> | voaice version".into()),
+        _ => Err("usage: voaice info <model.bin> | voaice mel <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-mel <model.bin> <in.wav> [--threads N] | voaice bench-f16 init|rows | voaice vclone check <file.voaice>... | voaice vclone print <8 metrics> | voaice vclone log <events.jsonl> | voaice version".into()),
     }
+}
+
+/// `voaice bench-f16 init|rows` — the same measurements as `whisper_oracle --bench-f16`, in a fresh process each:
+/// `init` times the first build of the GELU table (the reference's `ggml_cpu_init` also builds its other tables),
+/// `rows` the f32↔f16 rows on 384 × 1500 values and the GELU op on 1536 × 1500, best of 10, on the same inputs.
+fn bench_f16(what: &str) -> Result<(), String> {
+    let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e3;
+    if what == "init" {
+        let t = std::time::Instant::now();
+        let g = gelu::Gelu::new();
+        let first = ms(t);
+        std::hint::black_box(&g);
+        let mut best = f64::INFINITY;
+        for _ in 0..10 {
+            let t = std::time::Instant::now();
+            std::hint::black_box(gelu::Gelu::new());
+            best = best.min(ms(t));
+        }
+        println!("bench-f16 init_ms {first:.3} init_best_of_10_ms {best:.3}");
+        return Ok(());
+    }
+    if what != "rows" {
+        return Err("bench-f16 init | rows".into());
+    }
+    let (n, ng) = (384 * 1500, 1536 * 1500);
+    let mut s: u64 = 1;
+    let x: Vec<f32> = (0..ng)
+        .map(|_| {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 11) as i64 % 2000001 - 1000000) as f32 * 1e-5
+        })
+        .collect();
+    let mut y = vec![0f32; ng];
+    let mut h = vec![0u16; n];
+    let best = |f: &mut dyn FnMut()| {
+        f();
+        (0..10).map(|_| {
+            let t = std::time::Instant::now();
+            f();
+            ms(t)
+        }).fold(f64::INFINITY, f64::min)
+    };
+    let to16 = best(&mut || f16::fp32_to_fp16_row(&x[..n], &mut h));
+    let to32 = best(&mut || f16::fp16_to_fp32_row(&h, &mut y[..n]));
+    let g = gelu::Gelu::new();
+    let ge = best(&mut || g.row(&x, &mut y));
+    let ges = best(&mut || g.row_scalar(&x, &mut y));
+    println!("bench-f16 fp32_to_fp16_row_ms {to16:.3} fp16_to_fp32_row_ms {to32:.3} gelu_ms {ge:.3} gelu_scalar_ms {ges:.3} n_row {n} n_gelu {ng}");
+    Ok(())
 }
 
 /// `voaice vclone …` — voice identities (src/vclone.rs).

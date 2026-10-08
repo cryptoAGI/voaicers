@@ -9,7 +9,7 @@ Run them all with `testing/release_gate.sh`; the record is written to `testing/r
 `tests/oracle.rs` they are `#[ignore]`d for plain `cargo test`, because they need the pinned model and a recorded
 oracle run.
 
-| oracle | compares | result (0.0.2) |
+| oracle | compares | result (0.0.3) |
 |---|---|---|
 | `oracle_model_hparams_tensors_vocab_filters` | the 11 hparams; every tensor's name, type, shape, byte count and the sha256 of its bytes **as whisper's loader holds them in memory**; the 80×201 filterbank; every token string | 11/11 · **167/167** tensors (77,110,272 bytes) · filterbank bit-exact · **51,864/51,864** tokens |
 | `oracle_pcm_input_identical` | the f32 samples voaice reads from each WAV against the samples fed to whisper | identical on all 8 inputs |
@@ -17,6 +17,13 @@ oracle run.
 | `oracle_mel_threads_bit_identical` | the mel at 2, 3, 4 and 8 threads against 1 thread and against the reference | **9,266,560** values identical, 8 inputs |
 | `oracle_mel_discriminates_fused_fft` | the discriminator: the FFT with fused multiply-adds | differs in 25,242 of 328,000 values on JFK — the oracle tells float orders apart |
 | `guard_refuses_a_modified_model` | a model with one flipped bit in `decoder.token_embedding.weight` | parses, and is refused by the pin with the reason |
+| `oracle_f16_to_f32_all_65536` | (0.0.3) every f16 pattern widened by the port, against libggml-base's `ggml_fp16_to_fp32`, ggml-cpu's `ggml_table_f32_f16`, its `ggml_cpu_fp16_to_fp32` row (F16C `vcvtph2ps`) and that row's scalar tail | **65,536/65,536** each of the four |
+| `oracle_f32_to_f16_boundary_set` | (0.0.3) 1,429,656 f32 inputs — every f16 value and its f32 neighbours, every halfway point between adjacent f16 values and its neighbours, the overflow edge (65,520), the underflow edge (2⁻²⁵), subnormals, infinities, 35 NaN payloads × 2 signs, ±10 ± 20 ULP, 2²⁰ random — narrowed by the portable scalar (against libggml-base and ggml-cpu's inlined, FMA-contracted copy), by the row (against `ggml_cpu_fp32_to_fp16`'s F16C blocks) and by the `vcvtps2ph` model | **1,429,656/1,429,656** each; the portable and F16C conversions differ on 4,029 of the 4,047 NaN inputs, as the reference's do |
+| `oracle_f32_to_f16_every_pattern` | (0.0.3) **all 2³² f32 patterns**, the same three ways, compared by a per-chunk digest (65,536 chunks of 65,536; FNV-1a over the packed outputs) | **65,536/65,536** chunks each; the reference's own scalar copies agree on all 65,536, its row and scalar on 65,280 (the 256 chunks holding NaNs) |
+| `oracle_f16_discriminates_round_half_away` | the discriminator: ties rounded away from zero | differs in 31,752 boundary values and 8,448 of the 65,536 chunks — rejected |
+| `oracle_gelu_table_all_65536` | (0.0.3) the exported `ggml_table_gelu_f16`, entry for entry | **65,536/65,536** |
+| `oracle_gelu_table_discriminates_unfused` | the discriminator: GELU in the source's order without the FMA GCC formed | differs in 1 entry (`0xBFFF`, −1.999) — rejected; the FMA changes exactly one entry |
+| `oracle_gelu_op` | (0.0.3) `ggml_gelu` through a graph on the shipped CPU backend (1 thread; 4 threads recorded identical) on the boundary set plus every f16 value (1,495,192), then on all 2³² by digest; the vector and the scalar path | **1,495,192/1,495,192** both paths; **65,536/65,536** chunks of all 2³² both paths |
 
 Below the oracles, `cargo test` carries a second witness for the mel that needs no model:
 `same_bits_as_the_0_0_1_port_at_every_thread_count` keeps 0.0.1's allocating port verbatim (test-only) and requires
@@ -37,6 +44,19 @@ for voaice (`voaice bench-mel`), measured the same way on both sides:
 | 0.0.1 | rebuilt from tag `v0.0.1` in the same run (scratch under `.oracle/`, removed after); its `voaice mel` times the mel call alone |
 
 No crate and no libc binding is used for any of it: `/proc` is read as text.
+
+Step 5b (0.0.3) measures the f16 work the same way, each side in fresh processes (`voaice bench-f16`,
+`whisper_oracle --bench-f16`): the first build of the GELU table (best of 5 processes; the reference's
+`ggml_cpu_init` also fills its quick-GELU and f32←f16 tables, which voaice does not need, so that ratio flatters
+voaice and says so), the f32↔f16 rows on 384 × 1,500 values, and the GELU op on 1,536 × 1,500 at one thread (the
+reference's through a one-op ggml graph; its two tensor copies are measured alone and taken off).
+
+**How the oracle sees the conversions.** Everything it compares is the shipped code: `ggml_fp16_to_fp32` /
+`ggml_fp32_to_fp16` are exported by libggml-base, `ggml_cpu_fp16_to_fp32` / `ggml_cpu_fp32_to_fp16` and the data
+symbols `ggml_table_f32_f16` / `ggml_table_gelu_f16` by libggml-cpu (`nm -D`). The scalar `GGML_CPU_FP32_TO_FP16` is
+inlined, not exported: the oracle reaches ggml-cpu's own compiled copy by calling `ggml_cpu_fp32_to_fp16` on three
+values at a time (always its tail loop), and the GELU op's copy through the op. The copies inlined in im2col and
+flash attention are not observed until those nodes are (0.0.6 onward).
 
 ## The test inputs
 

@@ -1,6 +1,74 @@
 # Changelog
 
-## Unreleased — vclone
+## 0.0.3 — 2026-10-08 — f32 ↔ f16 and GELU, bit-exact on every input
+
+**The first two encoder kernels, as the shipped ggml-cpu computes them: every f16 pattern widened, every one of the
+4,294,967,296 f32 patterns narrowed, all 65,536 GELU table entries and the GELU op on every f32 input — then the op
+three times faster.** Record: `testing/results/0.0.3.txt`.
+
+### What the reference does (read from the source and `objdump -d libggml-cpu.so`, then confirmed by the oracle)
+- On an F16C build `GGML_CPU_FP32_TO_FP16` is **not** the hardware instruction: simd-mappings.h defines only the
+  `COMPUTE_` macro as `_cvtss_sh`, so the kernels' macro falls through to ggml-impl.h's portable bit trick (round to
+  nearest even; every NaN → `sign | 0x7E00`). im2col, the GELU index and the GELU table use it. GCC contracted it in
+  libggml-cpu (`vmulss` + `vfmadd231ss`); the fused product is by a power of two and exact, so the bits agree with
+  libggml-base's uncontracted copy on all 2³² inputs.
+- `ggml_cpu_fp32_to_fp16` — the F16 type traits' `from_float` (mul_mat, flash attention; pointer equality checked)
+  — converts blocks of 8 and 4 with `vcvtps2ph` (NaN quieted, top 10 payload bits kept) and the last `n % 4` with
+  the bit trick: a NaN's f16 depends on its position in the row. The two agree on every non-NaN f32.
+- f16 → f32: `ggml_table_f32_f16` (portable, filled at `ggml_cpu_init`) and `vcvtph2ps` agree on all 65,536.
+- `ggml_table_gelu_f16[i] = fp32_to_fp16(gelu(fp16_to_fp32(i)))` with `gelu(x) = (0.5·x)·(tanhf((S·x)·fma(A·x, x, 1)) + 1)`
+  — GCC fused `A·x·x + 1` into one FMA; glibc `tanhf`. The op: `x <= -10` → +0, `x >= 10` → x, else (NaN too) the
+  table at the portable index. Elementwise, so 1 and 4 threads are identical (recorded).
+
+### Measured (testing/release_gate.sh; 4-CPU Ryzen 3 3200U, 1-minute load 7.4 at the start, falling from ≈ 30, after
+an hour near 80 from other work on the machine; ±20 % is noise, and more)
+- `oracle_f16_to_f32_all_65536`: **65,536 / 65,536** against libggml-base, the table, the F16C row and its tail.
+- `oracle_f32_to_f16_boundary_set`: **1,429,656 / 1,429,656** each — the scalar against libggml-base and ggml-cpu's
+  inlined copy, the row and the `vcvtps2ph` model against `ggml_cpu_fp32_to_fp16`. The set: every f16 value, every
+  halfway point between neighbours (ties), each with its f32 neighbours, the 65,520 and 2⁻²⁵ edges, subnormals,
+  infinities, 35 NaN payloads × 2 signs, ±10 ± 20 ULP, 2²⁰ random. The portable and F16C forms differ on 4,029 of
+  its 4,047 NaNs, in ours as in the reference.
+- `oracle_f32_to_f16_every_pattern`: **all 2³² f32 patterns**, by per-chunk digest (65,536 chunks of 65,536):
+  65,536 / 65,536 chunks identical for each of the four comparisons. The reference's own scalar copies agree with
+  each other on every chunk, its row and its scalar on 65,280 (the 256 chunks holding NaNs).
+- `oracle_gelu_table_all_65536`: **65,536 / 65,536**. `oracle_gelu_op`: **1,495,192 / 1,495,192** (the boundary
+  set and every f16 value) on the vector and the scalar path, and 65,536 / 65,536 chunks of all 2³².
+- Discriminators: round-half-away differs in **31,752** boundary values and **8,448** chunks — rejected; the GELU
+  without the FMA differs in **1** table entry (`0xBFFF`, −1.999: 43,474 vs 43,475) — rejected, and that one entry
+  is the whole effect of the FMA.
+- Efficiency, only after the above (step 5b; each side in fresh processes):
+
+  | measure | reference | voaice 0.0.3 | ratio |
+  |---|---|---|---|
+  | GELU op, 1,536 × 1,500, 1 thread (reference net of its graph's two copies) | 26.04 ms | **6.04 ms** | **4.31×** |
+  | GELU op, voaice's scalar path | 26.04 ms | 18.75 ms | 1.39× |
+  | GELU table, first build (best of 5 processes; the reference's `ggml_cpu_init` also fills its quick-GELU and f32←f16 tables) | 3.16 ms | 2.49 ms | 1.27× |
+  | f32 → f16 row, 576,000 values | 0.172 ms | 0.139 ms | 1.24× |
+  | f16 → f32 row, 576,000 values | 0.184 ms | 0.172 ms | 1.07× |
+
+  An earlier full run of the same gate on the same kernels (only doc comments changed since; higher load) measured the op at 18.43 against 6.23 ms
+  (2.96×), the table 1.17×, the rows 0.90× and 1.01×: the op's gain is real, its size is not known to better than
+  that range here. The rows are the same instructions on both sides; their ratios are noise. The op's gain: the table held widened
+  to f32 (one lookup, not two) and eight lanes at once (`vcvtps2ph` for the index with the NaN lanes re-indexed to
+  the portable `sign | 0x7E00`, compares for the clamps, one gather). The mel (step 5) is unchanged from 0.0.2:
+  5.65× the reference at one thread in this run (6.21× in the earlier one).
+
+### Added
+- `src/f16.rs`: `fp16_to_fp32`, `fp32_to_fp16` (the portable ports), `fp32_to_fp16_f16c` (`vcvtps2ph` in integers),
+  `fp32_to_fp16_row` / `fp16_to_fp32_row` (F16C when the CPU has it — checked bit-identical — the model otherwise),
+  `fp32_to_fp16_round_half_away` (the discriminator).
+- `src/gelu.rs`: `gelu_f32` (the shipped FMA order), `gelu_f32_unfused` (the discriminator), `table_with`, `Gelu`
+  (`new`, `row`, `row_scalar`).
+- `whisper_oracle --f16 <dir>` (records the conversions from libggml-base and libggml-cpu, the exported tables and
+  the op through a ggml graph, on every f16 and every f32 pattern; about 2 minutes on one thread here) and
+  `--bench-f16 init|rows`; `voaice bench-f16 init|rows`.
+- Seven oracle tests (13 in all) and gate step 5b.
+- Changed: the decade's order — f32↔f16 + GELU became 0.0.3 (the encoder's order of work starts there); the Ogg/Opus
+  reader is now 0.0.4, the resampler 0.0.5, conv1 0.0.6 (docs/ROADMAP.md).
+- `src/lib.rs` allows clippy's `chunks_exact_to_as_chunks` on the `sha512` module (new in clippy 1.99; that module
+  belongs to the vclone work and is left unedited) so the gate's `clippy -D warnings` passes.
+
+## Also in 0.0.3 — vclone (committed before it, released with it)
 
 - `src/vclone.rs`: the vprint (`dvscope/1`) byte-identical to cryptoAGI/voaice `tools/vprint.py`. Checked on 2,000
   recorded metric sets (`testing/vclone/make_oracle.py`, which names the vprint.py it ran by sha256) and on all 10
