@@ -12,7 +12,7 @@ Built the way [bankml](https://github.com/cryptoAGI/bankml) was built against ll
   <img src="https://img.shields.io/badge/dependencies-0-56D364?style=flat-square" alt="zero dependencies">
   <img src="https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-2563EB?style=flat-square" alt="MIT OR Apache-2.0">
   <img src="https://img.shields.io/badge/log--mel-bit--exact%20vs%20whisper.cpp%20(ggml%200.16.0)-39D3C7?style=flat-square" alt="log-mel bit-exact">
-  <img src="https://img.shields.io/badge/status-0.0.1%20%C2%B7%20loader%20%2B%20front%20end%3B%20no%20transcript%20yet-F59E0B?style=flat-square" alt="status">
+  <img src="https://img.shields.io/badge/status-0.0.2%20%C2%B7%20loader%20%2B%20front%20end%206%C3%97%20faster%2C%200%20ULP%3B%20no%20transcript%20yet-F59E0B?style=flat-square" alt="status">
   <a href="https://github.com/cryptoAGI/voaicers/releases/latest"><img src="https://img.shields.io/github/v/release/cryptoAGI/voaicers?style=flat-square&label=release&color=0ECB81" alt="latest release"></a>
 </p>
 
@@ -25,17 +25,21 @@ mindX's production speech-to-text is whisper.cpp built against ggml 0.16.0, runn
 *a result counts only when an oracle has checked it, and the oracle is the reference's own compiled library run on
 the same input, compared by bit pattern.* Speed is measured only after that.
 
-**0.0.1 does not transcribe.** It is the first three stages:
+**0.0.2 does not transcribe yet.** It is the first three stages, the front end now optimized (0.0.2) with its bits unchanged:
 
 | stage | what | oracle result (this machine, 2026-10-07) |
 |---|---|---|
 | 0 | the oracle harness: links the pinned `libwhisper.so` and records what it computes | built; self-checking (below) |
 | 1 | the model loader + sha256 guard | **167 / 167 tensors** byte-identical to what whisper's loader holds (sha256 each, 77,110,272 bytes); hparams, filterbank (80×201, bit-exact), **51,864 / 51,864** vocab strings |
-| 2 | the log-mel front end | **2,316,640 / 2,316,640** f32 values bit-exact over 8 inputs, **max 0 ULP** |
+| 2 | the log-mel front end — allocation-free, threaded (0.0.2) | **2,316,640 / 2,316,640** f32 values bit-exact over 8 inputs, **max 0 ULP**; at 2, 3, 4 and 8 threads identical to 1 thread (9,266,560 values); the fused-FFT discriminator still rejected (25,242 values differ) |
 
-Speed, measured only after the oracles passed in the same gate run: the mel is at about **parity** with the
-reference, one thread each (JFK 11 s: 58.7 ms against 57.7 ms; the laptop was loaded, so ±20 % is noise). Nothing
-is optimized yet. Full record: [`testing/results/0.0.1.txt`](testing/results/0.0.1.txt).
+Efficiency, measured only after the oracles passed in the same gate run (0.0.2, this laptop, 4 CPUs at load ≈ 7.6,
+so ±20 % is noise): the mel is **6.1× faster than 0.0.1** (rebuilt from its tag in the same run) and **6.8× faster
+than the reference** at one thread (geometric means over the 8 inputs; JFK 11 s: **9.5 ms** against 60.1 ms;
+JFK ×3: 24.9 ms against 198.8), at **one sixth of the reference's CPU time** (JFK 9.7 against 58.3 CPU-ms) and
+**one third of its heap** (JFK 1,282 KiB — exactly the 80×4,100 output — against 3,868; the 30-s padded copy of the
+audio is gone). At 4 threads it is 5.9× the reference at 4. Full record:
+[`testing/results/0.0.2.txt`](testing/results/0.0.2.txt) (0.0.1's: [`0.0.1.txt`](testing/results/0.0.1.txt)).
 
 **A determinism note on the reference itself:** whisper.cpp's transcript depends on its thread count. At 1 thread it
 is identical run to run; at 4 threads the token ids and text stay the same but every token's probability differs in
@@ -102,7 +106,8 @@ Found by reading the source and the shipped binary (`objdump`), then confirmed b
 - Padding: 200 samples reflected from `samples[200..=1]`, 30 s + 200 zeros after; frames beyond `(n+200)/160` are
   `log10(1e-10)` without an FFT. Fewer than 201 samples is undefined behaviour in whisper.cpp (it reads
   `samples[1..=200]`); voaice refuses it.
-- Threads do not change the bits (each frame is computed whole by one thread): 1 vs 4 identical on all 8 inputs.
+- Threads do not change the bits (each frame is computed whole by one thread): 1 vs 4 identical on all 8 inputs, in the
+  reference and in voaice.rs (1 vs 2, 3, 4, 8).
 - The input: whisper-cli's miniaudio converts s16 with the literal `0.00003051757812f`, which is exactly 2⁻¹⁵, so
   `s / 32768.0` is the same; the oracle checks the samples voaice reads equal those fed to whisper, bit for bit.
 
@@ -112,7 +117,8 @@ Found by reading the source and the shipped binary (`objdump`), then confirmed b
 cargo build --release && cargo test --release          # unit tests (no model needed)
 testing/release_gate.sh                                # the gate: reference, pins, record, compare, then speed
 target/release/voaice info models/ggml-tiny.en.bin     # refuses any file that is not pinned, and says why
-target/release/voaice mel  models/ggml-tiny.en.bin in.wav [out.f32]
+target/release/voaice mel  models/ggml-tiny.en.bin in.wav [out.f32] [--threads N]
+target/release/voaice bench-mel models/ggml-tiny.en.bin in.wav [--threads N]   # heap, wall, CPU, RSS
 ```
 
 Input: 16-bit PCM, mono, 16 kHz WAV; anything else is refused, not converted (resampling is a later stage).
@@ -122,7 +128,7 @@ Disk: the reference checkout and build are about 160 MB in `upstream/` (gitignor
 
 ```
 Cargo.toml  rust-toolchain.toml      zero dependencies; Rust 1.99.0 pinned like bankml
-src/        sha256.rs model.rs wav.rs mel.rs lib.rs main.rs
+src/        sha256.rs model.rs wav.rs mel.rs measure.rs lib.rs main.rs
 tests/oracle.rs                      the oracle comparisons (#[ignore]: need the model and a recorded oracle)
 testing/oracle/                      build.sh, layout_probe.cpp, whisper_oracle.cpp
 testing/make_audio.py                the 8 test WAVs, pinned in testing/pins/audio.sha256
@@ -132,6 +138,64 @@ docs/                                ARCHITECTURE · oracles · REFERENCE · ROA
 ```
 
 Licence: MIT OR Apache-2.0. whisper.cpp (MIT) is used only as the oracle and is not redistributed.
+
+## vCLONE — the source code
+
+vCLONE is how voaice handles cloning. It has two halves, and both are open:
+
+| half | source |
+|---|---|
+| **capture and measurement** — record from the microphone, measure the recording into an 18-decimal voiceprint, write the result as a `.voaice` identity. This half captures a voice; it does not synthesise one ([why](https://github.com/cryptoAGI/voaice#vclone-captures-it-does-not-clone)) | [`web/capture.html`](https://github.com/cryptoAGI/voaice/blob/main/web/capture.html) (browser microphone capture) · [`tools/voaice.py`](https://github.com/cryptoAGI/voaice/blob/main/tools/voaice.py) · [`tools/vprint.py`](https://github.com/cryptoAGI/voaice/blob/main/tools/vprint.py) (the voiceprint) · [`voices/vclone.voaice`](https://github.com/cryptoAGI/voaice/blob/main/voices/vclone.voaice) (the template you measure into) · [`FORMAT.md`](https://github.com/cryptoAGI/voaice/blob/main/FORMAT.md) |
+| **synthesis** — speak in a measured voice: stage 1 is Kokoro-82M, stage 2 is OpenVoice v2 tone-colour transfer, run on the CPU through ONNX with no torch. Without a runtime or weights it falls back to a persona-tinted render and says which path it took | [`src/NeuralVoiceEngine.js`](https://github.com/Professor-Codephreak/voaice/blob/main/src/NeuralVoiceEngine.js) · [`src/VoiceCreationEngine.js`](https://github.com/Professor-Codephreak/voaice/blob/main/src/VoiceCreationEngine.js) |
+
+In voaice.rs, vCLONE starts with the measuring half, since a voiceprint is just a number to check against. The work
+is listed below.
+
+## TODO — the Rust crates
+
+The full engineering plan for each stage is in [TODO.md](TODO.md) and [docs/ROADMAP.md](docs/ROADMAP.md). Versions
+go up 0.0.1 at a time, with a milestone at every tenth step. The order of work:
+
+### voaice.rs (speech to text)
+- [x] **0.0.1:** the model loader with its sha256 guard, and the log-mel front end. Both are bit-exact (0 ULP)
+  against whisper.cpp at ggml 0.16.0.
+- [ ] **0.0.2:** the mel optimised: no allocations, optional threads, CPU and memory measured, bits unchanged.
+- [ ] **Stage 0b:** pin `ggml-base.en.bin` (production's default model). Record the VPS's ISA so the oracle
+  reproduces production's native ggml-cpu kernels (Zen 3, AVX2 + FMA).
+- [ ] **Stage 3, the encoder (0.1.0):** the GELU f16 table (the exported `ggml_table_gelu_f16`), f32↔f16
+  conversion, `vec_dot_f16` in AVX2 lane order, conv1 and conv2 through im2col, layer norm, flash attention, four
+  blocks, then `embd_enc` bit-exact. Each intermediate is observed through ggml's scheduler callback.
+- [ ] **Stage 4, the decoder (0.2.0):** cross-attention, the f16 KV cache, and all 51,864 logits bit-exact per
+  step through `whisper_get_logits_from_state`.
+- [ ] **Stage 5, the transcript (0.3.0):** the greedy loop, logit filters, timestamp rules, 30-second seek.
+  `transcript.tsv` must be identical: token ids, `t0`/`t1`, and the f32 bits of `p`.
+- [ ] **0.4.0:** `voaice transcribe --json` in whisper-cli's shape, plus a library entry point for voaice's call
+  sites.
+- [ ] **Stage 6, fast (0.5.0):** SIMD kernels, threads, a KV layout without copies. The oracle stays green
+  throughout, and timing is measured against whisper.cpp on the same cores.
+- [ ] **Portability:** port glibc 2.35's `sincosf`, `cosf` and `log10` in-crate, with an oracle covering every
+  argument the mel uses.
+
+### streamair (CPU → .opus)
+- [x] **0.0.1:** the Ogg/Opus container. Production's opusinfo reads every test file without a warning, and
+  opusdec decodes exactly the samples written.
+- [ ] **0.0.2–0.0.9:** a streaming writer with bounded memory, a reader for round trips, the range encoder, the
+  MDCT, band energies, PVQ, bit allocation.
+- [ ] **0.1.0:** a mono CELT encoder (fullband, 20 ms, CBR), byte-exact against libopus 1.4 at a stated complexity.
+- [ ] **0.2.0–0.3.0:** VBR at voaice's bitrates, stereo, SILK and hybrid.
+- [ ] **0.4.0–0.5.0:** the speed pass, then the efficiency pass: fewer CPU-seconds per audio-second, or fewer
+  bytes for the same quality, stated per change.
+- [ ] **1.0.0:** voaice writes every `.opus` through streamair, with libopus needed only as the oracle.
+
+### vCLONE in Rust
+- [ ] Port `tools/vprint.py` and get the same 18-decimal voiceprint, digit for digit, on the same WAV. Python and
+  the browser already agree; Rust becomes the third implementation in that test.
+- [ ] Read and write `.voaice` identities ([FORMAT.md](https://github.com/cryptoAGI/voaice/blob/main/FORMAT.md)),
+  with a round trip that reproduces the file byte for byte.
+- [ ] Capture to `.opus` through streamair, so a measured reference recording ships compressed with no external
+  encoder.
+- [ ] The synthesis half (Kokoro + OpenVoice v2) comes later, after the speaking half of the
+  [roadmap](docs/ROADMAP.md). It will be checked against the reference's own ONNX runtime, sample by sample.
 
 ## The voaice family — code and live links
 
