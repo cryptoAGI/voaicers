@@ -73,16 +73,20 @@ fn the_silence_cli_lengths_read_back_exactly() {
 }
 
 #[test]
-fn known_issue_the_writer_accepts_end_trimming_past_the_last_page() {
-    // streamair 0.0.1's mux bounds the trim by 5,760 samples, not by the samples on the last page: here the last page
-    // holds one 2.5 ms packet (120 samples) and the trim is 500, so the EOS granule (9,220) is below the previous
-    // page's (9,600). opusinfo 0.2 on production says "ERROR: stream 1 has interior holes or more than one page of end
-    // trimming" (checked 2026-10-08); voaice.rs refuses it by name. The writer's fix belongs to streamair's next step.
+fn end_trimming_stays_on_the_last_page() {
+    // Was a known issue (found by the 0.0.4 oracle): streamair 0.0.1 bounded the trim by 5,760 samples, not by the
+    // samples on the last page. Here the natural last page would hold one 2.5 ms packet (120 samples) against a trim of
+    // 500, so its EOS granule (9,220) fell below the previous page's (9,600), and opusinfo 0.2 called the file an
+    // ERROR. The writer now starts the last page early enough that the trim lies inside it, and voaice reads the
+    // exact length back.
     let mut p: Vec<Vec<u8>> = (0..10).map(|_| vec![0xF8]).collect();
     p.push(vec![0xE0]);
     let st = Stream { serial: 1, channels: 1, pre_skip: 312, input_rate: 48000, vendor: "v", comments: &[],
                       samples_48k: 9600 + 120 - 312 - 500, packets_per_page: 10 };
-    let f = mux(&st, &p).expect("the writer accepts it today");
-    let e = Reader::new(&f[..]).unwrap().finish().unwrap_err();
-    assert_eq!(e.kind, voaice::ogg::Kind::GranuleBackwards, "{e}");
+    let f = mux(&st, &p).unwrap();
+    let sum = Reader::new(&f[..]).unwrap().finish().unwrap();
+    assert_eq!(sum.duration, 9600 + 120 - 312 - 500);
+    if let Ok(out) = std::env::var("STREAMAIR_TRIM_OUT") {
+        std::fs::write(out, &f).unwrap(); // for opusinfo, the external check
+    }
 }

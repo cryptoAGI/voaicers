@@ -199,22 +199,34 @@ pub fn mux(s: &Stream, packets: &[Vec<u8>]) -> Result<Vec<u8>, String> {
     w.flush(0);
     let end = s.pre_skip as u64 + s.samples_48k;
     let per = s.packets_per_page.max(1);
+    // decoded samples through each packet
+    let mut cum = Vec::with_capacity(packets.len());
     let mut decoded: u64 = 0;
-    for (i, p) in packets.iter().enumerate() {
+    for p in packets {
         decoded += packet_samples(p).ok_or("malformed Opus packet (TOC)")? as u64;
-        let last = i + 1 == packets.len();
-        if last {
-            if decoded < end {
-                return Err(format!("packets decode to {} samples, fewer than pre-skip + audio ({})", decoded, end));
-            }
-            if decoded - end >= 960 * 6 {
-                return Err(format!("{} samples of trailing padding: more than a packet's worth", decoded - end));
-            }
+        cum.push(decoded);
+    }
+    if decoded < end {
+        return Err(format!("packets decode to {} samples, fewer than pre-skip + audio ({})", decoded, end));
+    }
+    if decoded - end >= 960 * 6 {
+        return Err(format!("{} samples of trailing padding: more than a packet's worth", decoded - end));
+    }
+    // End trimming happens on the last page only (RFC 7845 §4.4): the page before it must not claim more samples
+    // than the stream ends at, or the final granule would go backwards ("more than one page of end trimming", as
+    // opusinfo says). So the last page starts where the trim begins, at the latest: its first packet is the earliest
+    // one that the page boundaries of `packets_per_page` would leave before a granule larger than `end`.
+    let mut last_start = (packets.len() - 1) / per * per;
+    while last_start > 0 && cum[last_start - 1] > end {
+        last_start -= 1;
+    }
+    for (i, p) in packets.iter().enumerate() {
+        if i + 1 == packets.len() {
             w.push(p, end);
             w.flush(EOS);
         } else {
-            w.push(p, decoded);
-            if (i + 1) % per == 0 {
+            w.push(p, cum[i]);
+            if i < last_start && ((i + 1) % per == 0 || i + 1 == last_start) {
                 w.flush(0);
             }
         }
