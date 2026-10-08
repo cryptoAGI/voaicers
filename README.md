@@ -132,10 +132,40 @@ docs/                                ARCHITECTURE · oracles · REFERENCE · ROA
 
 Licence: MIT OR Apache-2.0. whisper.cpp (MIT) is used only as the oracle and is not redistributed.
 
-## Where it lives
+## The voaice family — code and live links
 
-- **This repository:** [cryptoAGI/voaicers](https://github.com/cryptoAGI/voaicers) — voaice.rs, the speech-to-text half of voaice in Rust.
-- **[cryptoAGI/voaice](https://github.com/cryptoAGI/voaice):** what a voice is, written down — `.voaice` identities, the 18-decimal vprint, the pronunciation table every engine speaks through.
-- **[cryptoAGI/bankml](https://github.com/cryptoAGI/bankml):** the method this follows — a zero-dependency Rust runtime bit-exact against llama.cpp's compiled library, then faster. Its [thesis](https://github.com/cryptoAGI/bankml/blob/main/docs/thesis.md) is the argument for exactness first.
-- **[PYTHAI/voaice](https://huggingface.co/PYTHAI/voaice) on Hugging Face:** the voice library — 70 open-licensed Piper voices, for anyone to use.
-- **The reference:** [ggml-org/whisper.cpp](https://github.com/ggml-org/whisper.cpp) (MIT), pinned in [`upstream/PIN`](upstream/PIN) at the commit mindX production runs. voaice.rs reproduces its compiled output; credit for the model and its design belongs to OpenAI Whisper and to whisper.cpp's authors.
+voaice.rs is one part of a larger body of voice work. Each part does one job, and each links to the others, so a
+stage written here can be swapped in where the older one runs today.
+
+### Code
+
+| repository | what it is |
+|---|---|
+| **[cryptoAGI/voaicers](https://github.com/cryptoAGI/voaicers)** — voaice.rs, this repository | speech to text in zero-dependency Rust, bit-exact against whisper.cpp |
+| [voaicers/streamair](streamair/) | CPU → `.opus` in zero-dependency Rust: the Ogg/Opus container (0.0.1, proven against libopus 1.4), then the encoder |
+| [cryptoAGI/voaice](https://github.com/cryptoAGI/voaice) | what a voice is, written down: `.voaice` identities, the 18-decimal vprint, the pronunciation table every engine speaks through |
+| [Professor-Codephreak/voaice](https://github.com/Professor-Codephreak/voaice) | the voice engine: in-house DSP, scientific and forensic voiceprints, the non-destructive editor, WAV/OGG export, torch-free neural TTS and cloning |
+| [Professor-Codephreak/playdocs](https://github.com/Professor-Codephreak/playdocs) | an instrument with a document inside it: point it at a URL, hear it read in the DeltaVerse cast, zoom the waveform to the sample |
+| [Professor-Codephreak/docsreader](https://github.com/Professor-Codephreak/docsreader) | the mindX and DeltaVerse document readers: speak a page aloud and light the words as they are read |
+| [Professor-Codephreak/faicey](https://github.com/Professor-Codephreak/faicey) | the face of AI, voaice's peer: what speaks, seen |
+| [Professor-Codephreak/aivatar](https://github.com/Professor-Codephreak/aivatar) | the `.persona` tool that joins them: looks (faicey), speaks (voaice), rigs and thinks |
+| [cryptoAGI/bankml](https://github.com/cryptoAGI/bankml) | the method this follows: bit-exact against llama.cpp's compiled library, then faster ([thesis](https://github.com/cryptoAGI/bankml/blob/main/docs/thesis.md)) |
+
+### Live
+
+| | |
+|---|---|
+| [**the mindX thesis**](https://mindx.pythai.net/doc/THESIS) · [listen](https://mindx.pythai.net/listen/THESIS) | the argument mindX is built on, read aloud by the voices this family makes |
+| [**rage.pythai.net**](https://rage.pythai.net/) — the WordPress player | every article is playable in the pre-rendered cast. For example: [the bankML thesis](https://rage.pythai.net/bankML-thesis/) (neural voice) and [OVERLORD of the DeltaVerse](https://rage.pythai.net/overlord-of-the-deltaverse/) (the OVERLORD voice) |
+| [playdocs](https://deltaverse.pythai.net/playdocs) | the playdocs instrument, live |
+| [docsplayer](https://deltaverse.pythai.net/docsplayer) | the document player: playlist, oscilloscope, spectrum, the cast |
+| [docsreader](https://deltaverse.pythai.net/docsreader) | the reader that lights each word as it is spoken |
+| [listen](https://deltaverse.pythai.net/listen) · [voices](https://deltaverse.pythai.net/voices) | the DeltaVerse listening room and the cast |
+| [ollywoo](https://deltaverse.pythai.net/ollywoo) | the stage where the cast performs: wardrobe, scenes, lip-sync |
+| [PYTHAI/voaice on Hugging Face](https://huggingface.co/PYTHAI/voaice) | the voice library: 70 open-licensed Piper voices, for anyone to use, each with Piper's attribution and its own licence |
+
+### The reference
+
+[ggml-org/whisper.cpp](https://github.com/ggml-org/whisper.cpp) (MIT), pinned in [`upstream/PIN`](upstream/PIN) at the
+commit mindX production runs. voaice.rs reproduces its compiled output. Credit for the model and its design belongs
+to OpenAI Whisper and to whisper.cpp's authors.
