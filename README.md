@@ -159,7 +159,10 @@ go up 0.0.1 at a time, with a milestone at every tenth step. The order of work:
 ### voaice.rs (speech to text)
 - [x] **0.0.1:** the model loader with its sha256 guard, and the log-mel front end. Both are bit-exact (0 ULP)
   against whisper.cpp at ggml 0.16.0.
-- [ ] **0.0.2:** the mel optimised: no allocations, optional threads, CPU and memory measured, bits unchanged.
+- [x] **0.0.2:** the mel optimised: no allocations, optional threads, CPU and memory measured, bits unchanged
+  (6.1× faster than 0.0.1, 6.8× the reference at one thread, a third of its heap; [record](testing/results/0.0.2.txt)).
+- [ ] **0.0.3–0.0.9:** the streaming Ogg/Opus reader, the resampler whisper-cli uses, conv1, the GELU table, conv2 +
+  positions, layer norm, the f16 dot in AVX2 lane order — one per step, each bit-exact ([plan](docs/ROADMAP.md)).
 - [ ] **Stage 0b:** pin `ggml-base.en.bin` (production's default model). Record the VPS's ISA so the oracle
   reproduces production's native ggml-cpu kernels (Zen 3, AVX2 + FMA).
 - [ ] **Stage 3, the encoder (0.1.0):** the GELU f16 table (the exported `ggml_table_gelu_f16`), f32↔f16
