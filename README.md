@@ -1,12 +1,13 @@
 <h1 align="center">voaice.rs</h1>
 
 <p align="center">
-  <b>Speech to text in zero-dependency Rust: bit-exact against whisper.cpp first, then faster.</b><br>
-  Built the way <a href="https://github.com/cryptoAGI/bankml">bankml</a> was built against llama.cpp.<br><br>
   <a href="https://github.com/Professor-Codephreak">Professor Codephreak</a> &middot; <a href="https://huggingface.co/Gregory-L">Gregory L. Magnusson</a> &middot; <a href="https://github.com/cryptoAGI">cryptoAGI</a>
 </p>
 
-<p align="center">
+**Speech to text in zero-dependency Rust: bit-exact against whisper.cpp first, then faster.**
+Built the way [bankml](https://github.com/cryptoAGI/bankml) was built against llama.cpp.
+
+<p>
   <img src="https://img.shields.io/badge/Rust-000000?style=flat-square&logo=rust&logoColor=white" alt="Rust">
   <img src="https://img.shields.io/badge/dependencies-0-56D364?style=flat-square" alt="zero dependencies">
   <img src="https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-2563EB?style=flat-square" alt="MIT OR Apache-2.0">
