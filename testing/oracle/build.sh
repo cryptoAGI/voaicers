@@ -42,5 +42,5 @@ g++ -std=gnu++17 -O0 -w $defs -DWHISPER_VERSION=\"1.9.1\" $inc "$root/testing/or
 "$out/layout_probe" > "$out/layout.h"
 # 2. the oracle
 g++ -std=gnu++17 -O2 -Wall $defs $inc -I"$out" "$root/testing/oracle/whisper_oracle.cpp" -o "$out/whisper_oracle" $lib
-echo "built $out/whisper_oracle (reference $pin_commit, ggml $gv)"
+echo "built ${out#"$ROOT"/}/whisper_oracle (reference $pin_commit, ggml $gv)"   # repo-relative: a record is not a map of this machine
 cat "$out/layout.h"

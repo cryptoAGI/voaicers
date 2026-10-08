@@ -2,7 +2,7 @@
 # host: x86_64, 4 cpus, AMD Ryzen 3 3200U with Radeon Vega Mobile Gfx; load 9.62 8.40 7.55
 # rustc: rustc 1.99.0 (b940084d7 2026-09-28); gcc: gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
 ## 1. reference
-built /home/hacker/cryptoAGI/voaice.rs/testing/oracle/bin/whisper_oracle (reference 080bbbe85230f624f0b52127f1ae1218247989f9, ggml 0.16.0)
+built testing/oracle/bin/whisper_oracle (reference 080bbbe85230f624f0b52127f1ae1218247989f9, ggml 0.16.0)
 ## 2. inputs
 model models/ggml-tiny.en.bin sha256 921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f (pinned)
 audio ok: 8 files match testing/pins/audio.sha256
