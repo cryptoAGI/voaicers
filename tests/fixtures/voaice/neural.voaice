@@ -1,0 +1,90 @@
+{
+ "format": "voaice/1",
+ "id": "neural",
+ "label": "NEURAL",
+ "engine": "piper",
+ "model": "en_GB-alan-medium",
+ "sampleRate": 22050,
+ "measured": {
+  "seconds": 30.17,
+  "f0": {
+   "median": 97.14,
+   "p10": 86.13,
+   "p90": 108.62,
+   "rawMin": 72.06,
+   "rawMax": 400.91,
+   "frames": 705,
+   "octaveErrorFrames": 5,
+   "octaveErrorPct": 0.7,
+   "method": "autocorrelation, 40 ms frames at 20 ms hop, voiced only, r>=0.45",
+   "note": "median with p10-p90; raw min/max are kept but are dominated by octave errors and should not be quoted as the voice's range"
+  },
+  "metrics": {
+   "rms": 0.16626077485650595,
+   "dominantFrequency": 96.8048780487805,
+   "spectralCentroid": 2618.000669975666,
+   "spectralRolloff": 5840.5609756097565,
+   "zeroCrossingRate": 0.1453993982173356,
+   "spectralBandwidth": 2831.157997409009,
+   "spectralFlux": 0.0,
+   "harmonicNoiseRatio": 32.90471239407234
+  }
+ },
+ "vprint": {
+  "hash": "44c0ab206f130bab886ab87311bd9c8a7a094f7ae592c5f917a11959ba41c9e5",
+  "hash512": "26683fd6ae4e8e909930372701f7f051f671d20f02984cc265a3988a6bf05b8e5225437fac578ccc9934429a720bbea562bd3b7ce250f18ba532084ab402382f",
+  "short": "44c0ab206f130bab",
+  "uint256": "31097689413140658010799099928486381906515435352135853513396839578016050956773",
+  "version": "dvscope/1",
+  "precision18": {
+   "rms": {
+    "wei": "166260774856505952",
+    "decimal": "0.166260774856505952"
+   },
+   "dominantFrequency": {
+    "wei": "96804878048780500992",
+    "decimal": "96.804878048780500992"
+   },
+   "spectralCentroid": {
+    "wei": "2618000669975665704960",
+    "decimal": "2618.000669975665704960"
+   },
+   "spectralRolloff": {
+    "wei": "5840560975609756385280",
+    "decimal": "5840.560975609756385280"
+   },
+   "zeroCrossingRate": {
+    "wei": "145399398217335616",
+    "decimal": "0.145399398217335616"
+   },
+   "spectralBandwidth": {
+    "wei": "2831157997409009139712",
+    "decimal": "2831.157997409009139712"
+   },
+   "spectralFlux": {
+    "wei": "0",
+    "decimal": "0.000000000000000000"
+   },
+   "harmonicNoiseRatio": {
+    "wei": "32904712394072342528",
+    "decimal": "32.904712394072342528"
+   }
+  },
+  "canonical": "{\"v\":\"dvscope/1\",\"precision\":18,\"metrics\":{\"rms\":{\"wei\":\"166260774856505952\",\"decimal\":\"0.166260774856505952\"},\"dominantFrequency\":{\"wei\":\"96804878048780500992\",\"decimal\":\"96.804878048780500992\"},\"spectralCentroid\":{\"wei\":\"2618000669975665704960\",\"decimal\":\"2618.000669975665704960\"},\"spectralRolloff\":{\"wei\":\"5840560975609756385280\",\"decimal\":\"5840.560975609756385280\"},\"zeroCrossingRate\":{\"wei\":\"145399398217335616\",\"decimal\":\"0.145399398217335616\"},\"spectralBandwidth\":{\"wei\":\"2831157997409009139712\",\"decimal\":\"2831.157997409009139712\"},\"spectralFlux\":{\"wei\":\"0\",\"decimal\":\"0.000000000000000000\"},\"harmonicNoiseRatio\":{\"wei\":\"32904712394072342528\",\"decimal\":\"32.904712394072342528\"}}}",
+  "params": {
+   "fft": 2048,
+   "hop": 512,
+   "window": "hann",
+   "sampleRate": 22050,
+   "framesAveraged": true,
+   "silenceFloorRms": 0.01
+  }
+ },
+ "provenance": {
+  "text": "six DeltaVerse sentences",
+  "source": "neural.wav",
+  "measuredAt": "2026-09-03",
+  "tool": "voaice.py voaice/1"
+ },
+ "synthesis": null
+}

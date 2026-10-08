@@ -186,15 +186,17 @@ go up 0.0.1 at a time, with a milestone at every tenth step. The order of work:
   bytes for the same quality, stated per change.
 - [ ] **1.0.0:** voaice writes every `.opus` through streamair, with libopus needed only as the oracle.
 
-### vCLONE in Rust
-- [ ] Port `tools/vprint.py` and get the same 18-decimal voiceprint, digit for digit, on the same WAV. Python and
-  the browser already agree; Rust becomes the third implementation in that test.
-- [ ] Read and write `.voaice` identities ([FORMAT.md](https://github.com/cryptoAGI/voaice/blob/main/FORMAT.md)),
-  with a round trip that reproduces the file byte for byte.
-- [ ] Capture to `.opus` through streamair, so a measured reference recording ships compressed with no external
-  encoder.
-- [ ] The synthesis half (Kokoro + OpenVoice v2) comes later, after the speaking half of the
-  [roadmap](docs/ROADMAP.md). It will be checked against the reference's own ONNX runtime, sample by sample.
+### vCLONE in Rust — [docs/VCLONE.md](docs/VCLONE.md)
+- [x] **vprint (`dvscope/1`)**, byte-identical to `tools/vprint.py`: 2,000 recorded metric sets and all 10 measured
+  `.voaice` identities verify field for field (`voaice vclone check`).
+- [x] **The forge log (`vclone-event/1`)**: capture, measure, ref, consent, model, actor, prompt, skill, tool,
+  language, forge. Each event is hash-chained, and an edit or a dropped event is refused. `mintable()` gives the
+  reasons when a voice may not be minted.
+- [ ] Port the forensic print as well (what `/voicey/measure` returns today), measure in Rust, port `compare()`.
+- [ ] Have ollywoo's `forgePersona()` write events as it goes, add a consent step, and record the cloning
+      engine's licence. Then emit a card from a log.
+- [ ] Synthesis (Kokoro + OpenVoice v2) later, after the speaking half of the [roadmap](docs/ROADMAP.md). It will
+      be checked against the reference's own ONNX runtime, sample by sample.
 
 ## The voaice family — code and live links
 

@@ -1,0 +1,115 @@
+{
+ "format": "voaice/1",
+ "id": "jaimla.espeak",
+ "label": "JAIMLA",
+ "engine": "espeak-ng",
+ "model": "en-us -s 161 -p 46",
+ "sampleRate": 22050,
+ "measured": {
+  "seconds": 30.0,
+  "f0": {
+   "median": 98.44,
+   "p10": 88.55,
+   "p90": 109.7,
+   "rawMin": 70.67,
+   "rawMax": 400.91,
+   "frames": 875,
+   "octaveErrorFrames": 24,
+   "octaveErrorPct": 2.7,
+   "method": "autocorrelation, 40 ms frames at 20 ms hop, voiced only, r>=0.45",
+   "note": "median with p10-p90; raw min/max are kept but are dominated by octave errors and should not be quoted as the voice's range"
+  },
+  "metrics": {
+   "rms": 0.08725722411768883,
+   "dominantFrequency": 387.219512195122,
+   "spectralCentroid": 1938.3207999747478,
+   "spectralRolloff": 3646.317073170732,
+   "zeroCrossingRate": 0.1369057604349255,
+   "spectralBandwidth": 2083.0694883558685,
+   "spectralFlux": 0.0,
+   "harmonicNoiseRatio": 12.802264079067374
+  }
+ },
+ "vprint": {
+  "hash": "0520f550655b0141e4253782602685ffad2dc80122bf215b80ede18f297ba1cd",
+  "hash512": "c779faf05e1d3b69d5bb862a941a1ee08a77b58026b1a4439895e9e7558aed235eddd2905b72527e83ef55611093639e34b20b3138de5e39cccf04302cfd0838",
+  "short": "0520f550655b0141",
+  "uint256": "2319796444313916008339490160099649072473792230293514268969697681484977775053",
+  "version": "dvscope/1",
+  "precision18": {
+   "rms": {
+    "wei": "87257224117688832",
+    "decimal": "0.087257224117688832"
+   },
+   "dominantFrequency": {
+    "wei": "387219512195122003968",
+    "decimal": "387.219512195122003968"
+   },
+   "spectralCentroid": {
+    "wei": "1938320799974747799552",
+    "decimal": "1938.320799974747799552"
+   },
+   "spectralRolloff": {
+    "wei": "3646317073170731892736",
+    "decimal": "3646.317073170731892736"
+   },
+   "zeroCrossingRate": {
+    "wei": "136905760434925504",
+    "decimal": "0.136905760434925504"
+   },
+   "spectralBandwidth": {
+    "wei": "2083069488355868672000",
+    "decimal": "2083.069488355868672000"
+   },
+   "spectralFlux": {
+    "wei": "0",
+    "decimal": "0.000000000000000000"
+   },
+   "harmonicNoiseRatio": {
+    "wei": "12802264079067373568",
+    "decimal": "12.802264079067373568"
+   }
+  },
+  "canonical": "{\"v\":\"dvscope/1\",\"precision\":18,\"metrics\":{\"rms\":{\"wei\":\"87257224117688832\",\"decimal\":\"0.087257224117688832\"},\"dominantFrequency\":{\"wei\":\"387219512195122003968\",\"decimal\":\"387.219512195122003968\"},\"spectralCentroid\":{\"wei\":\"1938320799974747799552\",\"decimal\":\"1938.320799974747799552\"},\"spectralRolloff\":{\"wei\":\"3646317073170731892736\",\"decimal\":\"3646.317073170731892736\"},\"zeroCrossingRate\":{\"wei\":\"136905760434925504\",\"decimal\":\"0.136905760434925504\"},\"spectralBandwidth\":{\"wei\":\"2083069488355868672000\",\"decimal\":\"2083.069488355868672000\"},\"spectralFlux\":{\"wei\":\"0\",\"decimal\":\"0.000000000000000000\"},\"harmonicNoiseRatio\":{\"wei\":\"12802264079067373568\",\"decimal\":\"12.802264079067373568\"}}}",
+  "params": {
+   "fft": 2048,
+   "hop": 512,
+   "window": "hann",
+   "sampleRate": 22050,
+   "framesAveraged": true,
+   "silenceFloorRms": 0.01
+  }
+ },
+ "provenance": {
+  "text": "the first 30 s of the rendered reading of /map, from block 1",
+  "source": "/tmp/claude-1000/-home-hacker-DeltaVerse/d153e65c-acc7-49fa-86e9-824b172abf31/scratchpad/tpl/wav/espeak-jaimla.wav",
+  "measuredAt": "2026-09-24",
+  "tool": "voaice.py voaice/1",
+  "render": {
+   "doc": "map",
+   "url": "https://deltaverse.pythai.net/audio/map/jaimla/part-01.opus",
+   "generated": "2026-09-02T23:22:55.179Z",
+   "engine": "espeak-ng 1.51 → opusenc 24kbps mono",
+   "seconds": 822.422,
+   "clip": "from the second mark (block 1, after the title) for 30 s, decoded to 16-bit mono 22050 Hz with ffmpeg"
+  }
+ },
+ "synthesis": null,
+ "recipe": {
+  "source": "DeltaVerse engine/ngn/voices.js ratios (rate, pitch) on the reference, mapped onto espeak-ng",
+  "renderer": "DeltaVerse scripts/render-listen.mjs (archive/espeak-ng-store-2026-09-02/render-listen.mjs)",
+  "engine": "espeak-ng 1.51",
+  "voice": "en-us",
+  "base": {
+   "wpm": 175,
+   "pitch": 50
+  },
+  "wpm": 161,
+  "pitch": 46,
+  "derivedFrom": "neural ×0.92 rate ×0.92 pitch",
+  "command": "espeak-ng -v en-us -s 161 -p 46 -w out.wav  (text on stdin)",
+  "encode": "opusenc --bitrate 24 --downmix-mono",
+  "store": "/audio/<doc>/<voice>/part-NN.opus + manifest.json with per-block marks"
+ },
+ "note": "The espeak-ng lineage of this voice — the first rendered store of the realm (2026-09-02), before neural became piper en_GB-alan-medium on 2026-09-03. Kept for posterity: a stated ratio on the reference, demonstrated on a different engine."
+}

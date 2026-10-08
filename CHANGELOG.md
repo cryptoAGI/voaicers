@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased — vclone
+
+- `src/vclone.rs`: the vprint (`dvscope/1`) byte-identical to cryptoAGI/voaice `tools/vprint.py`. Checked on 2,000
+  recorded metric sets (`testing/vclone/make_oracle.py`, which names the vprint.py it ran by sha256) and on all 10
+  measured `.voaice` identities, every field (`tests/vclone.rs`).
+- The forge log (`vclone-event/1`): hash-chained events for capture, measure, ref, consent, model, actor, prompt,
+  skill, tool, language and forge, and `mintable()`.
+- `src/json.rs` (an order-keeping JSON reader and writer) and `src/sha512.rs` (FIPS 180-4), in-crate: still zero
+  dependencies.
+- `voaice vclone check | print | log`. Plan and TODO: [docs/VCLONE.md](docs/VCLONE.md).
+
 ## 0.0.2 — 2026-10-08 — the mel, six times faster, still 0 ULP
 
 **The log-mel front end without the waste: no allocation per frame, no padded copy of the audio, vectors only

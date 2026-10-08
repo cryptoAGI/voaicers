@@ -1,0 +1,33 @@
+{
+ "format": "voaice/1",
+ "id": "vclone",
+ "label": "vCLONE",
+ "engine": "voaice",
+ "model": "",
+ "sampleRate": null,
+ "measured": null,
+ "vprint": null,
+ "provenance": {
+  "text": "",
+  "source": "",
+  "measuredAt": "",
+  "tool": "voaice/1 \u2014 template, nothing measured"
+ },
+ "synthesis": null,
+ "_why": [
+  "vCLONE is a voice in the DeltaVerse registry that renders nothing, and its",
+  "registry note says so in three words: 'voice not cloned'. This file is the",
+  "same statement in the same format as the voices that DO exist, so the cast",
+  "has a shape for it rather than a hole.",
+  "",
+  "measured and vprint are null because nothing has been measured. They are",
+  "filled by `voaice.py measure` against a real capture \u2014 web/capture.html",
+  "makes one from a microphone. Until then a null here is the truth and a",
+  "plausible-looking number would not be.",
+  "",
+  "synthesis is the seam. A cloner would satisfy it: given the identity above,",
+  "produce speech. Nothing in this repository implements one. The field exists",
+  "so that the interface is written down and so that a file claiming a voice can",
+  "be asked which model speaks it."
+ ]
+}

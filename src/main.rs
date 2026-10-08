@@ -4,12 +4,15 @@
 //!   voaice info  <model.bin>                                verify the pin, print the model summary
 //!   voaice mel   <model.bin> <in.wav> [out] [--threads N]   the log-mel spectrogram: shape and sha256 (and raw f32 to `out`)
 //!   voaice bench-mel <model.bin> <in.wav> [--threads N]     the mel's heap peak, wall (best of 10), CPU per call, peak RSS
+//!   voaice vclone check <file.voaice>...                   recompute each identity's vprint and compare every field
+//!   voaice vclone print <8 metrics>                         the dvscope/1 print of eight values (vprint.py's twin)
+//!   voaice vclone log <events.jsonl>                        verify a forge log's chain and say whether it is mintable
 //!   voaice version
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::process::ExitCode;
-use voaice::{measure, mel, model::Model, sha256, wav};
+use voaice::{measure, mel, model::Model, sha256, vclone, wav};
 
 /// The system allocator, counting live heap bytes and their peak, so `bench-mel` can report the heap a call needs
 /// (std only: a `GlobalAlloc` wrapper, no crate). Thread stacks are mapped, not allocated, and are not counted.
@@ -136,11 +139,57 @@ fn run(args: &[String]) -> Result<(), String> {
             );
             Ok(())
         }
+        Some("vclone") => vclone_cmd(&args[1..]),
         Some("version") => {
             println!("voaice {} (reference: whisper.cpp 080bbbe8, ggml 0.16.0)", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        _ => Err("usage: voaice info <model.bin> | voaice mel <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-mel <model.bin> <in.wav> [--threads N] | voaice version".into()),
+        _ => Err("usage: voaice info <model.bin> | voaice mel <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-mel <model.bin> <in.wav> [--threads N] | voaice vclone check <file.voaice>... | voaice vclone print <8 metrics> | voaice vclone log <events.jsonl> | voaice version".into()),
+    }
+}
+
+/// `voaice vclone …` — voice identities (src/vclone.rs).
+fn vclone_cmd(a: &[String]) -> Result<(), String> {
+    match a.first().map(String::as_str) {
+        Some("check") if a.len() >= 2 => {
+            let mut bad = 0;
+            for f in &a[1..] {
+                let text = std::fs::read_to_string(f).map_err(|e| format!("{f}: {e}"))?;
+                match vclone::check_identity(&text) {
+                    Ok(vclone::Check::Verified(p)) => println!("verified    {}  {f}", p.short),
+                    Ok(vclone::Check::Unmeasured) => println!("unmeasured  {:16}  {f}", "-"),
+                    Ok(vclone::Check::Mismatch { recomputed, fields }) => {
+                        bad += 1;
+                        println!("MISMATCH    {}  {f}: {}", recomputed.short, fields.join(", "))
+                    }
+                    Err(e) => {
+                        bad += 1;
+                        println!("ERROR       {:16}  {f}: {e}", "-")
+                    }
+                }
+            }
+            if bad > 0 { Err(format!("{bad} file(s) did not verify")) } else { Ok(()) }
+        }
+        Some("print") if a.len() == 9 => {
+            let mut v = [0f64; 8];
+            for (i, s) in a[1..].iter().enumerate() {
+                v[i] = s.parse().map_err(|_| format!("not a number: {s}"))?;
+            }
+            let p = vclone::vprint(&v)?;
+            println!("{}\n{}\n{}\n{}", p.hash, p.hash512, p.uint256, p.canonical);
+            Ok(())
+        }
+        Some("log") if a.len() == 2 => {
+            let text = std::fs::read_to_string(&a[1]).map_err(|e| format!("{}: {e}", a[1]))?;
+            let log = vclone::Log::from_jsonl(&text)?;
+            println!("chain verified: {} events", log.events.len());
+            match vclone::mintable(&log) {
+                Ok(()) => println!("mintable: yes"),
+                Err(why) => println!("mintable: no\n  - {}", why.join("\n  - ")),
+            }
+            Ok(())
+        }
+        _ => Err("usage: voaice vclone check <file.voaice>... | vclone print <rms dominantFrequency spectralCentroid spectralRolloff zeroCrossingRate spectralBandwidth spectralFlux harmonicNoiseRatio> | vclone log <events.jsonl>".into()),
     }
 }
 

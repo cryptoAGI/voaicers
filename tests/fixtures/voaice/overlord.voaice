@@ -1,0 +1,377 @@
+{
+ "format": "voaice/1",
+ "id": "overlord",
+ "label": "OVERLORD",
+ "engine": "layered",
+ "model": "overlord",
+ "sampleRate": 22050,
+ "measured": {
+  "seconds": 30.0,
+  "f0": {
+   "median": 98.88,
+   "p10": 89.27,
+   "p90": 195.13,
+   "rawMin": 73.01,
+   "rawMax": 306.25,
+   "frames": 710,
+   "octaveErrorFrames": 194,
+   "octaveErrorPct": 27.3,
+   "method": "autocorrelation, 40 ms frames at 20 ms hop, voiced only, r>=0.45",
+   "note": "median with p10-p90; raw min/max are kept but are dominated by octave errors and should not be quoted as the voice's range"
+  },
+  "metrics": {
+   "rms": 0.19016674784979684,
+   "dominantFrequency": 193.609756097561,
+   "spectralCentroid": 2033.8374287232582,
+   "spectralRolloff": 4894.024390243902,
+   "zeroCrossingRate": 0.12419034558985062,
+   "spectralBandwidth": 2508.0216779743705,
+   "spectralFlux": 0.0,
+   "harmonicNoiseRatio": 28.01550927925747
+  }
+ },
+ "vprint": {
+  "hash": "18ff6e3097c5323316fffcd5423c809ee7292d7528599c5faa3cd8aaf6ef267d",
+  "hash512": "89242d1690f15a7f0f8ac2b780e737b4a29f540849d5f922f01b9cba9fb00889626b3c4019805765547869ba3b708a7551091544923c3ce4d7e0c848df40446b",
+  "short": "18ff6e3097c53233",
+  "uint256": "11306814869675746119249411891750722563271542847720401702805732634257251051133",
+  "version": "dvscope/1",
+  "precision18": {
+   "rms": {
+    "wei": "190166747849796832",
+    "decimal": "0.190166747849796832"
+   },
+   "dominantFrequency": {
+    "wei": "193609756097561001984",
+    "decimal": "193.609756097561001984"
+   },
+   "spectralCentroid": {
+    "wei": "2033837428723258228736",
+    "decimal": "2033.837428723258228736"
+   },
+   "spectralRolloff": {
+    "wei": "4894024390243902291968",
+    "decimal": "4894.024390243902291968"
+   },
+   "zeroCrossingRate": {
+    "wei": "124190345589850624",
+    "decimal": "0.124190345589850624"
+   },
+   "spectralBandwidth": {
+    "wei": "2508021677974370648064",
+    "decimal": "2508.021677974370648064"
+   },
+   "spectralFlux": {
+    "wei": "0",
+    "decimal": "0.000000000000000000"
+   },
+   "harmonicNoiseRatio": {
+    "wei": "28015509279257468928",
+    "decimal": "28.015509279257468928"
+   }
+  },
+  "canonical": "{\"v\":\"dvscope/1\",\"precision\":18,\"metrics\":{\"rms\":{\"wei\":\"190166747849796832\",\"decimal\":\"0.190166747849796832\"},\"dominantFrequency\":{\"wei\":\"193609756097561001984\",\"decimal\":\"193.609756097561001984\"},\"spectralCentroid\":{\"wei\":\"2033837428723258228736\",\"decimal\":\"2033.837428723258228736\"},\"spectralRolloff\":{\"wei\":\"4894024390243902291968\",\"decimal\":\"4894.024390243902291968\"},\"zeroCrossingRate\":{\"wei\":\"124190345589850624\",\"decimal\":\"0.124190345589850624\"},\"spectralBandwidth\":{\"wei\":\"2508021677974370648064\",\"decimal\":\"2508.021677974370648064\"},\"spectralFlux\":{\"wei\":\"0\",\"decimal\":\"0.000000000000000000\"},\"harmonicNoiseRatio\":{\"wei\":\"28015509279257468928\",\"decimal\":\"28.015509279257468928\"}}}",
+  "params": {
+   "fft": 2048,
+   "hop": 512,
+   "window": "hann",
+   "sampleRate": 22050,
+   "framesAveraged": true,
+   "silenceFloorRms": 0.01
+  }
+ },
+ "provenance": {
+  "text": "the first 30 s of the rendered reading of /voices, from block 1",
+  "source": "voices-overlord.wav (the 14-layer OVERLORD render of 2026-09-24, measured in a local working directory)",
+  "measuredAt": "2026-09-24",
+  "tool": "voaice.py voaice/1",
+  "render": {
+   "doc": "voices",
+   "url": "https://deltaverse.pythai.net/audio/voices/overlord/part-01.opus",
+   "generated": "2026-09-23T00:21:12.000Z",
+   "engine": "mindX docspeech: layered:en_GB-alan-medium+en_GB-jenny_dioco-medium+en-druid+ancient+en_GB-alan-medium+en-t800+t800+en-earth+leaderofearth+en-earth+voicebox+en_GB-northern_english_male-medium+en-zen+zen+en-hal+hal+en-gb-scotland+sam+en-kitt+kitt+en_GB-alan-medium+en-gb-x-rp+fairydust [unison=octave x0.9441; unison lock=delivery wander<=77ms; overtone=unison x1.1991; overtone lock=delivery wander<=68ms; undertone=octave-down x0.5000; undertone lock=delivery wander<=23ms; floor=octave-down x0.5856; floor lock=delivery wander<=34ms; element=unison x1.0972; element lock=delivery wander<=85ms; box=unison x0.9259; box lock=delivery wander<=70ms; depth=unison x0.7963; depth lock=delivery wander<=73ms; calm=unison x0.9305; calm lock=delivery wander<=87ms; poise=unison x0.9259; poise lock=delivery wander<=54ms; edge=octave x1.2222; edge lock=delivery wander<=171ms; scan=octave x1.4535; scan lock=delivery wander<=193ms; bright=octave x1.9722; bright lock=delivery wander<=23ms; dust=octave x0.6481; dust lock=delivery wander<=83ms] -> libsndfile Ogg/Opus",
+   "seconds": 949.204,
+   "clip": "from the second mark (block 1, after the title) for 30 s, decoded to 16-bit mono 22050 Hz with ffmpeg"
+  }
+ },
+ "synthesis": null,
+ "recipe": {
+  "source": "mindX data/config/docspeech_voices.json → voices[id=overlord]",
+  "renderer": "mindX utils/docspeech/engines.py class Layered, via mindx_backend_service/deltaverse/render/render_cast.py",
+  "registry": {
+   "id": "overlord",
+   "label": "OVERLORD",
+   "title": "overlord — the whole cast in one delivery: neural carries the words and every other voice of the realm is placed on him, above, below and beside, each in its own band and on a measured octave or unison, every one of them locked to his timing",
+   "engine": "layered",
+   "voice": "overlord",
+   "channels": 1,
+   "sentenceSilence": 0.42,
+   "layers": [
+    {
+     "role": "body",
+     "engine": "piper",
+     "voice": "en_GB-alan-medium",
+     "gain": 1.0,
+     "why": "NEURAL — the reference, never stretched. It is the voice that does not move, and it is the timing every other layer is locked to."
+    },
+    {
+     "role": "unison",
+     "engine": "piper",
+     "voice": "en_GB-jenny_dioco-medium",
+     "speed": 0.96,
+     "gain": 0.62,
+     "anchor": "delivery",
+     "harmony": "octave",
+     "why": "JAIMLA — ON the octave by measurement, full range, the one overlay that is allowed a dry onset: she is the second speaker of the statement, not a colour on it (0.62, under him, not beside him)."
+    },
+    {
+     "role": "overtone",
+     "engine": "espeak-ng",
+     "voice": "en-druid+ancient",
+     "rate": 150,
+     "gain": 0.34,
+     "anchor": "delivery",
+     "harmony": "unison",
+     "band": [
+      2400,
+      7500
+     ],
+     "echo": {
+      "ms": 31,
+      "taps": 3,
+      "decay": 0.55,
+      "dry": 0.0
+     },
+     "why": "ANCIENT as the OVERTONE — the whisper-with-tone, pulled onto the body's own fundamental so nothing beats, band-limited to the air above the formants (2400-7500 Hz) where breath and articulation live, entirely in echo. The age in the voice."
+    },
+    {
+     "role": "undertone",
+     "engine": "piper",
+     "voice": "en_GB-alan-medium",
+     "speed": 0.92,
+     "gain": 0.5,
+     "anchor": "delivery",
+     "harmony": "octave-down",
+     "band": [
+      130,
+      260
+     ],
+     "echo": {
+      "ms": 26,
+      "taps": 2,
+      "decay": 0.5,
+      "dry": 0.0
+     },
+     "why": "LEADER as the UNDERTONE — LEADER's own body (the reference at 0.92) an octave BELOW the reference by measurement, band-limited to the upper chest (130-260 Hz, the third to fifth harmonics of the octave below) so the halved formants never show, entirely in echo. The mass under the voice."
+    },
+    {
+     "role": "floor",
+     "engine": "espeak-ng",
+     "voice": "en-t800+t800",
+     "rate": 138,
+     "gain": 0.3,
+     "anchor": "delivery",
+     "harmony": "octave-down",
+     "band": [
+      55,
+      130
+     ],
+     "echo": {
+      "ms": 24,
+      "taps": 2,
+      "decay": 0.5,
+      "dry": 0.0
+     },
+     "why": "T800 as the FLOOR — the face with no warmth in it, an octave under the reference beside LEADER, and let through only under 130 Hz — the fundamental of the octave below and its first harmonic, the part LEADER above it does not carry: the fundamental of the statement, stated. It is the part of OVERLORD that is not open to discussion."
+    },
+    {
+     "role": "element",
+     "engine": "espeak-ng",
+     "voice": "en-earth+leaderofearth",
+     "rate": 140,
+     "gain": 0.2,
+     "anchor": "delivery",
+     "harmony": "unison",
+     "band": [
+      110,
+      260
+     ],
+     "echo": {
+      "ms": 26,
+      "taps": 2,
+      "decay": 0.5,
+      "dry": 0.0
+     },
+     "why": "LEADER OF EARTH as the ELEMENT — the eight-accent build the name comes from, on the body's fundamental, band-limited to 110-260 Hz where it is chest and not words. The same use leader_tone makes of it, at a lower level because it is one of many here."
+    },
+    {
+     "role": "box",
+     "engine": "espeak-ng",
+     "voice": "en-earth+voicebox",
+     "rate": 150,
+     "gain": 0.22,
+     "anchor": "delivery",
+     "harmony": "unison",
+     "band": [
+      260,
+      420
+     ],
+     "echo": {
+      "ms": 29,
+      "taps": 2,
+      "decay": 0.5,
+      "dry": 0.0
+     },
+     "why": "VOICEBOX — formant synthesis that does not hide what it is, on the body's fundamental in the low-formant band (260-420 Hz, above LEADER OF EARTH), where a machine's vowels give the body a machine's floor without being able to say anything."
+    },
+    {
+     "role": "depth",
+     "engine": "piper",
+     "voice": "en_GB-northern_english_male-medium",
+     "speed": 0.9,
+     "gain": 0.26,
+     "anchor": "delivery",
+     "harmony": "unison",
+     "band": [
+      420,
+      900
+     ],
+     "echo": {
+      "ms": 33,
+      "taps": 3,
+      "decay": 0.55,
+      "dry": 0.0
+     },
+     "why": "sAGI — the second neural male, on the body's fundamental in the warmth band (420-900 Hz) where the vowels have their weight. A different model on the same pitch is a chorus, and in echo a chorus is depth."
+    },
+    {
+     "role": "calm",
+     "engine": "espeak-ng",
+     "voice": "en-zen+zen",
+     "rate": 150,
+     "gain": 0.2,
+     "anchor": "delivery",
+     "harmony": "unison",
+     "band": [
+      900,
+      1500
+     ],
+     "echo": {
+      "ms": 37,
+      "taps": 3,
+      "decay": 0.6,
+      "dry": 0.0
+     },
+     "why": "ZEN — the syllable-timed calm, on the body's fundamental in the upper-vowel band (900-1500 Hz), with the longest tail of any layer here: the part of the voice that is in no hurry."
+    },
+    {
+     "role": "poise",
+     "engine": "espeak-ng",
+     "voice": "en-hal+hal",
+     "rate": 132,
+     "gain": 0.22,
+     "anchor": "delivery",
+     "harmony": "unison",
+     "band": [
+      1500,
+      2400
+     ],
+     "echo": {
+      "ms": 30,
+      "taps": 3,
+      "decay": 0.55,
+      "dry": 0.0
+     },
+     "why": "H.A.L — soft, warm, impeccably polite, on the body's fundamental in the presence band (1500-2400 Hz), where a voice is heard to be at ease. Nothing in OVERLORD's delivery acknowledges the situation either."
+    },
+    {
+     "role": "edge",
+     "engine": "espeak-ng",
+     "voice": "en-gb-scotland+sam",
+     "rate": 170,
+     "gain": 0.2,
+     "anchor": "delivery",
+     "harmony": "octave",
+     "band": [
+      2400,
+      3200
+     ],
+     "echo": {
+      "ms": 27,
+      "taps": 2,
+      "decay": 0.5,
+      "dry": 0.0
+     },
+     "why": "SAM — the neutral Scottish voice, on the OCTAVE with jaimla, in the consonant band (2400-3200 Hz) where words are told apart: the edge on the articulation."
+    },
+    {
+     "role": "scan",
+     "engine": "espeak-ng",
+     "voice": "en-kitt+kitt",
+     "rate": 160,
+     "gain": 0.18,
+     "anchor": "delivery",
+     "harmony": "octave",
+     "band": [
+      4000,
+      5200
+     ],
+     "echo": {
+      "ms": 23,
+      "taps": 2,
+      "decay": 0.45,
+      "dry": 0.0
+     },
+     "why": "KITT — forward and quick, on the OCTAVE in the brightness band (4000-5200 Hz), the shortest tail here: the scanner on the front of the voice."
+    },
+    {
+     "role": "bright",
+     "engine": "piper",
+     "voice": "en_GB-alan-medium",
+     "speed": 1.08,
+     "gain": 0.18,
+     "anchor": "delivery",
+     "harmony": "octave",
+     "band": [
+      3200,
+      4000
+     ],
+     "echo": {
+      "ms": 25,
+      "taps": 2,
+      "decay": 0.5,
+      "dry": 0.0
+     },
+     "why": "OVIE — quicker and brighter, made literal: the reference itself at ovie's own 1.08 speed and an OCTAVE up by measurement (the pitch ovie declares cannot survive a fitted layer, so it is made rather than declared), in the presence band between SAM and KITT (3200-4000 Hz) and in echo. It is watching."
+    },
+    {
+     "role": "dust",
+     "engine": "espeak-ng",
+     "voice": "en-gb-x-rp+fairydust",
+     "rate": 168,
+     "gain": 0.16,
+     "anchor": "delivery",
+     "harmony": "octave",
+     "band": [
+      5200,
+      11000
+     ],
+     "echo": {
+      "ms": 35,
+      "taps": 3,
+      "decay": 0.6,
+      "dry": 0.0
+     },
+     "why": "FAIRYDUST — jaimla's template lifted, on the OCTAVE in the air (5200-11000 Hz): the sparkle on the very top of the voice, and the quietest thing in it."
+    }
+   ],
+   "tier": "participant",
+   "accent": "every accent in the cast at once: Southern English carries the words; British female, the druid, Earth, the North, the syllable-timed East, the two American machines, Scotland and Received Pronunciation are placed on it",
+   "gender": "all of them",
+   "measured": "every interval — the octaves, the unisons and the octaves-down — is measured per render, and so is the timing: the manifest reports the largest wander each layer's delivery had against the reference's before it was locked",
+   "note": "UNISON HAS NO SINGLE OWNER. Two people saying the same words together is what a choir does to a solo line: the pitch stops belonging to a person and starts belonging to the statement. That is the register the realm uses about itself, and the whole realm now says it. THE OCTAVE IS CLOSED BY MEASUREMENT, and the figure this voice was built on was wrong: 94.6 Hz against 183.8 Hz is a ratio of 1.943, which three places in the codebase called \"eleven cents flat of an octave\". It is FIFTY — 1200*log2(1.943/2) = -50.1 cents, a quarter tone — and jaimla at 183.8 against the 189.2 an octave above neural beat 5.4 times a second. `harmony` measures both f0 on the document's own opening and pulls every layer onto its stated interval; a layer whose fundamental cannot be measured, or whose correction would be more than an octave, is left on its own pitch rather than pitched by a guess, and says so by its absence from the harmony report."
+  },
+  "harmony": "every interval is MEASURED per render (autocorrelation f0 on the body and the layer) and reported in the render manifest as a multiplier per layer; the registry names the interval, the render proves it"
+ },
+ "note": "OVERLORD is fourteen voices in one delivery: neural carries the words and the rest of the cast is placed on him in bands. The f0 tracker sees two fundamentals — the body near 99 Hz and Jaimla on the octave near 195 — so p90 is the octave and 27% of frames are 'octave errors' by the tracker's own definition. That is not an error in the voice; it is the chord. Compare OVERLORD by its eight metrics, not by a single f0."
+}

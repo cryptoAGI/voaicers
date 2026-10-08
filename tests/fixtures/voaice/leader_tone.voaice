@@ -1,0 +1,193 @@
+{
+ "format": "voaice/1",
+ "id": "leader_tone",
+ "label": "LEADER",
+ "engine": "layered",
+ "model": "leader_harmony",
+ "sampleRate": 22050,
+ "measured": {
+  "seconds": 30.0,
+  "f0": {
+   "median": 86.64,
+   "p10": 76.64,
+   "p90": 114.25,
+   "rawMin": 61.94,
+   "rawMax": 386.84,
+   "frames": 724,
+   "octaveErrorFrames": 44,
+   "octaveErrorPct": 6.1,
+   "method": "autocorrelation, 40 ms frames at 20 ms hop, voiced only, r>=0.45",
+   "note": "median with p10-p90; raw min/max are kept but are dominated by octave errors and should not be quoted as the voice's range"
+  },
+  "metrics": {
+   "rms": 0.1935335945155071,
+   "dominantFrequency": 86.04878048780488,
+   "spectralCentroid": 1860.8130982780922,
+   "spectralRolloff": 4130.341463414634,
+   "zeroCrossingRate": 0.09798363999006184,
+   "spectralBandwidth": 2196.5217317111674,
+   "spectralFlux": 0.0,
+   "harmonicNoiseRatio": 46.068323321447274
+  }
+ },
+ "vprint": {
+  "hash": "876f7c3ad256b2dd8cfb0c467ddf3d138bbf7b92c2fecad9b644d5b22f535eb9",
+  "hash512": "18e10b19d0610cd38fdda9b87ca04521235607df546ea96d96f9ae27ffa9852225840e8df244f9454c371e5ff78268b8039efeeabfdd2adfc53d6bc827e6ca91",
+  "short": "876f7c3ad256b2dd",
+  "uint256": "61259211985306518839676870033959809589425029186327699990893276127815001136825",
+  "version": "dvscope/1",
+  "precision18": {
+   "rms": {
+    "wei": "193533594515507104",
+    "decimal": "0.193533594515507104"
+   },
+   "dominantFrequency": {
+    "wei": "86048780487804878848",
+    "decimal": "86.048780487804878848"
+   },
+   "spectralCentroid": {
+    "wei": "1860813098278092275712",
+    "decimal": "1860.813098278092275712"
+   },
+   "spectralRolloff": {
+    "wei": "4130341463414633660416",
+    "decimal": "4130.341463414633660416"
+   },
+   "zeroCrossingRate": {
+    "wei": "97983639990061840",
+    "decimal": "0.097983639990061840"
+   },
+   "spectralBandwidth": {
+    "wei": "2196521731711167365120",
+    "decimal": "2196.521731711167365120"
+   },
+   "spectralFlux": {
+    "wei": "0",
+    "decimal": "0.000000000000000000"
+   },
+   "harmonicNoiseRatio": {
+    "wei": "46068323321447276544",
+    "decimal": "46.068323321447276544"
+   }
+  },
+  "canonical": "{\"v\":\"dvscope/1\",\"precision\":18,\"metrics\":{\"rms\":{\"wei\":\"193533594515507104\",\"decimal\":\"0.193533594515507104\"},\"dominantFrequency\":{\"wei\":\"86048780487804878848\",\"decimal\":\"86.048780487804878848\"},\"spectralCentroid\":{\"wei\":\"1860813098278092275712\",\"decimal\":\"1860.813098278092275712\"},\"spectralRolloff\":{\"wei\":\"4130341463414633660416\",\"decimal\":\"4130.341463414633660416\"},\"zeroCrossingRate\":{\"wei\":\"97983639990061840\",\"decimal\":\"0.097983639990061840\"},\"spectralBandwidth\":{\"wei\":\"2196521731711167365120\",\"decimal\":\"2196.521731711167365120\"},\"spectralFlux\":{\"wei\":\"0\",\"decimal\":\"0.000000000000000000\"},\"harmonicNoiseRatio\":{\"wei\":\"46068323321447276544\",\"decimal\":\"46.068323321447276544\"}}}",
+  "params": {
+   "fft": 2048,
+   "hop": 512,
+   "window": "hann",
+   "sampleRate": 22050,
+   "framesAveraged": true,
+   "silenceFloorRms": 0.01
+  }
+ },
+ "provenance": {
+  "text": "the first 30 s of the rendered reading of /voices, from block 1",
+  "source": "/tmp/claude-1000/-home-hacker-DeltaVerse/d153e65c-acc7-49fa-86e9-824b172abf31/scratchpad/tpl/wav/voices-leader_tone.wav",
+  "measuredAt": "2026-09-24",
+  "tool": "voaice.py voaice/1",
+  "render": {
+   "doc": "voices",
+   "url": "https://deltaverse.pythai.net/audio/voices/leader_tone/part-01.opus",
+   "generated": "2026-09-23T20:01:12.000Z",
+   "engine": "mindX docspeech: layered:en_GB-alan-medium+en-earth+leaderofearth+en_GB-jenny_dioco-medium [resonance=octave x0.7967] -> libsndfile Ogg/Opus",
+   "seconds": 1218.276,
+   "clip": "from the second mark (block 1, after the title) for 30 s, decoded to 16-bit mono 22050 Hz with ffmpeg"
+  }
+ },
+ "synthesis": null,
+ "recipe": {
+  "source": "mindX data/config/docspeech_voices.json → voices[id=leader_harmony] (the alternate face `leader_tone` of leaderofearth)",
+  "renderer": "Layered via render_cast.py",
+  "registry": {
+   "id": "leader_harmony",
+   "label": "LEADER",
+   "surfaces": [
+    "deltaverse"
+   ],
+   "hidden": true,
+   "title": "LEADER",
+   "engine": "layered",
+   "voice": "leader_harmony",
+   "channels": 1,
+   "sentenceSilence": 0.85,
+   "layers": [
+    {
+     "role": "body",
+     "engine": "piper",
+     "voice": "en_GB-alan-medium",
+     "speed": 0.92,
+     "pitch": 0.88,
+     "gain": 1.0,
+     "why": "LEADER's own body, to the number. This face differs by what is BEHIND the voice, never by who is speaking."
+    },
+    {
+     "role": "element",
+     "engine": "espeak-ng",
+     "voice": "en-earth+leaderofearth",
+     "rate": 140,
+     "gain": 0.3,
+     "band": [
+      110,
+      900
+     ],
+     "anchor": true,
+     "echo": {
+      "ms": 26,
+      "taps": 2,
+      "decay": 0.5,
+      "dry": 0.0
+     },
+     "why": "LEADER OF EARTH AS TONE. The eight world Englishes come back as the element and not as a companion: band-limited to 110-900 Hz, below the consonant band, so it cannot form a word, and delivered only as echo, so it has no onset to localise."
+    },
+    {
+     "role": "resonance",
+     "engine": "piper",
+     "voice": "en_GB-jenny_dioco-medium",
+     "speed": 0.92,
+     "harmony": "octave",
+     "anchor": true,
+     "gain": 0.62,
+     "band": [
+      420,
+      5200
+     ],
+     "echo": {
+      "ms": 34,
+      "taps": 3,
+      "decay": 0.55,
+      "dry": 0.0
+     },
+     "why": "OVERLORD's ratio — 1.00 to 0.62, male to female — IN ECHO, and moved onto a true octave by measurement."
+    }
+   ],
+   "eq": [
+    [
+     60,
+     170,
+     2.5
+    ],
+    [
+     260,
+     520,
+     -3.5
+    ],
+    [
+     1900,
+     4200,
+     4.0
+    ],
+    [
+     5200,
+     11000,
+     -2.0
+    ]
+   ],
+   "note": "THE OVERLAY LESSON, RESOLVED RATHER THAN ABANDONED. LEADER dropped its overtone because a second voice mixed DRY is company and not character — it has its own onsets, and the ear localises onsets, so in the intelligibility band it formed words and outside it it droned. OVERLORD's answer was unison. THIS is the third answer and it is the one that makes a TIMBRE: keep OVERLORD's male-to-female ratio (1.00 : 0.62) and put the overlay entirely IN ECHO — no dry signal at all, three taps at 34 ms decaying 0.55 — so every onset it has arrives inside the body's own and it is heard as the voice's tail. A tail is a timbre. Under that sits LEADER OF EARTH itself as the element: the espeak build, band-limited to 110-900 Hz and also in echo, giving the mass the eight accents were always for without letting them speak. HARMONY IS MEASURED, NOT WRITTEN DOWN: the octave is computed from the f0 the two models actually render on this document's own opening, because a number typed here would be wrong by whatever the retune moved, and it would still look deliberate — which is precisely what happened to OVERLORD, whose own note called its interval eleven cents flat when the arithmetic says fifty.",
+   "measured": "the interval is measured per render; the harmony report is in the manifest",
+   "tier": "participant",
+   "accent": "Earth, with the eight accents as its element",
+   "gender": "male, with a female resonance an octave above"
+  }
+ },
+ "note": "LEADER's second face: the same body to the number, with LEADER OF EARTH (espeak en-earth) band-limited below the consonant band as the ELEMENT and Jaimla an octave above entirely IN ECHO at OVERLORD's 1.00:0.62 ratio. What differs is what is behind the voice, never who is speaking. The operator keeps this face on `anchor: true` by choice."
+}

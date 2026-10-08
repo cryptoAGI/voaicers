@@ -1,0 +1,151 @@
+{
+ "format": "voaice/1",
+ "id": "leaderofearth",
+ "label": "LEADER",
+ "engine": "layered",
+ "model": "leader",
+ "sampleRate": 22050,
+ "measured": {
+  "seconds": 30.0,
+  "f0": {
+   "median": 83.52,
+   "p10": 75.77,
+   "p90": 95.45,
+   "rawMin": 62.29,
+   "rawMax": 350.0,
+   "frames": 655,
+   "octaveErrorFrames": 4,
+   "octaveErrorPct": 0.6,
+   "method": "autocorrelation, 40 ms frames at 20 ms hop, voiced only, r>=0.45",
+   "note": "median with p10-p90; raw min/max are kept but are dominated by octave errors and should not be quoted as the voice's range"
+  },
+  "metrics": {
+   "rms": 0.1846550702405825,
+   "dominantFrequency": 86.04878048780488,
+   "spectralCentroid": 1947.9420926510015,
+   "spectralRolloff": 4334.707317073171,
+   "zeroCrossingRate": 0.10733699620327103,
+   "spectralBandwidth": 2257.786898743543,
+   "spectralFlux": 0.0,
+   "harmonicNoiseRatio": 47.71073885718787
+  }
+ },
+ "vprint": {
+  "hash": "60231d6f47ab746af35c861ace7b5756cea3e21193def2e151932b2742089488",
+  "hash512": "0168c5137772367bb9b3df63cad85ddab1344cb1e372c0c21cf9934bdf66840926c3139b6138fc741b027b23d023dc038fc10b4d447ef72da431c939defe33a0",
+  "short": "60231d6f47ab746a",
+  "uint256": "43484076262006658819891552101233644029125607298677451475337617446264401073288",
+  "version": "dvscope/1",
+  "precision18": {
+   "rms": {
+    "wei": "184655070240582496",
+    "decimal": "0.184655070240582496"
+   },
+   "dominantFrequency": {
+    "wei": "86048780487804878848",
+    "decimal": "86.048780487804878848"
+   },
+   "spectralCentroid": {
+    "wei": "1947942092651001544704",
+    "decimal": "1947.942092651001544704"
+   },
+   "spectralRolloff": {
+    "wei": "4334707317073171185664",
+    "decimal": "4334.707317073171185664"
+   },
+   "zeroCrossingRate": {
+    "wei": "107336996203271024",
+    "decimal": "0.107336996203271024"
+   },
+   "spectralBandwidth": {
+    "wei": "2257786898743543201792",
+    "decimal": "2257.786898743543201792"
+   },
+   "spectralFlux": {
+    "wei": "0",
+    "decimal": "0.000000000000000000"
+   },
+   "harmonicNoiseRatio": {
+    "wei": "47710738857187868672",
+    "decimal": "47.710738857187868672"
+   }
+  },
+  "canonical": "{\"v\":\"dvscope/1\",\"precision\":18,\"metrics\":{\"rms\":{\"wei\":\"184655070240582496\",\"decimal\":\"0.184655070240582496\"},\"dominantFrequency\":{\"wei\":\"86048780487804878848\",\"decimal\":\"86.048780487804878848\"},\"spectralCentroid\":{\"wei\":\"1947942092651001544704\",\"decimal\":\"1947.942092651001544704\"},\"spectralRolloff\":{\"wei\":\"4334707317073171185664\",\"decimal\":\"4334.707317073171185664\"},\"zeroCrossingRate\":{\"wei\":\"107336996203271024\",\"decimal\":\"0.107336996203271024\"},\"spectralBandwidth\":{\"wei\":\"2257786898743543201792\",\"decimal\":\"2257.786898743543201792\"},\"spectralFlux\":{\"wei\":\"0\",\"decimal\":\"0.000000000000000000\"},\"harmonicNoiseRatio\":{\"wei\":\"47710738857187868672\",\"decimal\":\"47.710738857187868672\"}}}",
+  "params": {
+   "fft": 2048,
+   "hop": 512,
+   "window": "hann",
+   "sampleRate": 22050,
+   "framesAveraged": true,
+   "silenceFloorRms": 0.01
+  }
+ },
+ "provenance": {
+  "text": "the first 30 s of the rendered reading of /voices, from block 1",
+  "source": "/tmp/claude-1000/-home-hacker-DeltaVerse/d153e65c-acc7-49fa-86e9-824b172abf31/scratchpad/tpl/wav/voices-leaderofearth.wav",
+  "measuredAt": "2026-09-24",
+  "tool": "voaice.py voaice/1",
+  "render": {
+   "doc": "voices",
+   "url": "https://deltaverse.pythai.net/audio/voices/leaderofearth/part-01.opus",
+   "generated": "2026-09-23T18:43:10.000Z",
+   "engine": "mindX docspeech: layered:en_GB-alan-medium -> libsndfile Ogg/Opus",
+   "seconds": 1163.444,
+   "clip": "from the second mark (block 1, after the title) for 30 s, decoded to 16-bit mono 22050 Hz with ffmpeg"
+  }
+ },
+ "synthesis": null,
+ "recipe": {
+  "source": "mindX data/config/docspeech_voices.json → voices[id=leaderofearth] (IMMUTABLE)",
+  "renderer": "Layered via render_cast.py",
+  "registry": {
+   "id": "leaderofearth",
+   "immutable": true,
+   "label": "LEADER",
+   "title": "leaderofearth — one accent assembled from eight world Englishes (royal, US, Australian, Indian, Mexican, Brazilian, Brooklyn, Slavic); deepest and slowest voice in the set",
+   "engine": "layered",
+   "voice": "leader",
+   "layers": [
+    {
+     "role": "body",
+     "engine": "piper",
+     "voice": "en_GB-alan-medium",
+     "speed": 0.92,
+     "pitch": 0.88,
+     "gain": 1.0,
+     "why": "the reference, lower and unhurried — and the ONLY voice here"
+    }
+   ],
+   "eq": [
+    [
+     60,
+     170,
+     2.5
+    ],
+    [
+     260,
+     520,
+     -3.5
+    ],
+    [
+     1900,
+     4200,
+     4.0
+    ],
+    [
+     5200,
+     11000,
+     -2.0
+    ]
+   ],
+   "sentenceSilence": 0.85,
+   "tier": "participant",
+   "accent": "Earth — one accent assembled from royal, US, Australian, Indian, Mexican, Brazilian, Brooklyn and Slavic English, on a Caribbean base",
+   "gender": "male",
+   "measured": "f0 117.9 Hz · centroid 1484 · presence 2-5 kHz 23.7% — the deepest voice in the set, and no longer the darkest: presence was 12.4% before the retune",
+   "note": "A LEADER IS ONE VOICE, and it is a SHAPED one. It was the reference with an espeak overtone mixed on, and however that overtone was placed it was a second person — in the intelligibility band it formed words, and outside it it became a drone, which is worse. Two voices saying the same thing is unison, and unison is OVERLORD's idea. So: the reference at pitch 0.88 and speed 0.92 (about 88 Hz against neural's 101, a shade under a tenth slower), with a broadcast EQ instead of a companion, and the 0.85 s pause after every conclusion that makes it deliberate rather than merely slow. It inherits neural's clarity because it IS neural."
+  },
+  "declaredRate": "piper renders at 22050 Hz and the file is declared at 22050×0.88 = 19404 Hz for the 0.88 pitch; the measurement clip was resampled to 22050"
+ },
+ "note": "LEADER is ONE voice, shaped: the reference at speed 0.92 and pitch 0.88 under a four-band broadcast EQ, with a 0.85 s pause after every conclusion. No second speaker. Measured 83.5 Hz median here (75.8–95.5), the deepest voice in the set."
+}

@@ -5,12 +5,17 @@
 //!
 //! 0.0.2 holds the first stages: the model loader with its sha256 guard ([`model`]), the WAV input ([`wav`]) and the
 //! log-mel front end ([`mel`], allocation-free and threaded since 0.0.2, still 0 ULP), plus [`measure`] (CPU time and
-//! peak RSS from `/proc`, for the gate). The encoder and decoder are not here yet (TODO.md).
+//! peak RSS from `/proc`, for the gate). [`vclone`] holds voaice's voice identities: the vprint, byte-identical to
+//! cryptoAGI/voaice's vprint.py, and the hash-chained forge log (docs/VCLONE.md). The encoder and decoder are not
+//! here yet (TODO.md).
 
+pub mod json;
 pub mod measure;
 pub mod mel;
 pub mod model;
 pub mod sha256;
+pub mod sha512;
+pub mod vclone;
 pub mod wav;
 
 /// Distance in units in the last place between two f32 values (0 = the same bits, or +0 against -0).

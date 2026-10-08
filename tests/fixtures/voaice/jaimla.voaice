@@ -1,0 +1,90 @@
+{
+ "format": "voaice/1",
+ "id": "jaimla",
+ "label": "JAIMLA",
+ "engine": "piper",
+ "model": "en_GB-jenny_dioco-medium",
+ "sampleRate": 22050,
+ "measured": {
+  "seconds": 26.374,
+  "f0": {
+   "median": 182.23,
+   "p10": 162.13,
+   "p90": 220.5,
+   "rawMin": 77.92,
+   "rawMax": 329.1,
+   "frames": 771,
+   "octaveErrorFrames": 15,
+   "octaveErrorPct": 1.9,
+   "method": "autocorrelation, 40 ms frames at 20 ms hop, voiced only, r>=0.45",
+   "note": "median with p10-p90; raw min/max are kept but are dominated by octave errors and should not be quoted as the voice's range"
+  },
+  "metrics": {
+   "rms": 0.19714308815262716,
+   "dominantFrequency": 182.85365853658536,
+   "spectralCentroid": 2771.925928627484,
+   "spectralRolloff": 7142.048780487805,
+   "zeroCrossingRate": 0.14685214632497542,
+   "spectralBandwidth": 3064.559488173902,
+   "spectralFlux": 0.0,
+   "harmonicNoiseRatio": 31.348880897757777
+  }
+ },
+ "vprint": {
+  "hash": "2275133be7cbf6a0eee80776f9cc3ef3748487d22686160b545480f8cb3c2752",
+  "hash512": "550e7130a24876451a6ad5a90fbb8508ccc6111c2462a941f03aea81af77a5f3aa3afee5abadacd40f7d7c1f7330bb53cb5ab96fcb207710905c6df76274970d",
+  "short": "2275133be7cbf6a0",
+  "uint256": "15585490706638615602527870104957773243959933898391177074723336032174741399378",
+  "version": "dvscope/1",
+  "precision18": {
+   "rms": {
+    "wei": "197143088152627168",
+    "decimal": "0.197143088152627168"
+   },
+   "dominantFrequency": {
+    "wei": "182853658536585363456",
+    "decimal": "182.853658536585363456"
+   },
+   "spectralCentroid": {
+    "wei": "2771925928627483967488",
+    "decimal": "2771.925928627483967488"
+   },
+   "spectralRolloff": {
+    "wei": "7142048780487805108224",
+    "decimal": "7142.048780487805108224"
+   },
+   "zeroCrossingRate": {
+    "wei": "146852146324975424",
+    "decimal": "0.146852146324975424"
+   },
+   "spectralBandwidth": {
+    "wei": "3064559488173902135296",
+    "decimal": "3064.559488173902135296"
+   },
+   "spectralFlux": {
+    "wei": "0",
+    "decimal": "0.000000000000000000"
+   },
+   "harmonicNoiseRatio": {
+    "wei": "31348880897757777920",
+    "decimal": "31.348880897757777920"
+   }
+  },
+  "canonical": "{\"v\":\"dvscope/1\",\"precision\":18,\"metrics\":{\"rms\":{\"wei\":\"197143088152627168\",\"decimal\":\"0.197143088152627168\"},\"dominantFrequency\":{\"wei\":\"182853658536585363456\",\"decimal\":\"182.853658536585363456\"},\"spectralCentroid\":{\"wei\":\"2771925928627483967488\",\"decimal\":\"2771.925928627483967488\"},\"spectralRolloff\":{\"wei\":\"7142048780487805108224\",\"decimal\":\"7142.048780487805108224\"},\"zeroCrossingRate\":{\"wei\":\"146852146324975424\",\"decimal\":\"0.146852146324975424\"},\"spectralBandwidth\":{\"wei\":\"3064559488173902135296\",\"decimal\":\"3064.559488173902135296\"},\"spectralFlux\":{\"wei\":\"0\",\"decimal\":\"0.000000000000000000\"},\"harmonicNoiseRatio\":{\"wei\":\"31348880897757777920\",\"decimal\":\"31.348880897757777920\"}}}",
+  "params": {
+   "fft": 2048,
+   "hop": 512,
+   "window": "hann",
+   "sampleRate": 22050,
+   "framesAveraged": true,
+   "silenceFloorRms": 0.01
+  }
+ },
+ "provenance": {
+  "text": "six DeltaVerse sentences",
+  "source": "jaimla.wav",
+  "measuredAt": "2026-09-03",
+  "tool": "voaice.py voaice/1"
+ },
+ "synthesis": null
+}
