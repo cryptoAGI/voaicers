@@ -339,14 +339,18 @@ impl Log {
 
 /// Whether the voice a forge log describes may be minted, and the reasons when it may not. The rules are the voice
 /// cards' (PYTHAI/voaice cards/), applied to a voice that belongs to a person:
-/// - it was measured (a print exists);
+/// - its voice was measured (a `measure` event with no modality, or `modality: "voice"`; a face print does not count);
 /// - the person consented, with scope `mint`, to this reference (when the voice was cloned from one);
 /// - the engine that speaks it is cleared for that use (`licence_cleared: true` on the ref event; until the cloning
 ///   model's licence is recorded, a cloned voice is not mintable);
 /// - the consent was not revoked later in the log.
 pub fn mintable(log: &Log) -> Result<(), Vec<String>> {
     let mut why = Vec::new();
-    if log.last_of(Kind::Measure).is_none() {
+    // the voice rule: a face measurement (fCLONE, `modality: "face"`) does not stand in for a voiceprint
+    let voice_measured = log.events.iter().any(|e| {
+        e.kind == Kind::Measure && matches!(e.body.get("modality").and_then(Value::as_str), None | Some("voice"))
+    });
+    if !voice_measured {
         why.push("never measured: there is no vprint to commit to".to_string());
     }
     let r = log.last_of(Kind::Ref);
@@ -423,6 +427,8 @@ mod tests {
         let mut log = Log::default();
         log.append(Kind::Capture, "t", "p", Value::Null);
         assert_eq!(mintable(&log).unwrap_err().len(), 2);
+        log.append(Kind::Measure, "t", "p", Value::obj(vec![("modality", Value::str("face"))]));
+        assert_eq!(mintable(&log).unwrap_err().len(), 2, "a face print is not a voiceprint");
         log.append(Kind::Measure, "t", "p", Value::Null);
         log.append(Kind::Ref, "t", "p", Value::obj(vec![("ref", Value::str("r1"))]));
         log.append(Kind::Consent, "t", "p", Value::obj(vec![("scope", Value::str("mint")), ("ref", Value::str("r1"))]));
