@@ -6,6 +6,7 @@
 //! streamair also carries the identities a stream is made from: [`vclone`] (the voice, from voaice.rs) and [`fclone`]
 //! (the face, the faice/1 faceprint and the face mesh), both byte-identical to the JavaScript ollywoo runs.
 pub mod fclone;
+pub mod forensic;
 pub mod identity;
 pub mod ogg;
 

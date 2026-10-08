@@ -1,0 +1,283 @@
+{
+ "oracle": "voaice Forensic.voiceprint",
+ "forensic_sha256": "ca3972fa21f9b9e0fd7092149724941c8e0ca695b0121f433c7dfdd0facb6c4d",
+ "scientific_sha256": "a5be6f8ea786f49d0abaaa05c30db3a0d152f29fb52636d71512b4d822b5cf6c",
+ "cases": [
+  {
+   "wav": "jfk.wav",
+   "sampleRate": 16000,
+   "maxFrames": 400,
+   "features": {
+    "dominantFrequency": "499.6875",
+    "amplitude": "0.10450128378993943",
+    "spectralCentroid": "1208.2115587670214",
+    "spectralRolloff": "2123.65234375",
+    "zeroCrossingRate": "0.100087890625",
+    "harmonicNoiseRatio": "0.32857374271288853"
+   },
+   "framesUsed": 400,
+   "measures": [
+    "499687500000000000000",
+    "104501284000000000",
+    "1208211558767000000000",
+    "2123652343750000000000",
+    "100087891000000000",
+    "328573743000000000"
+   ],
+   "hash": "0x80380a139d8944c3dcd50b5cc2b8027ca0bf51f2a57cebb99e11e281eaf7da40"
+  },
+  {
+   "wav": "jfk.wav",
+   "sampleRate": 16000,
+   "maxFrames": 40,
+   "features": {
+    "dominantFrequency": "439.84375",
+    "amplitude": "0.09230062302016433",
+    "spectralCentroid": "1197.5826605686684",
+    "spectralRolloff": "2103.515625",
+    "zeroCrossingRate": "0.09923095703125",
+    "harmonicNoiseRatio": "0.3115532813361764"
+   },
+   "framesUsed": 40,
+   "measures": [
+    "439843750000000000000",
+    "92300623000000000",
+    "1197582660569000000000",
+    "2103515625000000000000",
+    "99230957000000000",
+    "311553281000000000"
+   ],
+   "hash": "0x2df34ad84be38510595390fce4efb7c4a21d2282cfa3fd19b6e7c48e4ad0f5c1"
+  },
+  {
+   "wav": "jfk.wav",
+   "sampleRate": 16000,
+   "maxFrames": 0,
+   "features": {
+    "dominantFrequency": "496.48909006499537",
+    "amplitude": "0.10441221206494866",
+    "spectralCentroid": "1208.06649573466",
+    "spectralRolloff": "2122.2942780872795",
+    "zeroCrossingRate": "0.10004189153899722",
+    "harmonicNoiseRatio": "0.32559433154770306"
+   },
+   "framesUsed": 1077,
+   "measures": [
+    "496489090065000000000",
+    "104412212000000000",
+    "1208066495735000000000",
+    "2122294278087000000000",
+    "100041892000000000",
+    "325594332000000000"
+   ],
+   "hash": "0x6723b5f7a0979d88752ca8457752fc3f9cab14cad08b6028976c06099be65359"
+  },
+  {
+   "wav": "chirp.wav",
+   "sampleRate": 16000,
+   "maxFrames": 400,
+   "features": {
+    "dominantFrequency": "3164.2830141129034",
+    "amplitude": "0.34194194638142844",
+    "spectralCentroid": "3271.146924639294",
+    "spectralRolloff": "3250.6615423387098",
+    "zeroCrossingRate": "0.3828518775201613",
+    "harmonicNoiseRatio": "0.12677744998627177"
+   },
+   "framesUsed": 248,
+   "measures": [
+    "3164283014113000000000",
+    "341941946000000000",
+    "3271146924639000000000",
+    "3250661542339000000000",
+    "382851878000000000",
+    "126777450000000000"
+   ],
+   "hash": "0xb891c84220048592c25edb33907b4a631281533257f55896c458ad121bb70619"
+  },
+  {
+   "wav": "chirp.wav",
+   "sampleRate": 16000,
+   "maxFrames": 40,
+   "features": {
+    "dominantFrequency": "3095.1171875",
+    "amplitude": "0.344009784073421",
+    "spectralCentroid": "3209.8856500667193",
+    "spectralRolloff": "3176.171875",
+    "zeroCrossingRate": "0.3810546875",
+    "harmonicNoiseRatio": "0.12504746992676977"
+   },
+   "framesUsed": 40,
+   "measures": [
+    "3095117187500000000000",
+    "344009784000000000",
+    "3209885650067000000000",
+    "3176171875000000000000",
+    "381054688000000000",
+    "125047470000000000"
+   ],
+   "hash": "0xff3fa6eec133da48489d4dd141067b89ca518c5d4eee1b9d193f4a69cfb63e93"
+  },
+  {
+   "wav": "chirp.wav",
+   "sampleRate": 16000,
+   "maxFrames": 0,
+   "features": {
+    "dominantFrequency": "3164.2830141129034",
+    "amplitude": "0.34194194638142844",
+    "spectralCentroid": "3271.146924639294",
+    "spectralRolloff": "3250.6615423387098",
+    "zeroCrossingRate": "0.3828518775201613",
+    "harmonicNoiseRatio": "0.12677744998627177"
+   },
+   "framesUsed": 248,
+   "measures": [
+    "3164283014113000000000",
+    "341941946000000000",
+    "3271146924639000000000",
+    "3250661542339000000000",
+    "382851878000000000",
+    "126777450000000000"
+   ],
+   "hash": "0xb891c84220048592c25edb33907b4a631281533257f55896c458ad121bb70619"
+  },
+  {
+   "wav": "noise_loud.wav",
+   "sampleRate": 16000,
+   "maxFrames": 400,
+   "features": {
+    "dominantFrequency": "3533.8807397959185",
+    "amplitude": "0.5630528084593327",
+    "spectralCentroid": "3990.7531406271596",
+    "spectralRolloff": "6789.540816326531",
+    "zeroCrossingRate": "0.4755012356505102",
+    "harmonicNoiseRatio": "0"
+   },
+   "framesUsed": 98,
+   "measures": [
+    "3533880739796000000000",
+    "563052808000000000",
+    "3990753140627000000000",
+    "6789540816327000000000",
+    "475501236000000000",
+    "0"
+   ],
+   "hash": "0x23db4731777a6dd08f09709d30c170fa3fa6cf9e7d10a5382e499096b2453c5f"
+  },
+  {
+   "wav": "noise_loud.wav",
+   "sampleRate": 16000,
+   "maxFrames": 40,
+   "features": {
+    "dominantFrequency": "3389.453125",
+    "amplitude": "0.5662470343532137",
+    "spectralCentroid": "3989.313356444726",
+    "spectralRolloff": "6788.8671875",
+    "zeroCrossingRate": "0.4792724609375",
+    "harmonicNoiseRatio": "0"
+   },
+   "framesUsed": 40,
+   "measures": [
+    "3389453125000000000000",
+    "566247034000000000",
+    "3989313356445000000000",
+    "6788867187500000000000",
+    "479272461000000000",
+    "0"
+   ],
+   "hash": "0xaa4cd8a74a43f87dc3d8ac0cdc2b4b30125be1febf9a155c9a7972f9c967eed9"
+  },
+  {
+   "wav": "noise_loud.wav",
+   "sampleRate": 16000,
+   "maxFrames": 0,
+   "features": {
+    "dominantFrequency": "3533.8807397959185",
+    "amplitude": "0.5630528084593327",
+    "spectralCentroid": "3990.7531406271596",
+    "spectralRolloff": "6789.540816326531",
+    "zeroCrossingRate": "0.4755012356505102",
+    "harmonicNoiseRatio": "0"
+   },
+   "framesUsed": 98,
+   "measures": [
+    "3533880739796000000000",
+    "563052808000000000",
+    "3990753140627000000000",
+    "6789540816327000000000",
+    "475501236000000000",
+    "0"
+   ],
+   "hash": "0x23db4731777a6dd08f09709d30c170fa3fa6cf9e7d10a5382e499096b2453c5f"
+  },
+  {
+   "wav": "short.wav",
+   "sampleRate": 16000,
+   "maxFrames": 400,
+   "features": {
+    "dominantFrequency": "437.5",
+    "amplitude": "0.15721699032297892",
+    "spectralCentroid": "480.7977720546469",
+    "spectralRolloff": "481.0267857142857",
+    "zeroCrossingRate": "0.046875",
+    "harmonicNoiseRatio": "3.623777031414266"
+   },
+   "framesUsed": 28,
+   "measures": [
+    "437500000000000000000",
+    "157216990000000000",
+    "480797772055000000000",
+    "481026785714000000000",
+    "46875000000000000",
+    "3623777031000000000"
+   ],
+   "hash": "0xa98fef447662142322bdcaa4c96b47f23f4ce44a69bce3efbf8f1ccf57839b2a"
+  },
+  {
+   "wav": "short.wav",
+   "sampleRate": 16000,
+   "maxFrames": 40,
+   "features": {
+    "dominantFrequency": "437.5",
+    "amplitude": "0.15721699032297892",
+    "spectralCentroid": "480.7977720546469",
+    "spectralRolloff": "481.0267857142857",
+    "zeroCrossingRate": "0.046875",
+    "harmonicNoiseRatio": "3.623777031414266"
+   },
+   "framesUsed": 28,
+   "measures": [
+    "437500000000000000000",
+    "157216990000000000",
+    "480797772055000000000",
+    "481026785714000000000",
+    "46875000000000000",
+    "3623777031000000000"
+   ],
+   "hash": "0xa98fef447662142322bdcaa4c96b47f23f4ce44a69bce3efbf8f1ccf57839b2a"
+  },
+  {
+   "wav": "short.wav",
+   "sampleRate": 16000,
+   "maxFrames": 0,
+   "features": {
+    "dominantFrequency": "437.5",
+    "amplitude": "0.15721699032297892",
+    "spectralCentroid": "480.7977720546469",
+    "spectralRolloff": "481.0267857142857",
+    "zeroCrossingRate": "0.046875",
+    "harmonicNoiseRatio": "3.623777031414266"
+   },
+   "framesUsed": 28,
+   "measures": [
+    "437500000000000000000",
+    "157216990000000000",
+    "480797772055000000000",
+    "481026785714000000000",
+    "46875000000000000",
+    "3623777031000000000"
+   ],
+   "hash": "0xa98fef447662142322bdcaa4c96b47f23f4ce44a69bce3efbf8f1ccf57839b2a"
+  }
+ ]
+}

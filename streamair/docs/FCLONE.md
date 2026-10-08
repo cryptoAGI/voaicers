@@ -55,9 +55,14 @@ node testing/fclone/make_oracle.mjs <faicey>/src/face_clone 1000 > tests/fixture
 
 ## TODO
 
-- [ ] **The forensic voice print** that `/voicey/measure` returns (six measures), beside `dvscope/1`. The
-      tracking item is in voaice.rs `docs/VCLONE.md`. Until it is ported, a persona print built from ollywoo's
-      forensic voice print is checked only in JavaScript.
+- [x] **The forensic voice print's encoding** (`src/forensic.rs`): the print `/voicey/measure` returns, from its six
+      feature means, sample rate and frame count. It matches voaice's `Forensic.js` on 12 / 12 cases (four real
+      WAVs, three frame budgets each), the hash and every measure.
+- [ ] **The forensic DSP**: voice-activity detection, the analyser's FFT, pitch, flatness and HNR, which produce
+      those features. V8 takes `Math.log` and `Math.exp` from fdlibm, so they get the treatment `atan2` got.
+- [ ] **`framesUsed` from the server.** `/voicey/measure` returns the features and the hash but not `framesUsed`,
+      so a print it hands out cannot be recomputed from its own response. One field on voaice's server (mindX
+      `voaice/server.js` `_measure`) closes it.
 - [ ] **Read identities from any `.opus`.** The test reads the tags from streamair's own single-page OpusTags. The
       general reader is voaice.rs 0.0.4's streaming Ogg reader; wire `Identity::from_comments` to it when it lands,
       and add `streamair identity <file.opus>`.
