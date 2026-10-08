@@ -38,10 +38,8 @@ overhead at 50 packets per page is under 1% of a speech stream at 24 kbps.
 
 ## Credit
 
-Opus is [RFC 6716](https://www.rfc-editor.org/rfc/rfc6716), by Jean-Marc Valin, Koen Vos, Timothy B. Terriberry
-and contributors. The reference implementation is [libopus](https://opus-codec.org) (BSD-3-Clause), from Xiph.Org
-and contributors. Ogg is [RFC 3533](https://www.rfc-editor.org/rfc/rfc3533). streamair uses libopus only as the
-oracle; it copies no code from it.
+Opus (RFC 6716), its Ogg encapsulation (RFC 7845), Ogg (RFC 3533) and libopus, the oracle, are credited in
+[ATTRIBUTION.md](../ATTRIBUTION.md). streamair copies no code from libopus.
 
 Licence: MIT OR Apache-2.0 (the repository's [LICENSE-MIT](../LICENSE-MIT) and [LICENSE-APACHE](../LICENSE-APACHE)).
 

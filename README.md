@@ -51,17 +51,10 @@ how the oracle will check each, is in [TODO.md](TODO.md).
 
 ## The reference
 
-[`upstream/PIN`](upstream/PIN) pins it by commit, because **no whisper.cpp release tag bundles ggml 0.16.0**
-(v1.9.1 has 0.15.1, v1.9.2 has 0.18.1). ggml 0.16.0 was on master from 2026-07-10 to 2026-07-31; production was
-built on 2026-07-22 00:13 UTC from master, whose head then was **`080bbbe85230f624f0b52127f1ae1218247989f9`**
-(`v1.9.1-154-g080bbbe8`, `WHISPER_VERSION` 1.9.1, ggml 0.16.0). **Confirmed against production** (read-only,
-2026-10-07): production's `libwhisper.so.1.9.1` + ggml 0.16.0 was built then, and the next master commit is dated
-2026-07-28; production's `libwhisper` has no FMA instructions either, so the mel's bit-exactness holds there. Details:
-[docs/REFERENCE.md](docs/REFERENCE.md).
-
-Built CPU-only: `cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=ON`, gcc 11.4.0, glibc 2.35,
-an AVX2+FMA host. The model: `ggml-tiny.en.bin`, 77,704,715 bytes (production's size),
-sha256 `921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f` (equal to Hugging Face's `X-Linked-ETag`).
+voaice.rs is measured against the whisper.cpp build that mindX production runs, pinned by commit in
+[`upstream/PIN`](upstream/PIN) (ggml 0.16.0, `ggml-tiny.en.bin` pinned by sha256). Why that commit, and how it was
+confirmed against production: [docs/REFERENCE.md](docs/REFERENCE.md). Credit for every external project:
+[ATTRIBUTION.md](ATTRIBUTION.md).
 
 ## Documentation
 
@@ -70,7 +63,8 @@ sha256 `921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f` (equal
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | the modules, the oracle contract, **how to add a stage**, and every place in voaice that consumes speech-to-text today — the integration points voaice.rs is built to replace |
 | [docs/oracles.md](docs/oracles.md) | every oracle, what it compares, its result, and how it sees what whisper.cpp's API hides |
 | [docs/REFERENCE.md](docs/REFERENCE.md) | the pinned whisper.cpp, why a commit and not a tag, and its confirmation against production |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | the listening half to 1.0, and the speaking half — inspired by Kitten TTS v1 and v2 |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | the listening half to 1.0, and the speaking half |
+| [ATTRIBUTION.md](ATTRIBUTION.md) | the external projects this stands on: references, models, standards, inspiration |
 | [TODO.md](TODO.md) · [CHANGELOG.md](CHANGELOG.md) | the next stage in detail · what each version proved |
 
 ## How the oracle works
@@ -137,7 +131,7 @@ upstream/PIN                         the reference (commit, ggml version, build,
 docs/                                ARCHITECTURE · oracles · REFERENCE · ROADMAP
 ```
 
-Licence: MIT OR Apache-2.0. whisper.cpp (MIT) is used only as the oracle and is not redistributed.
+Licence: MIT OR Apache-2.0 ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)). External projects are credited in [ATTRIBUTION.md](ATTRIBUTION.md); none is redistributed here.
 
 ## vCLONE — the source code
 
@@ -231,12 +225,6 @@ stage written here can be swapped in where the older one runs today.
 | [listen](https://deltaverse.pythai.net/listen) · [voices](https://deltaverse.pythai.net/voices) | the DeltaVerse listening room and the cast |
 | [ollywoo](https://deltaverse.pythai.net/ollywoo) | the stage where the cast performs: wardrobe, scenes, lip-sync |
 | [PYTHAI/voaice on Hugging Face](https://huggingface.co/PYTHAI/voaice) | the voice library: 70 open-licensed Piper voices, for anyone to use, each with Piper's attribution and its own licence |
-
-### The reference
-
-[ggml-org/whisper.cpp](https://github.com/ggml-org/whisper.cpp) (MIT), pinned in [`upstream/PIN`](upstream/PIN) at the
-commit mindX production runs. voaice.rs reproduces its compiled output. Credit for the model and its design belongs
-to OpenAI Whisper and to whisper.cpp's authors.
 
 ---
 
