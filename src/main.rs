@@ -20,6 +20,8 @@
 //!   voaice encode <model.bin> <in.wav> [out.f32] [--threads N]  (v0.1.0) the whole encoder: the WAV -> mel -> embd_enc (sha256, digest)
 //!   voaice bench-attn <model.bin> <in.wav> [--threads N]        (v0.1.0) block 0's flash attention: heap, wall, CPU, RSS
 //!   voaice bench-encode <model.bin> <in.wav> [--threads N]      (v0.1.0) the whole encoder, mel -> embd_enc: heap, wall, CPU, RSS
+//!   voaice cross <model.bin> <in.wav> [out.f16] [--threads N]   (0.1.1) the cross-attention cache: the WAV -> embd_enc -> kv_cross (k then v)
+//!   voaice bench-cross <model.bin> <in.wav> cross|whole [--threads N]   (0.1.1) the cross K/V from embd_enc, or mel -> embd_enc -> kv_cross
 //!   voaice vclone check <file.voaice>...                   recompute each identity's vprint and compare every field
 //!   voaice vclone print <8 metrics>                         the dvscope/1 print of eight values (vprint.py's twin)
 //!   voaice vclone log <events.jsonl>                        verify a forge log's chain and say whether it is mintable
@@ -28,7 +30,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::process::ExitCode;
-use voaice::{attention, conv, encoder, f16, gelu, matmul, measure, mel, model::Model, norm, ogg, resample, sha256, vclone, wav};
+use voaice::{attention, conv, cross, encoder, f16, gelu, matmul, measure, mel, model::Model, norm, ogg, resample, sha256, vclone, wav};
 
 /// The system allocator, counting live heap bytes and their peak, so `bench-mel` can report the heap a call needs
 /// (std only: a `GlobalAlloc` wrapper, no crate). Thread stacks are mapped, not allocated, and are not counted.
@@ -398,6 +400,38 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
+        Some("cross") if args.len() == 3 || args.len() == 4 => {
+            let m = Model::load_pinned(Path::new(&args[1]))?;
+            let pcm = wav::read(Path::new(&args[2]))?;
+            let t = mel::Tables::new();
+            let mel = mel::MelPlan::new(&t, &m.filters, m.filters_n_mel as usize, m.filters_n_fft as usize)?.run(&pcm, threads)?;
+            let enc = encoder::Encoder::new(&m)?;
+            let cr = cross::Cross::new(&m)?;
+            drop(m);
+            let e = enc.encode(&mel.data, mel.n_len, 0, threads);
+            let mut kv = cross::KvCross::default();
+            let start = std::time::Instant::now();
+            cr.run_into(&e, threads, &mut kv, None);
+            let took = start.elapsed();
+            let bytes: Vec<u8> = kv.k.iter().chain(&kv.v).flat_map(|v| v.to_le_bytes()).collect();
+            println!(
+                "kv_cross {} layers x {} rows ({} frames + {} rows of +0) x {} f16, k then v: sha256 {}, digest {:016x}; {:.3} ms at {threads} thread(s) (embd_enc -> K x {:08x}, V + b)",
+                cr.layers.len(),
+                cr.n_pad,
+                cr.n_ctx,
+                cr.n_pad - cr.n_ctx,
+                cr.n_state,
+                sha256::hex(&sha256::digest(&bytes)),
+                kv_digest(&kv),
+                took.as_secs_f64() * 1e3,
+                cr.kscale.to_bits()
+            );
+            if let Some(out) = args.get(3) {
+                std::fs::write(out, &bytes).map_err(|e| format!("{out}: {e}"))?;
+            }
+            Ok(())
+        }
+        Some("bench-cross") if args.len() == 4 && (args[3] == "cross" || args[3] == "whole") => bench_cross(&args[1], &args[2], args[3] == "whole", threads),
         Some("bench-attn") if args.len() == 3 => bench_attn(&args[1], &args[2], threads),
         Some("bench-encode") if args.len() == 3 => bench_encode(&args[1], &args[2], threads),
         Some("opus") if args.len() == 3 && args[1] == "info" => opus_info(&args[2]),
@@ -463,7 +497,7 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("voaice {} (reference: whisper.cpp 080bbbe8, ggml 0.16.0)", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        _ => Err("usage: voaice info <model.bin> | voaice mel <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-mel <model.bin> <in.wav> [--threads N] | voaice bench-f16 init|rows | voaice conv1 <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-conv1 <model.bin> <in.wav> conv1|gelu [--threads N] | voaice conv <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-conv <model.bin> <in.wav> conv2|stage [--threads N] | voaice norm <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-norm <model.bin> <in.wav> norm|chain [--threads N] | voaice qkv <model.bin> <in.wav> [q.f32] [--threads N] | voaice bench-mm <model.bin> <in.wav> q|fc1|fc2|qkv|mlp|block [--threads N] | voaice encode <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-attn <model.bin> <in.wav> [--threads N] | voaice bench-encode <model.bin> <in.wav> [--threads N] | voaice opus info <file.opus> | voaice bench-opus <file.opus> | voaice resample <in.wav> [out.f32] | voaice bench-resample <in.wav> | voaice vclone check <file.voaice>... | voaice vclone print <8 metrics> | voaice vclone log <events.jsonl> | voaice version".into()),
+        _ => Err("usage: voaice info <model.bin> | voaice mel <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-mel <model.bin> <in.wav> [--threads N] | voaice bench-f16 init|rows | voaice conv1 <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-conv1 <model.bin> <in.wav> conv1|gelu [--threads N] | voaice conv <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-conv <model.bin> <in.wav> conv2|stage [--threads N] | voaice norm <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-norm <model.bin> <in.wav> norm|chain [--threads N] | voaice qkv <model.bin> <in.wav> [q.f32] [--threads N] | voaice bench-mm <model.bin> <in.wav> q|fc1|fc2|qkv|mlp|block [--threads N] | voaice encode <model.bin> <in.wav> [out.f32] [--threads N] | voaice bench-attn <model.bin> <in.wav> [--threads N] | voaice bench-encode <model.bin> <in.wav> [--threads N] | voaice cross <model.bin> <in.wav> [out.f16] [--threads N] | voaice bench-cross <model.bin> <in.wav> cross|whole [--threads N] | voaice opus info <file.opus> | voaice bench-opus <file.opus> | voaice resample <in.wav> [out.f32] | voaice bench-resample <in.wav> | voaice vclone check <file.voaice>... | voaice vclone print <8 metrics> | voaice vclone log <events.jsonl> | voaice version".into()),
     }
 }
 
@@ -634,6 +668,53 @@ fn bench_encode(model: &str, wavp: &str, threads: usize) -> Result<(), String> {
         2.0,
     );
     bench_line("bench-encode", threads, &bm, heap_peak.unwrap_or(0), &format!(" embd_enc_digest {:016x}", digest32(&out)));
+    Ok(())
+}
+
+/// The oracle's digest16 over the whole cache, k then v (padding rows included): `whisper_oracle --bench-cross` and
+/// `--bench-encode` print the same of the state's kv_cross.
+fn kv_digest(kv: &cross::KvCross) -> u64 {
+    let all: Vec<u16> = kv.k.iter().chain(&kv.v).copied().collect();
+    all.as_chunks::<4>().0.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, p| {
+        (h ^ (p[0] as u64 | (p[1] as u64) << 16 | (p[2] as u64) << 32 | (p[3] as u64) << 48)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// `voaice bench-cross <model> <wav> cross|whole` — `cross`: the same measurement as `whisper_oracle --bench-cross`,
+/// every decoder layer's K and V from `embd_enc` (computed beforehand) into the cache; `whole`: the same as
+/// `whisper_oracle --bench-encode` — whisper_encode_with_state runs the conv graph, the encoder graph AND the cross
+/// graph — so mel -> embd_enc -> kv_cross. The cache and the encoder's buffers are allocated by the first call and
+/// kept (the reference's are allocated by whisper_init_state); the widened weights are held outside the call.
+fn bench_cross(model: &str, wavp: &str, whole: bool, threads: usize) -> Result<(), String> {
+    let m = Model::load_pinned(Path::new(model))?;
+    let pcm = wav::read(Path::new(wavp))?;
+    let t = mel::Tables::new();
+    let mel = mel::MelPlan::new(&t, &m.filters, m.filters_n_mel as usize, m.filters_n_fft as usize)?.run(&pcm, 1)?;
+    let enc = encoder::Encoder::new(&m)?;
+    let cr = cross::Cross::new(&m)?;
+    drop(m);
+    let mut buf = encoder::EncoderBuffers::default();
+    let mut e: Vec<f32> = if whole { Vec::new() } else { enc.encode(&mel.data, mel.n_len, 0, threads) };
+    let mut kv = cross::KvCross::default();
+    let mut heap_peak = None;
+    let bm = measure::bench(
+        || {
+            let live = LIVE.load(Relaxed);
+            PEAK.store(live, Relaxed);
+            if whole {
+                if e.is_empty() {
+                    e = vec![0.0; enc.n_ctx * enc.n_state];
+                }
+                enc.encode_into(&mel.data, mel.n_len, 0, threads, &mut buf, &mut e);
+            }
+            cr.run_into(&e, threads, &mut kv, None);
+            heap_peak.get_or_insert(PEAK.load(Relaxed) - live);
+        },
+        10,
+        if whole { 2.0 } else { 1.0 },
+    );
+    let extra = format!("{} kv_cross_digest {:016x}", if whole { format!(" embd_enc_digest {:016x}", digest32(&e)) } else { String::new() }, kv_digest(&kv));
+    bench_line(if whole { "bench-cross what whole" } else { "bench-cross what cross" }, threads, &bm, heap_peak.unwrap_or(0), &extra);
     Ok(())
 }
 

@@ -240,14 +240,14 @@ pub fn cpy_f16_model(x: &[f32]) -> Vec<u16> {
 // ---- the fast path -------------------------------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
-enum Kernel {
+pub(crate) enum Kernel {
     Model,
     #[cfg(target_arch = "x86_64")]
     Avx2,
 }
 
 impl Kernel {
-    fn detect() -> Kernel {
+    pub(crate) fn detect() -> Kernel {
         #[cfg(target_arch = "x86_64")]
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") && std::is_x86_feature_detected!("f16c") {
             return Kernel::Avx2;
@@ -282,7 +282,7 @@ fn convert_perm(kern: Kernel, x: &[f32], split: usize, out: &mut [f32]) {
 
 /// The dots of `rows` frames of a panel (`px`: [rows4][k] in the kernel's layout, rows4 = rows rounded up to 4, the
 /// padding rows zero) with every weight row: `raw[f·n + c]`.
-fn panel_product(kern: Kernel, px: &[f32], rows: usize, lin: &Linear, raw: &mut [f32]) {
+pub(crate) fn panel_product(kern: Kernel, px: &[f32], rows: usize, lin: &Linear, raw: &mut [f32]) {
     let (k, n) = (lin.k, lin.n);
     let rows4 = rows.div_ceil(4) * 4;
     let n3 = n - n % 3;
@@ -336,7 +336,7 @@ fn dot_perm(x: &[f32], w: &[f32]) -> f32 {
 }
 
 /// Eight (or fewer) f32 to f16 as the CPY node converts them (the scalar bit trick): F16C unless a NaN is among them.
-fn cpy_f16(x: &[f32], y: &mut [u16]) {
+pub(crate) fn cpy_f16(x: &[f32], y: &mut [u16]) {
     let mut i = 0;
     #[cfg(target_arch = "x86_64")]
     if std::is_x86_feature_detected!("f16c") && std::is_x86_feature_detected!("avx") {
@@ -355,11 +355,11 @@ fn cpy_f16(x: &[f32], y: &mut [u16]) {
     }
 }
 
-struct Shared<T>(*mut T, usize);
+pub(crate) struct Shared<T>(*mut T, usize);
 // SAFETY: threads write disjoint frame ranges of the outputs, and the scope joins them before they are read
 unsafe impl<T> Sync for Shared<T> {}
 impl<T> Shared<T> {
-    fn new(s: Option<&mut [T]>) -> Shared<T> {
+    pub(crate) fn new(s: Option<&mut [T]>) -> Shared<T> {
         match s {
             Some(s) => Shared(s.as_mut_ptr(), s.len()),
             None => Shared(std::ptr::null_mut(), 0),
@@ -368,7 +368,7 @@ impl<T> Shared<T> {
     /// rows [a, b) of width w, or None when this output was not asked for
     /// SAFETY: the caller's frame range is its own (no other thread writes it) and lies inside the output
     #[allow(clippy::mut_from_ref)]
-    unsafe fn rows(&self, a: usize, b: usize, w: usize) -> Option<&mut [T]> {
+    pub(crate) unsafe fn rows(&self, a: usize, b: usize, w: usize) -> Option<&mut [T]> {
         if self.0.is_null() {
             return None;
         }
@@ -379,7 +379,7 @@ impl<T> Shared<T> {
 }
 
 /// Run `job(a, b)` on frame ranges [a, b) of `rows` frames (multiples of 4 except the last), one per thread.
-fn par_frames(rows: usize, threads: usize, job: &(dyn Fn(usize, usize) + Sync)) {
+pub(crate) fn par_frames(rows: usize, threads: usize, job: &(dyn Fn(usize, usize) + Sync)) {
     let quads = rows.div_ceil(4);
     let threads = threads.clamp(1, quads.max(1));
     std::thread::scope(|s| {
@@ -441,7 +441,7 @@ impl Linear {
 }
 
 /// `dst = src + b` per row (b broadcast; no bias: a copy).
-fn add_bias(src: &[f32], b: Option<&[f32]>, dst: &mut [f32]) {
+pub(crate) fn add_bias(src: &[f32], b: Option<&[f32]>, dst: &mut [f32]) {
     match b {
         None => dst.copy_from_slice(src),
         Some(b) => {
@@ -461,7 +461,7 @@ fn gelu_in_place(g: &Gelu, x: &mut [f32], scratch: &mut [f32]) {
 }
 
 /// `r` frames (`x`: [r][k], or `ln`'s output of them) converted into the panel's first `r` rows, padding rows to 4 zero.
-fn load_panel(kern: Kernel, x: &[f32], ln: Option<&LayerNorm>, split: usize, tmp: &mut [f32], px: &mut [f32]) {
+pub(crate) fn load_panel(kern: Kernel, x: &[f32], ln: Option<&LayerNorm>, split: usize, tmp: &mut [f32], px: &mut [f32]) {
     let k = tmp.len();
     let r = x.len() / k;
     for (f, xr) in x.chunks_exact(k).enumerate() {

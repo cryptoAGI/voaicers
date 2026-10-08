@@ -28,6 +28,11 @@ int main() {
     std::printf("#define VOAICE_OFF_STATE_SCHED_ENCODE %zu\n", offsetof(whisper_state, sched_encode));
     std::printf("#define VOAICE_OFF_STATE_EMBD_CONV    %zu\n", offsetof(whisper_state, embd_conv));
     std::printf("#define VOAICE_OFF_WSCHED_SCHED       %zu\n", offsetof(whisper_sched, sched));
+    // (0.1.1) the cross graph's scheduler and the cross-attention KV cache it writes
+    std::printf("#define VOAICE_OFF_STATE_SCHED_CROSS  %zu\n", offsetof(whisper_state, sched_cross));
+    std::printf("#define VOAICE_OFF_STATE_KV_CROSS     %zu\n", offsetof(whisper_state, kv_cross));
+    std::printf("#define VOAICE_OFF_KV_K               %zu\n", offsetof(whisper_kv_cache, k));
+    std::printf("#define VOAICE_OFF_KV_V               %zu\n", offsetof(whisper_kv_cache, v));
     std::printf("#define VOAICE_SIZEOF_MEL         %zu\n", sizeof(whisper_mel));
     std::printf("#define VOAICE_SIZEOF_FILTERS     %zu\n", sizeof(whisper_filters));
     return 0;

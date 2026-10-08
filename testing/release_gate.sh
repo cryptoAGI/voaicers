@@ -71,6 +71,19 @@
 #   12. (v0.1.0) its efficiency, only after 4h passed: block 0's attention, and THE WHOLE ENCODER (the mel ->
 #      embd_enc: `voaice bench-encode` against `whisper_oracle --bench-encode`, i.e. whisper_encode_with_state, the
 #      digest of each side's embd_enc printed and compared), each in a fresh process, at 1, 2 and nproc threads
+#   4i. (0.1.1) cross-attention K and V: every node of the cross graph read through sched_cross's eval callback
+#      (`whisper_oracle --cross`: one digest per row of its 24 nodes, and of the kv_cross buffer itself — every layer's
+#      1,536 rows, the padding included — after observed runs at 1 and 4 threads and unobserved runs at 1, 2 and 4, the
+#      standalone graph checked against it); voaice fed the reference's embd_enc (the model and the fast path at 1 and 4
+#      threads) and its own, from its own mel at 1, 2 and 4 threads, compared bit for bit (tests/cross.rs);
+#      discriminators (the scale before the product, in the weights, in double, after the f16 copy; V scaled, V
+#      unbiased, V's bias on K; no f16 rounding; the layer stride without padding, the non-flash layout, padding not +0;
+#      the CPY by the row converter, which finite activations make indistinguishable)
+#   13. (0.1.1) its efficiency, only after 4i passed: the cross K/V from embd_enc (`voaice bench-cross ... cross` against
+#      `whisper_oracle --bench-cross`, the same ops as a ggml graph, which the record shows equal to the scheduler's), and
+#      the WHOLE of whisper_encode_with_state — which runs the cross graph too, so v0.1.0's step 12 timed the reference
+#      doing more than voaice did — mel -> embd_enc -> kv_cross (`voaice bench-cross ... whole` against
+#      `whisper_oracle --bench-encode`), the digests of embd_enc and kv_cross compared, at 1, 2 and nproc threads
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
@@ -147,6 +160,12 @@ testing/oracle/bin/whisper_oracle --encoder "$model" .oracle/encoder .audio/*.wa
 log "(the encoder record took $(( $(date +%s) - t0 )) s: each input encoded five times — observed at 1 and 4 threads, not observed at 1, 2, 4 — and each attention node recomputed at 1..8 threads and by use_ref; $(du -sh .oracle/encoder | cut -f1) of digests and embd_enc)"
 fa=$(objdump -d --no-show-raw-insn -C "$lib" | sed -n '/<ggml_compute_forward_flash_attn_ext_tiled(.*)>:$/,/^$/p'); sm=$(nfn ggml_vec_soft_max_f32 0x300)
 log "libggml-cpu's ggml_compute_forward_flash_attn_ext_tiled (the path whisper's encoder takes): $(echo "$fa" | grep -c 'vfmadd231ps') vfmadd231ps (simd_gemm's chains), $(echo "$fa" | grep -c 'vmaxss') vmaxss (the tile max), $(echo "$fa" | grep -c 'call.*<expf@plt>') calls of glibc expf, $(echo "$fa" | grep -c 'call.*<fmaxf@plt>') of fmaxf, $(echo "$fa" | grep -c 'call.*<ggml_vec_soft_max_f32@plt>') of ggml_vec_soft_max_f32, $(echo "$fa" | grep -c 'vcvtps2ph') vcvtps2ph (Q is not converted), $(echo "$fa" | grep -c 'vaddsd') vaddsd (S += the double sum); ggml_vec_soft_max_f32: $(echo "$sm" | grep -cE 'vfn?madd') FMA (ggml_v_expf), $(echo "$sm" | grep -c vaddsd) vaddsd, $(echo "$sm" | grep -c 'call.*expf') call of expf (the n % 8 tail); expf from $(objdump -T "$lib" | awk '$NF=="expf"{print $(NF-1)}')"
+rm -rf .oracle/cross
+t0=$(date +%s)
+testing/oracle/bin/whisper_oracle --cross "$model" .oracle/cross .audio/*.wav 2>&1 | tee -a "$out"
+log "(the cross record took $(( $(date +%s) - t0 )) s: each input encoded five times — the cross graph observed at 1 and 4 threads, not observed at 1, 2, 4 — and the standalone cross graph at 1 and 4 threads; $(du -sh .oracle/cross | cut -f1) of digests)"
+sc=$(objdump -d --no-show-raw-insn "$lib" | sed -n '/<ggml_compute_forward_scale>:/,/^$/p')
+log "libggml-cpu's ggml_compute_forward_scale: $(echo "$sc" | grep -c 'vmulps') vmulps (ggml_vec_scale_f32: b == 0, whisper's Kscale), $(echo "$sc" | grep -cE 'vfn?madd') FMA (ggml_vec_mad1_f32, the b != 0 branch)"
 log "this CPU: $(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -xE 'avx|avx2|fma|f16c|avx512f' | paste -sd' ') (production: Zen 3, the same extensions; its library is not the one checked here)"
 
 log "## 4. voaice.rs"
@@ -221,6 +240,12 @@ cargo test --release --test attention -- --ignored --nocapture --test-threads=1 
 tee -a "$out" < "$step"
 grep -q "test result: ok. 3 passed" "$step" || { log "FAIL: the attention / encoder oracle comparisons did not all pass"; exit 1; }
 
+log "## 4i. cross-attention K and V (0.1.1): every node of sched_cross through its eval callback, and kv_cross whole"
+step=.oracle/cross_step.log
+cargo test --release --test cross -- --ignored --nocapture --test-threads=1 2>&1 \
+  | grep -vE "^\s*(Compiling|Finished|Running)|^$|^running" > "$step" || true
+tee -a "$out" < "$step"
+grep -q "test result: ok. 3 passed" "$step" || { log "FAIL: the cross K/V oracle comparisons did not all pass"; exit 1; }
 nt=$(nproc)
 log "## 5. efficiency (only now): log-mel; wall = best of 10 calls, cpu = CPU ms per call (utime+stime, all threads,"
 log "##    loop >= 1 s), heap = bytes live at the first call's peak (KiB; voaice's counting allocator, the reference's"
@@ -408,7 +433,40 @@ for what in attn encode; do
       "$(echo "$r" | field rss_peak_delta_kb)" "$(echo "$v" | field rss_peak_delta_kb)" "$dg")"
   done
 done
+log "## 13. efficiency (only now): cross-attention K and V (0.1.1) on jfk. cross = every decoder layer's K (x Kscale) and V"
+log "##    (+ b) from embd_enc (computed beforehand by each side) into the f16 cache; whole = the mel -> embd_enc -> kv_cross,"
+log "##    i.e. what whisper_encode_with_state does (its conv, encoder AND cross graphs) against voaice's encode_into +"
+log "##    Cross::run_into. wall = best of 10, cpu = CPU ms per call over >= 1 s (cross) or >= 2 s (whole); heap: voaice ="
+log "##    bytes live at the first call's peak (the cache and buffers, allocated by that call and then reused; the widened"
+log "##    weights are held outside the call); the reference: cross = sched_cross's compute buffer + kv_cross, whole = the"
+log "##    conv and encoder schedulers' buffers + kv_pad + sched_cross's buffer + kv_cross (v0.1.0's step 12 counted the"
+log "##    first three only); rss ="
+log "##    VmHWM delta of the first call (the reference's cross: its standalone graph's tensors were allocated before)"
+log "$(printf '%-7s %3s | %9s %9s %6s | %9s %9s | %7s %7s | %6s %6s | %s' op thr ref_ms vo_ms x cpu_ref cpu_vo mem_ref heap_vo rss_r rss_v digests)"
+for what in cross whole; do
+  for th in 1 2 "$nt"; do
+    if [ "$what" = cross ]; then r=$(testing/oracle/bin/whisper_oracle --bench-cross "$model" .audio/jfk.wav "$th")
+    else r=$(testing/oracle/bin/whisper_oracle --bench-encode "$model" .audio/jfk.wav "$th"); fi
+    v=$(target/release/voaice bench-cross "$model" .audio/jfk.wav "$what" --threads "$th")
+    rk=$(echo "$r" | field kv_cross_digest); vk=$(echo "$v" | field kv_cross_digest)
+    [ "$rk" = "$vk" ] || { log "FAIL: kv_cross digests differ in the benchmark ($rk vs $vk)"; exit 1; }
+    dg="kv $vk"
+    if [ "$what" = whole ]; then
+      rd=$(echo "$r" | field embd_enc_digest); vd=$(echo "$v" | field embd_enc_digest)
+      [ "$rd" = "$vd" ] || { log "FAIL: embd_enc digests differ in the benchmark ($rd vs $vd)"; exit 1; }
+      dg="$dg, enc $vd"
+    fi
+    rw=$(echo "$r" | field wall_best_ms); vw=$(echo "$v" | field wall_best_ms)
+    rm_kb=$(echo "$r" | field op_mem_kb)
+    [ "$what" = whole ] && rm_kb=$(( rm_kb + $(echo "$r" | field cross_mem_kb) ))
+    log "$(printf '%-7s %3s | %9.3f %9.3f %5.2fx | %9s %9s | %7s %7s | %6s %6s | %s' "$what" "$th" \
+      "$rw" "$vw" "$(awk -v a="$rw" -v b="$vw" 'BEGIN{print a/b}')" \
+      "$(echo "$r" | field cpu_ms_per_call)" "$(echo "$v" | field cpu_ms_per_call)" \
+      "$rm_kb" "$(echo "$v" | field heap_peak_kb)" \
+      "$(echo "$r" | field rss_peak_delta_kb)" "$(echo "$v" | field rss_peak_delta_kb)" "$dg")"
+  done
+done
 log "load after the measurements: $(cut -d' ' -f1-3 /proc/loadavg)"
-log "## transcripts recorded (not yet reproduced by voaice.rs: the encoder is v0.1.0's, the decoder is v0.2.0's)"
+log "## transcripts recorded (not yet reproduced by voaice.rs: the encoder is v0.1.0's, the cross K/V 0.1.1's, the decoder is v0.2.0's)"
 for d in .oracle/tiny.en/*/; do log "$(basename "$d"): $(tr '\n' ' ' < "$d/transcript.txt")"; done
 log "GATE PASSED"

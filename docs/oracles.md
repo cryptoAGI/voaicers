@@ -235,6 +235,39 @@ through the same symbol by both sides. Production's Zen 3 library and glibc were
 same operations, but the max tree's choice among NaNs and FMA NaN payloads were not compared; the encoder never
 produces them from audio.
 
+### Cross-attention K and V (0.1.1) — `tests/cross.rs` against every node of `sched_cross` and the `kv_cross` buffer itself
+
+`whisper_encode_with_state` ends with a third graph, `whisper_build_graph_cross` on `sched_cross`
+(testing/cross/NOTES.md): per decoder layer, `mul_mat(cross_attn.key.weight, embd_enc)` (no bias) → `ggml_scale` by
+`Kscale = (float) pow(64.0, −0.25)` (`0x3EB504F3`; with `b = 0` the kernel is `ggml_vec_scale_f32`, one `vmulps` per 8
+values) → CPY to f16; `mul_mat(cross_attn.value.weight, embd_enc)` → ADD the value bias → CPY to f16 — the CPYs into
+`kv_cross` (flash attention's layout: per layer `n_pad` = 1,536 rows of 384 f16, layer `il` at row `il · 1536`).
+`whisper_oracle --cross` finds `sched_cross` and `kv_cross` (its `k` and `v` tensors) through the layout probe and
+self-checks them: kv_cross's tensors are `[384 · 4 · 1536]` f16, and every CPY node's destination is a view of exactly
+those tensors at byte offset `2 · 384 · il · 1536`. It observes every node through the eval callback at 1 and 4 threads
+and records one digest per row of the 24 computed nodes; after each run (observed at 1 and 4, unobserved at 1, 2, 4) it
+reads `kv_cross` whole and records one digest per row of k and of v — **all 6,144 rows of each, the 36 padding rows of
+every layer included**. Self-checks, all yes on all 8 inputs: six nodes per layer and no other computed node; f16
+weights in a plain CPU buffer; src1 is `embd_enc` itself; the same Kscale in every layer, its `b` 0; no ADD reads K;
+V's ADD reads `decoder.blocks.N.cross_attn.value.bias`; kv_cross +0 at init and its 288 padding rows still +0 after;
+the CPY nodes' rows = the buffer's rows; 1 vs 4 threads identical; observed = unobserved; 1 = 2 = 4 threads; `embd_enc`
+identical in every run; the standalone graph (what `--bench-cross` times) = the scheduler's kv_cross at 1 and 4 threads.
+The input is the encoder record's `embd_enc.f32`, checked against the digest the cross record took of the state's.
+3.1 MB for 8 inputs.
+
+| oracle | compares | result (0.1.1) |
+|---|---|---|
+| `oracle_cross_nodes_bit_exact` | fed the reference's own `embd_enc`: the model (`Linear::model` + the scale + the scalar CPY) on every frame of every layer, and the fast path (`Cross::run_into` with taps) at 1 and 4 threads; every node by row digest, and the whole cache (padding included) | **0 rows differ** of 864,000 node rows and 294,912 kv_cross rows (8 inputs × model, 1t, 4t) |
+| `oracle_cross_end_to_end` | voaice's own mel → `Encoder::encode_into` → `Cross::run_into` at 1, 2 and 4 threads: `embd_enc` value by value, every node by digest, and the cache — pre-filled with 0xFFFF and written twice, so a padding row left unwritten or a row from the first call would show | `embd_enc` = the record's; **0 rows differ** in 576 node comparisons (864,000 rows) and 294,912 cache rows (1,158,912 rows in all) |
+| `oracle_cross_discriminators` | the model with one reading changed, on every 25th frame and the last (61 frames) of all 4 layers, all six nodes by row digest (1,464 rows per input); and the cache laid out as other readings would lay it, against the buffer's 12,288 rows | the scale before the product **732**; folded into the f16 weights **732**; in double **244–247**; after the f16 copy **488**; V scaled too **488**; V without its bias **488**; V's bias on K **488**; the activations not rounded to f16 **1,464**; layers packed without padding **9,216**; the non-flash layout (V transposed) **10,716**; padding rows not +0 **288** — each rejected on every input. **The CPYs by the row converter: 0 on every input**, as predicted — the two converters agree on every finite value (0.0.3), and these activations are finite |
+
+What this holds for: this laptop's native libggml-cpu (Zen+, AVX2 + FMA + F16C, no AVX-512); production's Zen 3
+library not run; `base.en` (n_state 512, 6 decoder layers) not compared; `audio_ctx` ≠ 0 (a shorter n_ctx, so another
+padding) not compared; non-finite activations not compared (the products' NaN conversion follows 0.0.9's split, which
+`--mm-nan` checked on the encoder's query product only). Every reading of 64^−0.25 in f32 (`pow` in double then
+rounded, `powf`, `1/sqrtf(8)`, `sqrtf(0.125)`) gives `0x3EB504F3`, so the recorded op parameter, not a reading of the
+source, pins the scale; the scale in double is a different *operation* and is caught.
+
 ## Efficiency — measured only after the oracles pass
 
 (0.0.4) Step 6 of the gate measures the Ogg/Opus reader after 4b passed: Ogg's CRC on 16 MiB sliced-by-8 against the
@@ -312,6 +345,15 @@ reference's memory for the encoder is its two schedulers' compute buffers plus `
 allocated by that call). Both hold their weights outside the call: the reference f16 (the model), voaice widened to f32
 (2× the bytes) for the products.
 
+Step 13 (0.1.1) times the cross K/V on jfk: every decoder layer's K and V from `embd_enc` (computed beforehand by each
+side) into the f16 cache — the reference as the standalone graph the record shows equal to `sched_cross`'s
+(`whisper_oracle --bench-cross`; its memory reported as what whisper holds for it: `sched_cross`'s compute buffer +
+`kv_cross`), voaice through `Cross::run_into` with the cache kept between calls (`voaice bench-cross ... cross`) — and
+**the fair whole**: `whisper_encode_with_state`, which runs the conv, encoder **and cross** graphs, against voaice's
+`Encoder::encode_into` + `Cross::run_into` (`voaice bench-cross ... whole`). Step 12's ratio (v0.1.0) compared voaice's
+encoder alone with that whole call; step 13 is the like-for-like comparison. Each side prints the digests of the
+`kv_cross` (and for `whole`, `embd_enc`) it measured, and the gate stops if they differ.
+
 ## The test inputs
 
 Eight WAVs, generated by `testing/make_audio.py` and pinned by sha256 in `testing/pins/audio.sha256`: JFK (11 s,
@@ -327,7 +369,8 @@ against a public getter** (the tensor map's size against the loader's count, `n_
 `whisper_n_len_from_state`, `n_mel` against `whisper_model_n_mels`), and refuses to run on any mismatch. Since
 0.0.6 it also finds the state's schedulers (`sched_conv`, `sched_encode`) and `embd_conv` that way, and observes
 every node of the conv graph through ggml's own `ggml_backend_sched_set_eval_callback`; observing does not change the
-result (`embd_conv` is bit-identical with and without the callback, on all 8 inputs).
+result (`embd_conv` is bit-identical with and without the callback, on all 8 inputs). Since 0.1.1 also `sched_cross`
+and `kv_cross` (its `k` / `v` tensors), checked against the CPY nodes that write them.
 
 ## Determinism of the reference
 
@@ -343,6 +386,8 @@ result (`embd_conv` is bit-identical with and without the callback, on all 8 inp
   `embd_enc` at 1, 2 and 4 threads: the tiled kernel's rows are independent (each score and each output element is
   one FMA chain; the softmax state is per row), so neither the chunking nor the tiles' composition moves a bit. The
   encoder is the first whole stage voaice reproduces **at any thread count**.
+- The cross graph (0.1.1) and the `kv_cross` it leaves are bit-identical at 1, 2 and 4 threads (each output one dot
+  in one thread; SCALE, ADD and CPY elementwise) — for finite activations, as for 0.0.9's products.
 - `whisper_full` at 1 thread is identical run to run.
 - At 4 threads against 1, token ids and text are the same, but every token's probability differs in its bits, and
   on JFK the token timestamps move. The transcript oracle is therefore pinned at **1 thread**; a bit-exact transcript

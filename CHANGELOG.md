@@ -1,5 +1,97 @@
 # Changelog
 
+## 0.1.1 — 2026-10-08 — cross-attention K and V, bit-exact: every node of `sched_cross` and `kv_cross` itself
+
+**The second decade opens with the cross graph `whisper_encode_with_state` runs after the encoder: per decoder layer
+K = `embd_enc` × `cross_attn.key.weight` × `Kscale` (a SCALE node), V = `embd_enc` × `cross_attn.value.weight` + bias,
+both copied to f16 into `kv_cross` — every one of its 24 nodes and the whole cache, its 288 padding rows included, bit
+for bit on 8 inputs, from the reference's `embd_enc` (model, 1 and 4 threads) and from voaice's own mel (1, 2 and 4
+threads); all exact on the first oracle run. Then the cross stage 4.76× the reference at one thread (4.86× in a
+rerun), and — like for like for the first time — the whole of `whisper_encode_with_state`, mel → `embd_enc` →
+`kv_cross`, 3.70× at one thread (1,085 against 4,011 ms; 3.74× in a rerun). Found while reading: v0.1.0's encoder
+ratio compared voaice's encoder against whisper's encoder + cross.**
+Record: `testing/results/0.1.1.txt`; how it was read and found: `testing/cross/NOTES.md`.
+
+### The op, read from the pin and the binary
+- `whisper_build_graph_cross` (whisper.cpp:2272), on its own scheduler `sched_cross`, for each of tiny's 4 decoder
+  layers: `mul_mat(cross_attn.key.weight, embd_enc)` → `ggml_scale(·, Kscale)` → `ggml_cpy` to f16;
+  `mul_mat(cross_attn.value.weight, embd_enc)` → `ggml_add(·, cross_attn.value.bias)` → `ggml_cpy` to f16. **K has no
+  bias** (the model has none); **only K is scaled** here.
+- `Kscale = pow(float(n_state_head), -0.25)`: `std::pow(float, double)` in double, then the float initialiser —
+  `0x3EB504F3` for head size 64 (as does every other way of writing 64^−0.25 in f32: the recorded op parameter, not a
+  reading, pins it). `ggml_scale` passes `b = 0`, so `ggml_compute_forward_scale_f32` takes `ggml_vec_scale_f32`: one
+  f32 multiply per value (6 `vmulps` in the binary; the FMA path is the `b ≠ 0` branch). The allocator runs it in place.
+- The products are 0.0.9's (`from_float` split by thread, then `ggml_vec_dot_f16`); the CPYs are 0.0.9's scalar bit trick.
+- `kv_cross` (flash_attn): `whisper_kv_cache_init(F16, n_text_state 384, n_text_layer 4, GGML_PAD(1500, 256) = 1536)`
+  — k and v each `[4 · 1536 · 384]` f16, the buffer cleared at init; layer il's K/V written to rows `il · 1536 + [0,
+  1500)` (frame-major, flash attention's layout), so **rows 1,500..1,535 of every layer are +0** for the life of the state.
+- **`whisper_encode_with_state` runs this graph every call** (whisper_encode_internal: conv, encoder, then `// cross`).
+  v0.1.0's step 12 timed that call as "the whole encoder" against voaice's `encode_into`, which did not compute the
+  cross K/V: the reference was doing ~11 % more work than voaice's measured call. Its 3.85–4.04× was flattered; the
+  like-for-like figure is below.
+
+### The oracle
+- `whisper_oracle --cross`: the layout probe adds `whisper_state::sched_cross`, `kv_cross` and the cache's `k` / `v`; the
+  oracle self-checks them (kv_cross's tensors `[384 · 4 · 1536]` f16, and every CPY's destination a view of exactly those
+  tensors at byte offset `2 · 384 · il · 1536`). An eval callback observes every node of `sched_cross` at 1 and 4
+  threads — **24 computed nodes, 6 per layer, nothing else** — one digest per row of each; after every run (observed at
+  1 and 4 threads, unobserved at 1, 2, 4) `kv_cross` is read whole and digested per row, **all 12,288 rows, the padding
+  included**. Self-checks yes on 8 / 8: f16 weights in a plain CPU buffer; src1 is `embd_enc` itself; Kscale the same in
+  every layer, `b` = 0; no ADD reads K; V's ADD reads `cross_attn.value.bias`; kv_cross +0 at init and its 288 padding
+  rows +0 after; the CPY nodes' rows = the buffer's; 1 vs 4 threads identical; observed = unobserved; 1 = 2 = 4
+  threads; `embd_enc` identical in every run; the standalone graph (what `--bench-cross` times) = the scheduler's
+  kv_cross at 1 and 4 threads. 3.1 MB for 8 inputs.
+- `oracle_cross_nodes_bit_exact` (fed the reference's `embd_enc`, checked against the digest the cross record took of
+  the state's): the model on every frame of every layer, the fast path at 1 and 4 threads — **0 rows differ** of
+  864,000 node rows and **0 of 294,912 kv_cross rows**.
+- `oracle_cross_end_to_end`: voaice's mel → `Encoder::encode_into` → `Cross::run_into` at 1, 2 and 4 threads — `embd_enc`
+  equal, every node **0 rows differ** (576 node comparisons), the cache (pre-filled with 0xFFFF, written twice) **0 of
+  294,912 rows**; 1,158,912 rows in all.
+- `oracle_cross_discriminators` (every 25th frame and the last, 4 layers, all six nodes: 1,464 rows per input; and the
+  cache's layout against its 12,288 rows), each caught on every input: the scale before the product 732; folded into the
+  f16 weights 732; in double 244–247; after the f16 copy 488; V scaled too 488; V without its bias 488; V's bias on K
+  488; the activations not rounded to f16 1,464; the layers packed without padding 9,216; the non-flash layout (V
+  transposed) 10,716; padding not +0 288. **The CPYs by the row converter: 0 on every input**, as predicted (the two
+  converters agree on every finite value; 0.0.9 told them apart only with constructed NaN rows).
+- **Found on the way:** compared on the f16 cache alone, "scale in double" was caught on only 6 of 8 inputs (0–3 of 488
+  rows): the f16 rounding swallows most one-ulp f32 differences. The discriminators now compare every node, f32 first.
+- **What this holds for:** this laptop's native libggml-cpu (Zen+, AVX2 + FMA + F16C, no AVX-512). Production's Zen 3
+  library not run; `base.en` (n_state 512, 6 decoder layers) not compared; `audio_ctx` ≠ 0 not compared; non-finite
+  activations not compared through this graph.
+
+### Faster, bits unchanged
+- `embd_enc` converted **once** per panel of 128 frames for all eight products (whisper's eight MUL_MATs convert it
+  eight times); each product 0.0.9's 4 × 3 register block; the scale, the bias and the f16 conversion as the panel's
+  epilogue, written straight into the caller's cache (`KvCross`, sized on the first call); the padding rows set to +0
+  on every call; threads by frames. The panel size (64, 128, 256) measured within noise: the stage is FMA-bound.
+
+### Measured (gate step 13, only after 4i passed; Ryzen 3 3200U, 2 cores / 4 threads, load 4.5 at the gate's start, ~3
+during the measurements; rerun at load 2.0–2.5 in `.oracle/step13_rerun.txt`)
+jfk; each side in a fresh process; wall = best of 10 (gate run · rerun):
+
+| | threads | whisper.cpp | voaice.rs | × |
+|---|---|---|---|---|
+| **cross K/V of 4 layers**, `embd_enc` → `kv_cross` | 1 | 454.2 · 451.0 ms | **95.4 · 92.8 ms** | **4.76 · 4.86×** |
+| | 2 | 278.8 · 263.7 | 58.3 · 57.7 | 4.78 · 4.57× |
+| | 4 | 283.2 · 274.3 | 67.5 · 69.1 | 4.19 · 3.97× |
+| **the whole of `whisper_encode_with_state`**, mel → `embd_enc` → `kv_cross` | 1 | 4,010.6 · 4,021.5 | **1,085.4 · 1,074.9** | **3.70 · 3.74×** |
+| | 2 | 2,440.3 · 2,457.6 | 835.8 · 825.0 | 2.92 · 2.98× |
+| | 4 | 2,395.9 | 901.6 | 2.66× |
+
+- The cross stage: 1,769,472,000 multiply-adds in 95 ms ≈ 18.5 G a second at one thread, about two thirds of this
+  core's 8 FMA lanes a cycle at its 3.5 GHz boost. CPU per call 97 against 471 CPU-ms at one thread (4.8×).
+- **The fair whole is 3.70–3.74× at one thread**, against step 12's 3.79× for voaice's encoder alone against the same
+  call (v0.1.0's gate: 3.85×, rerun 4.04×). The reference's cross graph is ~11 % of its call (454 of 4,011 ms), and
+  voaice now does that work too, faster than the rest, so the ratio barely moves — but it is now the like-for-like one.
+  Subtracting, the reference's encoder alone is ≈ 3,557 ms against voaice's 1,056: ≈ 3.4× (derived, not measured).
+- Memory: the cross stage holds **9,794 KiB** at one thread (the 9,216 KiB cache itself + the panels) against
+  whisper's **11,466 KiB** (`sched_cross`'s 2,250 KiB compute buffer + the same 9,216 KiB cache). The whole: **26,312 KiB**
+  against **40,864 KiB** (v0.1.0's 29,398 plus `sched_cross` and `kv_cross`). voaice holds the eight cross weights
+  widened to f32 (4.7 MB, 2× the f16 bytes) outside the call. Both sides' `kv_cross` and `embd_enc` were digested and
+  compared by the gate: `76f24e73e318b877` and `50d38ec85f2778b9` on both.
+- At four threads voaice is no faster than at two (2 cores; SMT siblings share the FMA pipes); the reference's whole
+  call gains as little.
+
 ## v0.1.0 — 2026-10-08 — MILESTONE: the whole encoder, bit-exact — flash attention, four blocks, ln_post, `embd_enc`
 
 **From voaice's own mel to `embd_enc`, bit for bit what the pinned whisper.cpp's `whisper_encode_with_state` leaves in

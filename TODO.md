@@ -182,13 +182,39 @@ whisper.cpp (upstream/PIN) in the same run; only then is its speed measured.
       for rows with finite Q (a +0 score is known), with a guard; at 2 threads the whole encoder gains 1.37×, at 4
       none (2 cores; SMT siblings share the FMA pipes).
 
-## Next: 0.1.1 — cross-attention K and V (see docs/ROADMAP.md, the second decade)
-- [ ] `whisper_build_graph_cross`: per decoder layer `mul_mat(cross_attn_k_w, embd_enc)` → `ggml_scale(·, 64^−0.25)`,
-      `mul_mat(cross_attn_v_w, embd_enc) + cross_attn_v_b`, both CPY'd to f16 into `kv_cross` at `il·n_ctx_pad` (flash
-      attention's layout). Read the SCALE node's arithmetic (a multiply by `pow(64, −0.25)` computed in float — not a power of two, so it rounds), and what
-      `kv_cross`'s padding rows hold.
-- [ ] Oracle: the eval callback on `sched_cross` (layout probe: its offset), every node by row digest; the `kv_cross`
-      buffer whole (with its padding), from voaice's own `embd_enc`, 8 inputs, 1 and 4 threads.
+## Done: 0.1.1 — cross-attention K and V (CHANGELOG.md, testing/cross/NOTES.md)
+- [x] Read from the pin and the binary: `whisper_build_graph_cross` (whisper.cpp:2272) on `sched_cross`, per decoder layer
+      `mul_mat(cross_attn.key.weight, embd_enc)` (no bias) → SCALE by `Kscale = (float) pow(64.0, −0.25)` = `0x3EB504F3`
+      (`ggml_vec_scale_f32`: `b = 0`, one `vmulps` per 8 values) → CPY to f16; `mul_mat(cross_attn.value.weight,
+      embd_enc)` → ADD the value bias → CPY to f16; the CPYs (the scalar bit trick, 0.0.9's) into `kv_cross` at row
+      `il · 1536` (`GGML_PAD(1500, 256)`); the cache cleared at init, so rows 1,500..1,535 of every layer stay +0.
+- [x] **Found while reading:** `whisper_encode_with_state` runs the cross graph after the encoder graph, so v0.1.0's
+      step 12 timed the reference doing the encoder **and** the cross K/V against voaice's encoder alone. 0.1.1 times
+      the cross stage alone and the like-for-like whole (gate step 13).
+- [x] Oracle (`whisper_oracle --cross`, tests/cross.rs): every node of `sched_cross` (24, nothing else computed) by row
+      digest and the `kv_cross` buffer itself, all 12,288 rows with the padding; voaice fed the reference's `embd_enc`
+      (model, fast 1t and 4t) and its own from its own mel (1, 2, 4 threads): 0 rows differ; eleven discriminators
+      caught on every input, the row converter for the CPYs indistinguishable on finite values, as predicted.
+- [x] Faster, bits unchanged: `embd_enc` converted once per panel for all eight products (the reference converts it
+      eight times), 0.0.9's 4 × 3 block, scale / bias / f16 as the epilogue straight into the caller's cache.
+- [ ] Not covered: production's own libggml-cpu (Zen 3); an AVX-512 build; `base.en` (n_state 512, 6 decoder layers);
+      `audio_ctx` ≠ 0 (a shorter n_ctx, another padding); non-finite activations (0.0.9's split decides their
+      conversion; not compared through this graph); the non-flash layout (`flash_attn = false`, V transposed, no
+      padding) is only a discriminator here, not a supported path.
+- [x] Measured (gate step 13): the cross stage 4.76× the reference at one thread (95 against 454 ms; 4.86× in a rerun),
+      4.6–4.8× at two; the whole of `whisper_encode_with_state` like for like 3.70–3.74× at one thread.
+- [ ] Efficiency left: the cross products run at ~18.5 G multiply-adds a second, about two thirds of this core's FMA
+      peak (the panel size, 64 to 256 frames, made no measurable difference: FMA-bound); the weights are held widened
+      to f32 (4.7 MB for the eight, 2× the f16 bytes); at 4 threads nothing is gained over 2 (2 cores, SMT siblings).
+      The cross K/V could also start on each panel of `embd_enc` as `ln_post` produces it (one pass, no re-read).
+
+## Next: 0.1.2 — the decoder's input (see docs/ROADMAP.md, the second decade)
+- [ ] `whisper_build_graph_decoder` (whisper.cpp:2458) begins: `cur = add(get_rows(d_te, embd), get_rows(d_pe,
+      position))` — `decoder.token_embedding.weight` is f16 [384, 51864] (GET_ROWS widens to f32: the table, exact),
+      `decoder.positional_embedding` f32 [384, 448]; then one ADD. Read the batch whisper builds for a prompt
+      (`whisper_batch_prep_legacy`: tokens, positions n_past.., the seq ids and `logits` flags) and for one token.
+- [ ] Oracle: the eval callback on `sched_decode` up to that ADD (layout probe: its offset), the prompts
+      `[SOT, (lang), task, NOT/BEG]` of the 8 recorded transcripts through `whisper_decode_with_state`.
 
 ## Then, in order
 
@@ -238,8 +264,8 @@ Order of work: GELU table → f32↔f16 conversions (both done in 0.0.3) → `ve
 (norm, attention, MLP) → all four → `embd_enc` bit-exact on the 8 test inputs — **all done in v0.1.0**.
 
 ### Stage 4 — decoder (plan)
-Cross-attention K/V (`whisper_build_graph_cross`: `mul_mat` of `embd_enc` by each layer's cross K/V, scaled by
-`n_state_head^-0.25` on both K and Q in the non-flash path — check which path flash_attn takes there), self-attention
+Cross-attention K/V (`whisper_build_graph_cross`: done in 0.1.1 — with flash_attn only K is scaled there, by a SCALE
+node, and the cache has flash attention's padded layout; Q's `KQscale` comes in 0.1.3), self-attention
 with the f16 KV cache, token + positional embeddings, 4 blocks, `ln`, logits = `mul_mat(d_te, cur)`.
 Oracle: `whisper_decode_with_state()` + `whisper_get_logits_from_state()` (public): all 51,864 logits per step,
 bit-exact, for the prompt `[SOT, (lang), task, NOT/BEG]` and for each greedy step of the recorded transcripts.

@@ -19,7 +19,10 @@
 //   whisper_oracle --bench-mm <model.bin> <wav> <threads> q|fc1|fc2|qkv|mlp|block   (0.0.9) their time, see bench_mm
 //   whisper_oracle --encoder <model.bin> <outdir> <wav ...> (v0.1.0) flash attention and the whole encoder, see record_encoder
 //   whisper_oracle --bench-attn <model.bin> <wav> <threads>    (v0.1.0) block 0's attention, see bench_attn
-//   whisper_oracle --bench-encode <model.bin> <wav> <threads>  (v0.1.0) whisper_encode_with_state, mel -> embd_enc
+//   whisper_oracle --bench-encode <model.bin> <wav> <threads>  (v0.1.0) whisper_encode_with_state, mel -> embd_enc (and,
+//                                                              found in 0.1.1, the cross graph's kv_cross: it runs that too)
+//   whisper_oracle --cross <model.bin> <outdir> <wav ...>   (0.1.1) the cross graph (sched_cross) and kv_cross, see record_cross
+//   whisper_oracle --bench-cross <model.bin> <wav> <threads>   (0.1.1) the cross graph's time, see bench_cross
 //
 // --bench-mel measures the reference's whisper_pcm_to_mel_with_state the way `voaice bench-mel` measures voaice's,
 // in a fresh process each: the heap bytes live at the first call's peak (operator new counted, below), peak RSS of
@@ -1931,15 +1934,312 @@ static int bench_encode(const char * model_path, const char * wav, int threads) 
     while (reps < 5 || now_ms() - w0 < 2000.0) { check(whisper_encode_with_state(ctx, st, 0, threads) == 0, "whisper_encode failed"); reps++; }
     const double c1 = cpu_seconds();
     const std::vector<uint8_t> e = tensor_bytes(state_embd_enc(st, n_state));
-    std::printf("bench-encode-reference threads %d wall_best_ms %.4f cpu_ms_per_call %.4f cpu_reps %d op_mem_kb %zu rss_peak_delta_kb %ld embd_enc_digest %016llx\n",
+    // (0.1.1) whisper_encode_with_state also ran the cross graph: kv_cross's digest (k then v, whole), comparable with
+    // `voaice bench-cross ... whole`; op_mem_kb above does not count sched_cross's buffer or kv_cross (as v0.1.0 printed it)
+    std::vector<uint8_t> kv;
+    for (size_t off : {(size_t)VOAICE_OFF_KV_K, (size_t)VOAICE_OFF_KV_V}) {
+        const std::vector<uint8_t> b = tensor_bytes(*reinterpret_cast<ggml_tensor **>((char *)st + VOAICE_OFF_STATE_KV_CROSS + off));
+        kv.insert(kv.end(), b.begin(), b.end());
+    }
+    size_t cross_bytes = kv.size();   // kv_cross + sched_cross's compute buffer: what the call also uses for the cross graph
+    {
+        ggml_backend_sched_t s = state_sched(st, VOAICE_OFF_STATE_SCHED_CROSS);
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(s); i++) cross_bytes += ggml_backend_sched_get_buffer_size(s, ggml_backend_sched_get_backend(s, i));
+    }
+    std::printf("bench-encode-reference threads %d wall_best_ms %.4f cpu_ms_per_call %.4f cpu_reps %d op_mem_kb %zu rss_peak_delta_kb %ld embd_enc_digest %016llx kv_cross_digest %016llx cross_mem_kb %zu\n",
                 threads, best, (c1 - c0) * 1000.0 / reps, reps, (bytes + 1023) / 1024, peak >= 0 ? peak - before : -1,
-                (unsigned long long)digest32((const float *)e.data(), e.size() / 4));
+                (unsigned long long)digest32((const float *)e.data(), e.size() / 4),
+                (unsigned long long)digest16((const uint16_t *)kv.data(), kv.size() / 2), (cross_bytes + 1023) / 1024);
+    whisper_free_state(st);
+    whisper_free(ctx);
+    return 0;
+}
+
+// ---- (0.1.1) the cross graph: cross-attention K and V of every decoder layer, into kv_cross --------------------------
+// --cross <model.bin> <outdir> <wav ...>: each input encoded five times (whisper_encode_with_state runs the conv graph,
+// the encoder graph and then the CROSS graph on sched_cross) — the cross graph observed through its eval callback at 1
+// and 4 threads, not observed at 1, 2, 4 — and after each run the state's kv_cross.k / .v read whole (the layout
+// probe's offsets, self-checked against the CPY nodes' destinations). Writes per input:
+//   cross_nodes.tsv   idx, key (b<il>.{k_mm,k_scale,k_cpy,v_mm,v_add,v_cpy}), op, type, row width, rows, offset in cross.d64
+//   cross.d64         one 64-bit FNV-1a digest per row (frame) of every computed node, 1-thread run
+//   kv_cross.d64      one digest per row (n_state f16) of kv_cross.k then of kv_cross.v, ALL rows: n_layer x n_pad each,
+//                     the padding rows included
+//   cross.tsv         the self-checks and the facts: Kscale's bits, the cache's shape, embd_enc's digest (the input,
+//                     equal to the encoder record's embd_enc.f32), 1 vs 4 threads, observed vs not, padding +0, the
+//                     standalone graph (what --bench-cross times) = the scheduler's kv_cross at 1 and 4 threads
+static const char * CROSS_KEYS[6] = {"k_mm", "k_scale", "k_cpy", "v_mm", "v_add", "v_cpy"};
+struct cross_capture {
+    std::map<const ggml_tensor *, std::string> names, key;
+    std::vector<std::string> tsv, other;
+    std::vector<uint64_t> digests;
+    std::map<std::string, std::vector<uint64_t>> by_key;
+    const ggml_tensor * embd_enc = nullptr, * kc = nullptr, * vc = nullptr;
+    int n_state = 0, n_pad = 0, idx = 0, scale_inplace = 0;
+    uint32_t scale_bits = 0;
+    bool weights_f16_plain = true, src1_embd_enc = true, biases_named = true, k_unbiased = true, scale_b_zero = true,
+         scale_same = true, cpy_into_cache = true;
+};
+static bool cross_cb(ggml_tensor * t, bool ask, void * ud) {
+    auto & c = *static_cast<cross_capture *>(ud);
+    if (ask) return true;
+    const int idx = c.idx++;
+    if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE)
+        return true;
+    auto src_key = [&](int i) -> std::string {
+        auto it = t->src[i] ? c.key.find(t->src[i]) : c.key.end();
+        return it == c.key.end() ? "" : it->second;
+    };
+    auto split = [](const std::string & s, std::string & il) { il = s.substr(0, s.find('.')); return s.empty() ? s : s.substr(s.find('.') + 1); };
+    std::string k, il;
+    if (t->op == GGML_OP_MUL_MAT) {
+        auto it = c.names.find(t->src[0]);
+        const std::string p = "decoder.blocks.", w = it == c.names.end() ? "" : it->second;
+        if (w.compare(0, p.size(), p) == 0) {
+            il = std::to_string(std::atoi(w.c_str() + p.size()));
+            const std::string rest = w.substr(w.find('.', p.size()) + 1);
+            if (rest == "cross_attn.key.weight") k = il + ".k_mm";
+            if (rest == "cross_attn.value.weight") k = il + ".v_mm";
+        }
+        c.weights_f16_plain = c.weights_f16_plain && t->src[0]->type == GGML_TYPE_F16 && t->src[0]->buffer &&
+                              std::strcmp(ggml_backend_buffer_name(t->src[0]->buffer), "CPU") == 0;
+        const ggml_tensor * s1 = t->src[1];
+        c.src1_embd_enc = c.src1_embd_enc && s1->type == GGML_TYPE_F32 && ggml_is_contiguous(s1) &&
+                          (s1 == c.embd_enc || s1->view_src == c.embd_enc) && s1->data == c.embd_enc->data;
+    } else if (t->op == GGML_OP_SCALE) {
+        const std::string sk = split(src_key(0), il);
+        if (sk == "k_mm") k = il + ".k_scale";
+        float sb[2];
+        std::memcpy(sb, t->op_params, sizeof sb);
+        if (c.scale_bits == 0) c.scale_bits = f32_bits(sb[0]);
+        c.scale_same = c.scale_same && f32_bits(sb[0]) == c.scale_bits;
+        c.scale_b_zero = c.scale_b_zero && sb[1] == 0.0f;
+        c.scale_inplace += t->data == t->src[0]->data;
+    } else if (t->op == GGML_OP_ADD) {
+        const std::string sk = split(src_key(0), il);
+        if (sk == "k_mm" || sk == "k_scale") c.k_unbiased = false;
+        if (sk == "v_mm") {
+            k = il + ".v_add";
+            auto it = c.names.find(t->src[1]);
+            c.biases_named = c.biases_named && it != c.names.end() && it->second == "decoder.blocks." + il + ".cross_attn.value.bias";
+        }
+    } else if (t->op == GGML_OP_CPY) {
+        const std::string sk = split(src_key(0), il);
+        const ggml_tensor * cache = sk == "k_scale" ? c.kc : sk == "v_add" ? c.vc : nullptr;
+        if (cache) {
+            k = il + (sk == "k_scale" ? ".k_cpy" : ".v_cpy");
+            c.cpy_into_cache = c.cpy_into_cache && t->type == GGML_TYPE_F16 && t->view_src == cache &&
+                               t->view_offs == (size_t)2 * c.n_state * std::atoi(il.c_str()) * c.n_pad &&
+                               ggml_nelements(t) == ggml_nelements(t->src[0]);
+        }
+    }
+    if (k.empty()) { c.other.push_back(std::string(ggml_op_desc(t)) + "@" + std::to_string(idx)); return true; }
+    c.key[t] = k;
+    std::vector<uint64_t> d = row_digests(t, c.n_state);
+    char line[256];
+    std::snprintf(line, sizeof line, "%d\tb%s\t%s\t%s\t%d\t%zu\t%zu", idx, k.c_str(), ggml_op_desc(t), ggml_type_name(t->type),
+                  c.n_state, d.size(), c.digests.size());
+    c.tsv.push_back(line);
+    c.digests.insert(c.digests.end(), d.begin(), d.end());
+    c.by_key["b" + k] = d;
+    return true;
+}
+static ggml_tensor * state_kv_cross(whisper_state * st, bool v) {
+    return *reinterpret_cast<ggml_tensor **>((char *)st + VOAICE_OFF_STATE_KV_CROSS + (v ? VOAICE_OFF_KV_V : VOAICE_OFF_KV_K));
+}
+// the cross graph as whisper_build_graph_cross builds it (flash_attn: view_1d at il * n_pad rows), as a standalone graph
+// on the shipped CPU backend (what --bench-cross times): in = embd_enc [n_state, n_ctx]; k, v = [n_state * n_layer * n_pad] f16
+struct cross_graph {
+    ggml_context * ctx; ggml_tensor * in, * k, * v; ggml_cgraph * gf;
+    std::vector<uint8_t> work;
+    cross_graph(std::map<std::string, ggml_tensor *> & m, int n_state, int n_ctx, int n_pad, int n_layer) {
+        ggml_init_params p = { (size_t)96 << 20, nullptr, false };
+        ctx = ggml_init(p);
+        check(ctx != nullptr, "ggml_init failed");
+        in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state, n_ctx);
+        k = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, (int64_t)n_state * n_layer * n_pad);
+        v = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, (int64_t)n_state * n_layer * n_pad);
+        std::memset(k->data, 0, ggml_nbytes(k));
+        std::memset(v->data, 0, ggml_nbytes(v));
+        gf = ggml_new_graph(ctx);
+        const float Kscale = pow(float(n_state / (n_state / 64)), -0.25);   // whisper.cpp:2298, the same expression
+        for (int il = 0; il < n_layer; il++) {
+            const std::string pre = "decoder.blocks." + std::to_string(il) + ".cross_attn.";
+            ggml_tensor * K = ggml_scale(ctx, ggml_mul_mat(ctx, conv2_graph::copy(ctx, m.at(pre + "key.weight")), in), Kscale);
+            ggml_tensor * V = ggml_add(ctx, ggml_mul_mat(ctx, conv2_graph::copy(ctx, m.at(pre + "value.weight")), in), conv2_graph::copy(ctx, m.at(pre + "value.bias")));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, K, ggml_view_1d(ctx, k, (int64_t)n_state * n_ctx, (size_t)2 * n_state * il * n_pad)));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, V, ggml_view_1d(ctx, v, (int64_t)n_state * n_ctx, (size_t)2 * n_state * il * n_pad)));
+        }
+    }
+    void run(int threads) {
+        ggml_cplan cp = ggml_graph_plan(gf, threads, nullptr);
+        if (work.size() < cp.work_size) work.resize(cp.work_size);
+        cp.work_data = work.data();
+        check(ggml_graph_compute(gf, &cp) == GGML_STATUS_SUCCESS, "graph compute failed");
+        check(cp.n_threads == threads, "the plan did not take the thread count");
+    }
+    ~cross_graph() { ggml_free(ctx); }
+};
+static std::vector<uint64_t> kv_rows(const std::vector<uint8_t> & kb, const std::vector<uint8_t> & vb, int n_state) {
+    std::vector<uint64_t> d;
+    for (const std::vector<uint8_t> * b : {&kb, &vb})
+        for (size_t r = 0; r < b->size() / (2 * (size_t)n_state); r++) d.push_back(digest16((const uint16_t *)(b->data() + r * 2 * n_state), n_state));
+    return d;
+}
+static int record_cross(const char * model_path, const std::string & outdir, int nwav, char ** wavs) {
+    if (mkdir(outdir.c_str(), 0755) != 0 && errno != EEXIST) die("cannot create outdir (its parent must exist)");
+    whisper_context * ctx = load_quiet(model_path);
+    auto & tensors = model_tensors(ctx);
+    const int n_ctx = whisper_model_n_audio_ctx(ctx), n_state = whisper_model_n_text_state(ctx), n_layer = whisper_model_n_text_layer(ctx);
+    const int n_pad = (n_ctx + 255) / 256 * 256;
+    check(n_state == whisper_model_n_audio_state(ctx), "n_text_state != n_audio_state");
+    for (int a = 0; a < nwav; a++) {
+        std::string path = wavs[a];
+        std::string stem = path.substr(path.find_last_of('/') + 1);
+        stem = stem.substr(0, stem.find_last_of('.'));
+        const std::string dir = outdir + "/" + stem;
+        mkdir(dir.c_str(), 0755);
+        std::vector<float> pcm = read_wav(path.c_str());
+        cross_capture caps[2];
+        std::vector<uint8_t> kb[5], vb[5], enc[5];
+        bool shape = true, zero_at_init = true;
+        const int threads[5] = {1, 4, 1, 2, 4};
+        for (int r = 0; r < 5; r++) {              // r = 0, 1: observed at 1 and 4 threads; r = 2..4: not observed, 1, 2, 4
+            whisper_state * st = whisper_init_state(ctx);
+            check(st != nullptr, "whisper_init_state failed");
+            ggml_tensor * kc = state_kv_cross(st, false), * vc = state_kv_cross(st, true);
+            for (ggml_tensor * x : {kc, vc})
+                shape = shape && x && x->type == GGML_TYPE_F16 && ggml_n_dims(x) == 1 && x->ne[0] == (int64_t)n_state * n_layer * n_pad;
+            check(shape, "layout check failed: kv_cross is not [n_state * n_layer * n_pad] f16");
+            for (ggml_tensor * x : {kc, vc}) { std::vector<uint8_t> b = tensor_bytes(x); for (uint8_t y : b) zero_at_init = zero_at_init && y == 0; }
+            check(whisper_pcm_to_mel_with_state(ctx, st, pcm.data(), (int)pcm.size(), 1) == 0, "pcm_to_mel failed");
+            state_sched(st, VOAICE_OFF_STATE_SCHED_CONV);
+            state_sched(st, VOAICE_OFF_STATE_SCHED_ENCODE);
+            ggml_backend_sched_t sx = state_sched(st, VOAICE_OFF_STATE_SCHED_CROSS);
+            if (r < 2) {
+                for (auto & kv : tensors) caps[r].names[kv.second] = kv.first;
+                caps[r].n_state = n_state; caps[r].n_pad = n_pad;
+                caps[r].embd_enc = state_embd_enc(st, n_state); caps[r].kc = kc; caps[r].vc = vc;
+                ggml_backend_sched_set_eval_callback(sx, cross_cb, &caps[r]);
+            }
+            check(whisper_encode_with_state(ctx, st, 0, threads[r]) == 0, "whisper_encode failed");
+            kb[r] = tensor_bytes(kc); vb[r] = tensor_bytes(vc); enc[r] = tensor_bytes(state_embd_enc(st, n_state));
+            whisper_free_state(st);
+        }
+        cross_capture & c = caps[0];
+        check((int)c.tsv.size() == 6 * n_layer, "the cross graph did not show 6 nodes per decoder layer");
+        bool keys = true;
+        for (int il = 0; il < n_layer; il++)
+            for (const char * k : CROSS_KEYS) keys = keys && c.by_key.count("b" + std::to_string(il) + "." + k);
+        const bool thr = c.digests == caps[1].digests && c.tsv == caps[1].tsv && kb[0] == kb[1] && vb[0] == vb[1];
+        const bool obs = kb[0] == kb[2] && vb[0] == vb[2];
+        const bool thr_unobs = kb[2] == kb[3] && kb[2] == kb[4] && vb[2] == vb[3] && vb[2] == vb[4];
+        const bool enc_same = enc[0] == enc[1] && enc[0] == enc[2] && enc[0] == enc[3] && enc[0] == enc[4];
+        bool pad_zero = true;
+        size_t pad_rows = 0;
+        for (const std::vector<uint8_t> * b : {&kb[2], &vb[2]})
+            for (int il = 0; il < n_layer; il++)
+                for (int row = n_ctx; row < n_pad; row++, pad_rows++)
+                    for (int e = 0; e < 2 * n_state; e++) pad_zero = pad_zero && (*b)[((size_t)il * n_pad + row) * 2 * n_state + e] == 0;
+        std::vector<uint64_t> kv = kv_rows(kb[2], vb[2], n_state);
+        bool cpy_eq_buffer = true;   // each CPY node's rows = the buffer's rows of its layer
+        for (int il = 0; il < n_layer; il++)
+            for (int which = 0; which < 2; which++) {
+                const std::vector<uint64_t> & d = c.by_key.at("b" + std::to_string(il) + (which ? ".v_cpy" : ".k_cpy"));
+                for (int row = 0; row < n_ctx; row++) cpy_eq_buffer = cpy_eq_buffer && d[row] == kv[(size_t)which * n_layer * n_pad + (size_t)il * n_pad + row];
+            }
+        // the standalone graph (what --bench-cross times) from the state's own embd_enc, at 1 and 4 threads
+        bool alone = true;
+        {
+            cross_graph g(tensors, n_state, n_ctx, n_pad, n_layer);
+            check(enc[0].size() == ggml_nbytes(g.in), "embd_enc size");
+            for (int th : {1, 4}) {
+                std::memcpy(g.in->data, enc[0].data(), enc[0].size());
+                g.run(th);
+                alone = alone && std::memcmp(g.k->data, kb[2].data(), kb[2].size()) == 0 && std::memcmp(g.v->data, vb[2].data(), vb[2].size()) == 0;
+            }
+        }
+        write_bin(dir + "/cross.d64", c.digests.data(), c.digests.size());
+        write_bin(dir + "/kv_cross.d64", kv.data(), kv.size());
+        FILE * nf = std::fopen((dir + "/cross_nodes.tsv").c_str(), "w");
+        for (auto & l : c.tsv) std::fprintf(nf, "%s\n", l.c_str());
+        std::fclose(nf);
+        std::string other;
+        for (auto & o : c.other) other += (other.empty() ? "" : ",") + o;
+        const double kscale_d = pow(float(n_state / (n_state / 64)), -0.25);
+        const auto yn = [](bool b) { return b ? "yes" : "NO"; };
+        FILE * m = std::fopen((dir + "/cross.tsv").c_str(), "w");
+        std::fprintf(m, "n_ctx\t%d\nn_pad\t%d\nn_state\t%d\nn_layer\t%d\nnodes_digested\t%zu\nflash_attn_layout\tyes\n"
+                        "kscale_bits\t%08x\nkscale_pow_double\t%.17g\nscale_b_zero\t%s\nscale_same_every_layer\t%s\nscale_in_place\t%d\n"
+                        "six_nodes_per_layer\t%s\nother_computed_nodes\t%s\nweights_f16_plain_cpu\t%s\nsrc1_is_embd_enc\t%s\n"
+                        "v_bias_named\t%s\nk_unbiased\t%s\ncpy_into_kv_cross_at_il_n_pad\t%s\nkv_cross_zero_at_init\t%s\n"
+                        "kv_cross_padding_rows\t%zu\nkv_cross_padding_all_zero\t%s\ncpy_nodes_eq_kv_cross_rows\t%s\n"
+                        "threads_1_vs_4_bit_identical\t%s\nkv_cross_observed_eq_unobserved\t%s\nkv_cross_1_2_4_threads_identical\t%s\n"
+                        "embd_enc_every_run_identical\t%s\nembd_enc_digest\t%016llx\nstandalone_eq_sched_1_4_threads\t%s\n",
+                     n_ctx, n_pad, n_state, n_layer, c.tsv.size(), c.scale_bits, kscale_d, yn(c.scale_b_zero), yn(c.scale_same),
+                     c.scale_inplace, yn(keys), other.empty() ? "none" : other.c_str(), yn(c.weights_f16_plain), yn(c.src1_embd_enc),
+                     yn(c.biases_named), yn(c.k_unbiased), yn(c.cpy_into_cache), yn(zero_at_init), pad_rows, yn(pad_zero), yn(cpy_eq_buffer),
+                     yn(thr), yn(obs), yn(thr_unobs), yn(enc_same),
+                     (unsigned long long)digest32((const float *)enc[0].data(), enc[0].size() / 4), yn(alone));
+        std::fclose(m);
+        std::fprintf(stderr, "whisper_oracle: %s: %zu cross nodes digested (6 per layer: %s; others computed: %s); Kscale %08x (b = 0: %s), "
+                             "in place %d of %d; weights f16 plain: %s; src1 = embd_enc: %s; V's bias named: %s; K unbiased: %s; "
+                             "CPYs into kv_cross at il*%d: %s; kv_cross +0 at init: %s, %zu padding rows +0 after: %s; CPY nodes = buffer: %s; "
+                             "1 vs 4 threads identical: %s; observed = unobserved: %s; 1 = 2 = 4 threads: %s; standalone = scheduler: %s\n",
+                     stem.c_str(), c.tsv.size(), yn(keys), other.empty() ? "none" : other.c_str(), c.scale_bits, yn(c.scale_b_zero),
+                     c.scale_inplace, n_layer, yn(c.weights_f16_plain), yn(c.src1_embd_enc), yn(c.biases_named), yn(c.k_unbiased), n_pad,
+                     yn(c.cpy_into_cache), yn(zero_at_init), pad_rows, yn(pad_zero), yn(cpy_eq_buffer), yn(thr), yn(obs), yn(thr_unobs), yn(alone));
+    }
+    whisper_free(ctx);
+    return 0;
+}
+
+// --bench-cross <model.bin> <wav> <threads>: the cross graph through the standalone graph above (the record shows it equal
+// to the scheduler's), its input embd_enc computed beforehand from <wav> by whisper_encode_with_state, in a fresh process.
+// wall = best of 10, cpu = CPU ms per compute over >= 1 s; mem = what whisper holds for it: sched_cross's compute buffer +
+// kv_cross (allocated by whisper_init_state); rss = VmHWM delta of the first compute (the standalone graph's tensors were
+// allocated before it). kv_cross_digest = digest16 over k then v, whole (padding included).
+static int bench_cross(const char * model_path, const char * wav, int threads) {
+    whisper_context * ctx = load_quiet(model_path);
+    auto & tensors = model_tensors(ctx);
+    whisper_state * st = whisper_init_state(ctx);
+    std::vector<float> pcm = read_wav(wav);
+    check(whisper_pcm_to_mel_with_state(ctx, st, pcm.data(), (int)pcm.size(), 1) == 0, "pcm_to_mel failed");
+    check(whisper_encode_with_state(ctx, st, 0, threads) == 0, "whisper_encode failed");
+    const int n_ctx = whisper_model_n_audio_ctx(ctx), n_state = whisper_model_n_text_state(ctx), n_layer = whisper_model_n_text_layer(ctx);
+    const int n_pad = (n_ctx + 255) / 256 * 256;
+    const std::vector<uint8_t> e = tensor_bytes(state_embd_enc(st, n_state));
+    const std::vector<uint8_t> want_k = tensor_bytes(state_kv_cross(st, false)), want_v = tensor_bytes(state_kv_cross(st, true));
+    size_t bytes = want_k.size() + want_v.size();
+    ggml_backend_sched_t s = state_sched(st, VOAICE_OFF_STATE_SCHED_CROSS);
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(s); i++) bytes += ggml_backend_sched_get_buffer_size(s, ggml_backend_sched_get_backend(s, i));
+    cross_graph g(tensors, n_state, n_ctx, n_pad, n_layer);
+    std::memcpy(g.in->data, e.data(), e.size());
+    const long before = status_kb("VmRSS:");
+    const bool reset = reset_peak_rss();
+    g.run(threads);
+    const long peak = reset ? status_kb("VmHWM:") : -1;
+    check(std::memcmp(g.k->data, want_k.data(), want_k.size()) == 0 && std::memcmp(g.v->data, want_v.data(), want_v.size()) == 0,
+          "the standalone cross graph != the state's kv_cross");
+    double best = 1e30;
+    for (int r = 0; r < 10; r++) { const double t = now_ms(); g.run(threads); best = std::min(best, now_ms() - t); }
+    const double c0 = cpu_seconds(), w0 = now_ms();
+    int reps = 0;
+    while (reps < 10 || now_ms() - w0 < 1000.0) { g.run(threads); reps++; }
+    const double c1 = cpu_seconds();
+    std::vector<uint16_t> kv(want_k.size() / 2 + want_v.size() / 2);
+    std::memcpy(kv.data(), want_k.data(), want_k.size());
+    std::memcpy((uint8_t *)kv.data() + want_k.size(), want_v.data(), want_v.size());
+    std::printf("bench-cross-reference threads %d wall_best_ms %.4f cpu_ms_per_call %.4f cpu_reps %d op_mem_kb %zu rss_peak_delta_kb %ld kv_cross_digest %016llx\n",
+                threads, best, (c1 - c0) * 1000.0 / reps, reps, (bytes + 1023) / 1024, peak >= 0 ? peak - before : -1,
+                (unsigned long long)digest16(kv.data(), kv.size()));
     whisper_free_state(st);
     whisper_free(ctx);
     return 0;
 }
 
 int main(int argc, char ** argv) {
+    if (argc >= 4 && std::strcmp(argv[1], "--cross") == 0) return record_cross(argv[2], argv[3], argc - 4, argv + 4);
+    if (argc == 5 && std::strcmp(argv[1], "--bench-cross") == 0) return bench_cross(argv[2], argv[3], std::atoi(argv[4]));
     if (argc >= 4 && std::strcmp(argv[1], "--encoder") == 0) return record_encoder(argv[2], argv[3], argc - 4, argv + 4);
     if (argc == 5 && std::strcmp(argv[1], "--bench-attn") == 0) return bench_attn(argv[2], argv[3], std::atoi(argv[4]));
     if (argc == 5 && std::strcmp(argv[1], "--bench-encode") == 0) return bench_encode(argv[2], argv[3], std::atoi(argv[4]));
