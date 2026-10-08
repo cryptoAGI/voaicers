@@ -213,6 +213,15 @@ int main(int argc, char ** argv) {
         std::vector<float> mel1;
         int n_len = 0, n_len_org = 0, n_mel = 0;
         bool threads_agree = true;
+        double best_us = 1e30;
+        for (int rep = 0; rep < 5; rep++) {
+            whisper_state * st = whisper_init_state(ctx);
+            const int64_t t0 = ggml_time_us();
+            whisper_pcm_to_mel_with_state(ctx, st, pcm.data(), (int)pcm.size(), 1);
+            const double us = (double)(ggml_time_us() - t0);
+            if (us < best_us) best_us = us;
+            whisper_free_state(st);
+        }
         for (int threads : {1, 4}) {
             whisper_state * st = whisper_init_state(ctx);
             check(st != nullptr, "whisper_init_state failed");
@@ -232,14 +241,17 @@ int main(int argc, char ** argv) {
         }
         write_f32(dir + "/mel.f32", mel1.data(), mel1.size());
         FILE * m = std::fopen((dir + "/mel.tsv").c_str(), "w");
-        std::fprintf(m, "n_samples\t%zu\nn_mel\t%d\nn_len\t%d\nn_len_org\t%d\nthreads_1_vs_4_bit_identical\t%s\n",
-                     pcm.size(), n_mel, n_len, n_len_org, threads_agree ? "yes" : "NO");
+        std::fprintf(m, "n_samples\t%zu\nn_mel\t%d\nn_len\t%d\nn_len_org\t%d\nthreads_1_vs_4_bit_identical\t%s\n"
+                        "reference_ms_1_thread_best_of_5\t%.2f\n",
+                     pcm.size(), n_mel, n_len, n_len_org, threads_agree ? "yes" : "NO", best_us / 1000.0);
         std::fclose(m);
 
         // the transcript: greedy, one thread, everything else at whisper-cli's defaults except the printing.
         // temperature_inc = 0 turns off the temperature fallback (which would sample), so the run is one greedy pass.
         whisper_full_params fp = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-        fp.n_threads = 1;
+        // VOAICE_FULL_THREADS (default 1) sets whisper_full's threads, to record whether the transcript depends on it
+        const char * ft = std::getenv("VOAICE_FULL_THREADS");
+        fp.n_threads = ft ? std::atoi(ft) : 1;
         fp.print_progress = false; fp.print_realtime = false; fp.print_timestamps = false; fp.print_special = false;
         fp.token_timestamps = true;
         fp.temperature_inc = 0.0f;
@@ -247,9 +259,9 @@ int main(int argc, char ** argv) {
         whisper_state * st = whisper_init_state(ctx);
         check(whisper_full_with_state(ctx, st, fp, pcm.data(), (int)pcm.size()) == 0, "whisper_full failed");
         FILE * t = std::fopen((dir + "/transcript.tsv").c_str(), "w");
-        std::fprintf(t, "# params: greedy best_of=%d n_threads=1 flash_attn=%d token_timestamps=1 temperature=%g "
+        std::fprintf(t, "# params: greedy best_of=%d n_threads=%d flash_attn=%d token_timestamps=1 temperature=%g "
                         "temperature_inc=0 language=en no_context=%d\n",
-                     fp.greedy.best_of, (int)cparams.flash_attn, fp.temperature, (int)fp.no_context);
+                     fp.greedy.best_of, fp.n_threads, (int)cparams.flash_attn, fp.temperature, (int)fp.no_context);
         const int ns = whisper_full_n_segments_from_state(st);
         for (int s = 0; s < ns; s++) {
             std::fprintf(t, "segment\t%d\t%lld\t%lld\t%s\n", s, (long long)whisper_full_get_segment_t0_from_state(st, s),

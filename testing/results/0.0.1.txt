@@ -1,0 +1,61 @@
+# voaice.rs 0.0.1 release gate — 2026-10-08T01:03:27Z
+# host: x86_64, 4 cpus, AMD Ryzen 3 3200U with Radeon Vega Mobile Gfx; load 9.62 8.40 7.55
+# rustc: rustc 1.99.0 (b940084d7 2026-09-28); gcc: gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
+## 1. reference
+built /home/hacker/cryptoAGI/voaice.rs/testing/oracle/bin/whisper_oracle (reference 080bbbe85230f624f0b52127f1ae1218247989f9, ggml 0.16.0)
+## 2. inputs
+model models/ggml-tiny.en.bin sha256 921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f (pinned)
+audio ok: 8 files match testing/pins/audio.sha256
+## 3. record (the shipped libwhisper.so, in process)
+whisper_oracle: chirp: 40000 samples, mel 80x3250, threads agree: yes, 1 segments
+whisper_oracle: jfk: 176000 samples, mel 80x4100, threads agree: yes, 2 segments
+whisper_oracle: jfk_x3: 528000 samples, mel 80x6300, threads agree: yes, 6 segments
+whisper_oracle: min_len: 201 samples, mel 80x3001, threads agree: yes, 0 segments
+whisper_oracle: noise_loud: 16000 samples, mel 80x3100, threads agree: yes, 0 segments
+whisper_oracle: odd_len: 12345 samples, mel 80x3077, threads agree: yes, 1 segments
+whisper_oracle: short: 4800 samples, mel 80x3030, threads agree: yes, 0 segments
+whisper_oracle: silence: 16000 samples, mel 80x3100, threads agree: yes, 1 segments
+## 4. voaice.rs
+    Finished `release` profile [optimized] target(s) in 10.05s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test guard_refuses_a_modified_model ... guard: refused: modified tiny.en has the size of ggml-tiny.en.bin (77704715 bytes) but sha256 97fcb6d6c685525d1c12436fe4407284eef7477a9cbce735a09ba20eaf4bb1f8, not the pinned 921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f
+ok
+test oracle_mel_bit_exact ... oracle_mel (2316640 values):
+  chirp       80 x 3250 =  260000 values: 0 differ, max 0 ULP
+  jfk         80 x 4100 =  328000 values: 0 differ, max 0 ULP
+  jfk_x3      80 x 6300 =  504000 values: 0 differ, max 0 ULP
+  min_len     80 x 3001 =  240080 values: 0 differ, max 0 ULP
+  noise_loud  80 x 3100 =  248000 values: 0 differ, max 0 ULP
+  odd_len     80 x 3077 =  246160 values: 0 differ, max 0 ULP
+  short       80 x 3030 =  242400 values: 0 differ, max 0 ULP
+  silence     80 x 3100 =  248000 values: 0 differ, max 0 ULP
+ok
+test oracle_mel_discriminates_fused_fft ... oracle_mel_discriminates: fused-FFT variant on jfk: 25242 of 328000 values differ, max 32768 ULP
+ok
+test oracle_model_hparams_tensors_vocab_filters ... oracle_model: 167 tensors (77110272 bytes) identical by sha256, filterbank 80x201 bit-exact, 51864 vocab strings identical (1 hold a NUL the C API cannot show past)
+ok
+test oracle_pcm_input_identical ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.23s
+## 5. speed (only now): log-mel, one thread, best of 5
+wav          samples   reference ms   voaice ms
+chirp          40000          16.06        14.4
+jfk           176000          57.74        58.7
+jfk_x3        528000         175.81       198.1
+min_len          201           1.95         1.8
+noise_loud     16000           7.32         6.7
+odd_len        12345           5.65         5.5
+short           4800           3.51         3.2
+silence        16000           6.82         8.3
+## transcripts recorded (not yet reproduced by voaice.rs: encoder and decoder are later stages)
+chirp:  (whistling) 
+jfk:  And so my fellow Americans ask not what your country can do for you  ask what you can do for your country. 
+jfk_x3:  And so my fellow Americans ask not what your country can do for you  ask what you can do for your country  And so my fellow Americans ask not what your country can do for you  ask what you can do for your country  And so my fellow Americans ask not what your country can do for you  for you ask what you can do for your country. 
+min_len: 
+noise_loud: 
+odd_len:  [BLANK_AUDIO] 
+short: 
+silence:  [BLANK_AUDIO] 
+GATE PASSED
